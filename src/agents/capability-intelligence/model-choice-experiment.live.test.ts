@@ -85,11 +85,30 @@ type CapturedModelRequest = {
   url: string;
 };
 
+type ProviderResponseSummary = {
+  responseShape: string;
+  finishReason: string | null;
+  contentPresent: boolean;
+  contentLength: number;
+  toolCallCount: number;
+  toolCallNames: string[];
+  outputItemTypes: string[];
+  parserOutcome: string;
+  httpStatus: number | null;
+  contentType: string | null;
+};
+
+type SerializedSmokeError = {
+  name: string;
+  message: string;
+};
+
 type ExperimentRun = V1IObservation;
 
 type ModelPayloadCapture = {
   requests: CapturedModelRequest[];
   delegatedRequests: number;
+  responseSummaries: ProviderResponseSummary[];
   recordProviderRequest: (request: CapturedModelRequest) => void;
   restore: () => void;
 };
@@ -196,6 +215,66 @@ describe("v1I harness evidence repair", () => {
       "override",
     );
   });
+
+  it("records sanitized no-tool and tool-call response summaries after body parsing", async () => {
+    const noTool = await captureProviderSummaryForFixture(
+      [
+        'data: {"object":"chat.completion.chunk","choices":[{"delta":{"content":"done"},"finish_reason":null}]}',
+        'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}',
+        "data: [DONE]",
+      ].join("\n\n"),
+    );
+    expect(noTool.parserOutcome).toBe("no-tool-complete");
+    expect(noTool.responseShape).toContain("chat.completion.chunk");
+    expect(noTool.finishReason).toBe("stop");
+    expect(noTool.contentPresent).toBe(true);
+    expect(noTool.contentLength).toBe(4);
+    expect(noTool.toolCallCount).toBe(0);
+
+    const toolCall = await captureProviderSummaryForFixture(
+      [
+        'data: {"object":"chat.completion.chunk","choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"git_diff"}}]},"finish_reason":null}]}',
+        'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}',
+        "data: [DONE]",
+      ].join("\n\n"),
+    );
+    expect(toolCall.parserOutcome).toBe("tool-call-complete");
+    expect(toolCall.toolCallCount).toBe(1);
+    expect(toolCall.toolCallNames).toEqual(["git_diff"]);
+  });
+
+  it("keeps a primary terminal timeout authoritative over cleanup errors", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "v1i-cleanup-precedence-"));
+    try {
+      const timeout = new V1ISmokeTimeoutError({
+        timeoutStage: "terminalCompletion",
+        timeoutMs: 60_000,
+        lastSuccessfulCheckpoint: "provider-response-received",
+      });
+      writeSmokeInvalidArtifact({
+        smokeRoot: root,
+        error: timeout,
+        lastSuccessfulCheckpoint: "provider-response-received",
+        harnessCommit: HARNESS_COMMIT,
+        modelConfigHash: hashV1ICanonical(modelConfigIdentity()),
+        cleanupErrors: [{ name: "EPERM", message: "cleanup handle still open" }],
+      });
+      const invalid = JSON.parse(
+        fs.readFileSync(path.join(root, "smoke-invalid.json"), "utf8"),
+      ) as {
+        invalidReason: string;
+        failureStage: string;
+        cleanupErrors: SerializedSmokeError[];
+      };
+      expect(invalid.invalidReason).toBe("INFRASTRUCTURE_TIMEOUT");
+      expect(invalid.failureStage).toBe("terminalCompletion");
+      expect(invalid.cleanupErrors).toEqual([
+        { name: "EPERM", message: "cleanup handle still open" },
+      ]);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
 });
 
 describeSmokeLive("v1I model-choice experiment smoke", () => {
@@ -244,6 +323,7 @@ describeSmokeLive("v1I model-choice experiment smoke", () => {
         lastSuccessfulCheckpoint = stage;
         appendV1ISmokeCheckpoint(smokeRoot, { stage, ...details });
       };
+      const cleanupErrors: SerializedSmokeError[] = [];
       recordCheckpoint("manifest-written", { harnessCommit: HARNESS_COMMIT });
       try {
         await runV1ISmokeStage({
@@ -256,6 +336,7 @@ describeSmokeLive("v1I model-choice experiment smoke", () => {
         recordCheckpoint("live-config-built");
         const smokeDeadline = createSmokeDeadlineForRun(smokeRoot);
         smokeDeadline.enter("workspaceSessionPreparation", "live-config-built");
+        const responseSummaries: ProviderResponseSummary[] = [];
         let observation: ExperimentRun;
         const execution = runV1IAttempt(
           smokeInput,
@@ -274,6 +355,38 @@ describeSmokeLive("v1I model-choice experiment smoke", () => {
                 if (stage) {
                   smokeDeadline.enter(stage, checkpoint.stage);
                 }
+              },
+              requestCapture: {
+                onResponseSummary: (summary) => {
+                  responseSummaries.push(summary);
+                  fs.writeFileSync(
+                    path.join(smokeRoot, "smoke-provider-response.json"),
+                    `${JSON.stringify({ summaries: responseSummaries }, null, 2)}\n`,
+                  );
+                  recordCheckpoint(
+                    summary.parserOutcome === "body-pending"
+                      ? "provider-response-body-pending"
+                      : "provider-response-parsed",
+                    {
+                      responseShape: summary.responseShape,
+                      finishReason: summary.finishReason,
+                      contentPresent: summary.contentPresent,
+                      contentLength: summary.contentLength,
+                      toolCallCount: summary.toolCallCount,
+                      toolCallNames: summary.toolCallNames,
+                      outputItemTypes: summary.outputItemTypes,
+                      parserOutcome: summary.parserOutcome,
+                    },
+                  );
+                  if (summary.toolCallCount > 0) {
+                    recordCheckpoint("tool-call-parsed", {
+                      toolCount: summary.toolCallCount,
+                      representativeToolNames: summary.toolCallNames,
+                    });
+                  } else if (summary.parserOutcome === "no-tool-complete") {
+                    recordCheckpoint("no-tool-response-detected");
+                  }
+                },
               },
             }),
           (value) => {
@@ -297,7 +410,16 @@ describeSmokeLive("v1I model-choice experiment smoke", () => {
           throw error;
         } finally {
           smokeDeadline.dispose();
-          fs.rmSync(workspaceDir, { recursive: true, force: true });
+          try {
+            fs.rmSync(workspaceDir, {
+              recursive: true,
+              force: true,
+              maxRetries: 3,
+              retryDelay: 50,
+            });
+          } catch (error) {
+            cleanupErrors.push(serializeSmokeError(error));
+          }
         }
         const result = {
           status: observation.valid ? "PASS" : "FAIL",
@@ -306,6 +428,7 @@ describeSmokeLive("v1I model-choice experiment smoke", () => {
           activeFilteringEnabled: false,
           observationValid: observation.valid,
           rankingEpoch: observation.rankingEpoch,
+          cleanupErrors,
         };
         fs.writeFileSync(
           path.join(smokeRoot, "smoke-result.json"),
@@ -319,6 +442,7 @@ describeSmokeLive("v1I model-choice experiment smoke", () => {
           lastSuccessfulCheckpoint,
           harnessCommit: HARNESS_COMMIT,
           modelConfigHash: smokeManifest.modelConfigHash,
+          cleanupErrors,
         });
         throw error;
       }
@@ -348,6 +472,7 @@ function writeSmokeInvalidArtifact(input: {
   lastSuccessfulCheckpoint: string;
   harnessCommit: string;
   modelConfigHash: string;
+  cleanupErrors?: readonly SerializedSmokeError[];
 }): void {
   const timeout = input.error instanceof V1ISmokeTimeoutError ? input.error : undefined;
   const rawErrorName = input.error instanceof Error ? input.error.name : "NonErrorThrown";
@@ -362,6 +487,7 @@ function writeSmokeInvalidArtifact(input: {
     timeoutMs: timeout?.timeoutMs ?? null,
     harnessCommit: input.harnessCommit,
     modelConfigHash: input.modelConfigHash,
+    cleanupErrors: input.cleanupErrors ?? [],
     recordedAt: new Date().toISOString(),
   };
   fs.writeFileSync(
@@ -667,6 +793,7 @@ async function runOne(input: {
     holdAfterCapture?: boolean;
     onRequestCaptured?: (request: CapturedModelRequest) => void;
     onDelegatedRequest?: () => void;
+    onResponseSummary?: (summary: ProviderResponseSummary) => void;
   };
   abortSignal?: AbortSignal;
   timeoutMs?: number;
@@ -1506,9 +1633,11 @@ function captureModelPayloads(
     holdAfterCapture?: boolean;
     onRequestCaptured?: (request: CapturedModelRequest) => void;
     onDelegatedRequest?: () => void;
+    onResponseSummary?: (summary: ProviderResponseSummary) => void;
   },
 ): ModelPayloadCapture {
   const requests: CapturedModelRequest[] = [];
+  const responseSummaries: ProviderResponseSummary[] = [];
   let providerRequestRecorded = false;
   let delegatedRequests = 0;
   const originalFetch = globalThis.fetch;
@@ -1516,13 +1645,13 @@ function captureModelPayloads(
     const url =
       typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
     const body = init?.body ?? (input instanceof Request ? await input.clone().text() : undefined);
-    if (
+    const isProviderRequest =
       (url.startsWith(LM_STUDIO_BASE_URL) ||
         url.includes("/chat/completions") ||
         url.includes("/responses")) &&
       typeof body === "string" &&
-      body.trim().startsWith("{")
-    ) {
+      body.trim().startsWith("{");
+    if (isProviderRequest) {
       const parsed = JSON.parse(body) as Record<string, unknown>;
       const request = { body: parsed, url };
       if (!providerRequestRecorded) {
@@ -1551,11 +1680,47 @@ function captureModelPayloads(
     }
     options?.onDelegatedRequest?.();
     delegatedRequests += 1;
-    return await originalFetch(input, init);
+    const response = await originalFetch(input, init);
+    if (!isProviderRequest) {
+      return response;
+    }
+    const initialSummary = createPendingProviderResponseSummary(response);
+    responseSummaries.push(initialSummary);
+    options?.onResponseSummary?.(initialSummary);
+    if (!response.body) {
+      const emptySummary = {
+        ...initialSummary,
+        parserOutcome: "empty-body",
+      } satisfies ProviderResponseSummary;
+      responseSummaries.push(emptySummary);
+      options?.onResponseSummary?.(emptySummary);
+      return response;
+    }
+    const state = createResponseSummaryState(response.headers.get("content-type"));
+    const observedBody = response.body.pipeThrough(
+      new TransformStream<Uint8Array, Uint8Array>({
+        transform(chunk, controller) {
+          consumeProviderResponseChunk(state, chunk);
+          controller.enqueue(chunk);
+        },
+        flush() {
+          finishProviderResponseState(state);
+          const summary = finishProviderResponseSummary(initialSummary, state);
+          responseSummaries.push(summary);
+          options?.onResponseSummary?.(summary);
+        },
+      }),
+    );
+    return new Response(observedBody, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    });
   };
   return {
     requests,
     delegatedRequests,
+    responseSummaries,
     recordProviderRequest: (request) => {
       providerRequestRecorded = true;
       requests.push(request);
@@ -1563,6 +1728,280 @@ function captureModelPayloads(
     restore: () => {
       globalThis.fetch = originalFetch;
     },
+  };
+}
+
+async function captureProviderSummaryForFixture(fixture: string): Promise<ProviderResponseSummary> {
+  const originalFetch = globalThis.fetch;
+  const summaries: ProviderResponseSummary[] = [];
+  globalThis.fetch = async () =>
+    new Response(fixture, {
+      headers: { "content-type": "text/event-stream" },
+    });
+  const capture = captureModelPayloads(undefined, {
+    onResponseSummary: (summary) => summaries.push(summary),
+  });
+  try {
+    const response = await fetch(`${LM_STUDIO_BASE_URL}/chat/completions`, {
+      method: "POST",
+      body: JSON.stringify({ model: MODEL_ID, tools: [] }),
+    });
+    await response.text();
+  } finally {
+    capture.restore();
+    globalThis.fetch = originalFetch;
+  }
+  const summary = summaries.at(-1);
+  if (!summary) {
+    throw new Error("provider response fixture did not produce a summary");
+  }
+  return summary;
+}
+
+type ProviderResponseSummaryState = {
+  contentType: string | null;
+  decoder: TextDecoder;
+  buffer: string;
+  sse: boolean;
+  shapes: Set<string>;
+  finishReason: string | null;
+  contentPresent: boolean;
+  contentLength: number;
+  toolCalls: Map<string, string>;
+  outputItemTypes: Set<string>;
+  sawTerminal: boolean;
+  parseErrors: number;
+};
+
+function createResponseSummaryState(
+  contentType: string | null = null,
+): ProviderResponseSummaryState {
+  return {
+    contentType,
+    decoder: new TextDecoder(),
+    buffer: "",
+    sse: contentType?.toLowerCase().includes("text/event-stream") ?? false,
+    shapes: new Set(),
+    finishReason: null,
+    contentPresent: false,
+    contentLength: 0,
+    toolCalls: new Map(),
+    outputItemTypes: new Set(),
+    sawTerminal: false,
+    parseErrors: 0,
+  };
+}
+
+function createPendingProviderResponseSummary(response: Response): ProviderResponseSummary {
+  return {
+    responseShape: response.headers.get("content-type")?.includes("event-stream")
+      ? "sse"
+      : "unknown",
+    finishReason: null,
+    contentPresent: false,
+    contentLength: 0,
+    toolCallCount: 0,
+    toolCallNames: [],
+    outputItemTypes: [],
+    parserOutcome: response.body ? "body-pending" : "empty-body",
+    httpStatus: response.status,
+    contentType: response.headers.get("content-type"),
+  };
+}
+
+function consumeProviderResponseChunk(
+  state: ProviderResponseSummaryState,
+  chunk: Uint8Array,
+): void {
+  state.buffer += state.decoder.decode(chunk, { stream: true });
+  if (!state.sse && state.buffer.includes("data:")) {
+    state.sse = true;
+  }
+  if (!state.sse) {
+    if (state.buffer.length > 131_072) {
+      state.buffer = "";
+      state.parseErrors += 1;
+    }
+    return;
+  }
+  const lines = state.buffer.split(/\r?\n/);
+  state.buffer = lines.pop() ?? "";
+  for (const line of lines) {
+    consumeProviderResponseLine(state, line);
+  }
+}
+
+function finishProviderResponseState(state: ProviderResponseSummaryState): void {
+  state.buffer += state.decoder.decode();
+  if (state.sse) {
+    if (state.buffer.length > 0) {
+      consumeProviderResponseLine(state, state.buffer);
+    }
+    return;
+  }
+  const payload = state.buffer.trim();
+  if (!payload) {
+    return;
+  }
+  try {
+    consumeProviderResponsePayload(state, JSON.parse(payload) as unknown);
+  } catch {
+    state.parseErrors += 1;
+  }
+}
+
+function consumeProviderResponseLine(state: ProviderResponseSummaryState, line: string): void {
+  const trimmed = line.trim();
+  if (trimmed.startsWith("event:")) {
+    const eventName = trimmed.slice("event:".length).trim();
+    if (eventName === "response.completed" || eventName === "response.done") {
+      state.sawTerminal = true;
+    }
+    return;
+  }
+  if (!trimmed.startsWith("data:")) {
+    return;
+  }
+  const data = trimmed.slice("data:".length).trim();
+  if (data === "[DONE]") {
+    state.sawTerminal = true;
+    return;
+  }
+  try {
+    consumeProviderResponsePayload(state, JSON.parse(data) as unknown);
+  } catch {
+    state.parseErrors += 1;
+  }
+}
+
+function consumeProviderResponsePayload(state: ProviderResponseSummaryState, value: unknown): void {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    state.parseErrors += 1;
+    return;
+  }
+  const payload = value as Record<string, unknown>;
+  addStringShape(state.shapes, payload.object);
+  addStringShape(state.shapes, payload.type);
+  if (payload.type === "response.completed" || payload.type === "response.done") {
+    state.sawTerminal = true;
+  }
+  const choices = Array.isArray(payload.choices) ? payload.choices : [];
+  for (const choice of choices) {
+    if (!choice || typeof choice !== "object" || Array.isArray(choice)) {
+      continue;
+    }
+    const choiceRecord = choice as Record<string, unknown>;
+    if (typeof choiceRecord.finish_reason === "string") {
+      state.finishReason = choiceRecord.finish_reason;
+      state.sawTerminal = true;
+    }
+    const delta = asRecord(choiceRecord.delta) ?? asRecord(choiceRecord.message);
+    if (delta) {
+      collectProviderResponseContent(state, delta.content);
+      collectProviderResponseToolCalls(state, delta.tool_calls);
+    }
+  }
+  collectProviderResponseContent(state, payload.content);
+  collectProviderResponseContent(state, payload.delta);
+  collectProviderResponseToolCalls(state, payload.tool_calls);
+  const item = asRecord(payload.item);
+  if (item) {
+    addStringShape(state.outputItemTypes, item.type);
+    collectProviderResponseContent(state, item.content);
+    collectProviderResponseToolCalls(state, item.tool_calls);
+  }
+  const output = Array.isArray(payload.output) ? payload.output : [];
+  for (const entry of output) {
+    const outputItem = asRecord(entry);
+    if (outputItem) {
+      addStringShape(state.outputItemTypes, outputItem.type);
+      collectProviderResponseToolCalls(state, outputItem.tool_calls);
+      if (outputItem.type === "function_call" && typeof outputItem.name === "string") {
+        addProviderToolCall(state, outputItem.name, outputItem.call_id);
+      }
+    }
+  }
+}
+
+function collectProviderResponseContent(state: ProviderResponseSummaryState, value: unknown): void {
+  if (typeof value === "string") {
+    state.contentPresent = true;
+    state.contentLength += value.length;
+  }
+}
+
+function collectProviderResponseToolCalls(
+  state: ProviderResponseSummaryState,
+  value: unknown,
+): void {
+  if (!Array.isArray(value)) {
+    return;
+  }
+  for (const [index, call] of value.entries()) {
+    const record = asRecord(call);
+    const functionRecord = record ? asRecord(record.function) : undefined;
+    const name =
+      (functionRecord && typeof functionRecord.name === "string" && functionRecord.name) ||
+      (record && typeof record.name === "string" && record.name) ||
+      null;
+    if (name) {
+      addProviderToolCall(state, name, record?.id ?? record?.index ?? index);
+    }
+  }
+}
+
+function addProviderToolCall(
+  state: ProviderResponseSummaryState,
+  name: string,
+  identity: unknown,
+): void {
+  const key = `${typeof identity === "string" || typeof identity === "number" ? identity : "?"}:${name}`;
+  state.toolCalls.set(key, name);
+}
+
+function finishProviderResponseSummary(
+  initial: ProviderResponseSummary,
+  state: ProviderResponseSummaryState,
+): ProviderResponseSummary {
+  const toolCallNames = [...state.toolCalls.values()];
+  return {
+    ...initial,
+    responseShape: [...state.shapes].join("|") || initial.responseShape,
+    finishReason: state.finishReason,
+    contentPresent: state.contentPresent,
+    contentLength: state.contentLength,
+    toolCallCount: toolCallNames.length,
+    toolCallNames,
+    outputItemTypes: [...state.outputItemTypes],
+    parserOutcome:
+      state.parseErrors > 0
+        ? "parse-error"
+        : state.sawTerminal
+          ? toolCallNames.length > 0
+            ? "tool-call-complete"
+            : "no-tool-complete"
+          : toolCallNames.length > 0
+            ? "tool-call-stream-closed-without-terminal"
+            : "stream-closed-without-terminal",
+  };
+}
+
+function addStringShape(target: Set<string>, value: unknown): void {
+  if (typeof value === "string" && value.length > 0 && target.size < 8) {
+    target.add(value);
+  }
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function serializeSmokeError(error: unknown): SerializedSmokeError {
+  return {
+    name: error instanceof Error ? error.name : "NonErrorThrown",
+    message: error instanceof Error ? error.message : String(error),
   };
 }
 

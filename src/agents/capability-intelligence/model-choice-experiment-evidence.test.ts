@@ -157,6 +157,41 @@ describe("v1I evidence protocol", () => {
       "duplicate valid v1I cell",
     );
   });
+
+  it("does not classify incomplete synthetic strata", () => {
+    const required = requiredV1ICells("synthetic", TOOL_RANKING_HELD_OUT_CASES);
+    const observations = required.map((cell) =>
+      makeObservation({
+        surfaceMode: cell.surfaceMode,
+        caseId: cell.caseId,
+        arm: cell.arm,
+        replicate: cell.replicate,
+      }),
+    );
+    for (const count of [0, 1, 101]) {
+      const summary = summarizeV1IObservations(
+        observations.slice(0, count),
+        [],
+        102,
+        "synthetic",
+        undefined,
+        required,
+      );
+      expect(summary.status).toBe("PARTIAL");
+      expect(summary.result).toBe("NOT_CLASSIFIED");
+    }
+    const complete = summarizeV1IObservations(
+      observations,
+      [],
+      102,
+      "synthetic",
+      undefined,
+      required,
+    );
+    expect(complete.status).toBe("COMPLETE");
+    expect(complete.result).not.toBe("NOT_CLASSIFIED");
+    expect(complete.pairedCaseCount).toBe(17);
+  });
 });
 
 function makeManifest(): V1IManifest {

@@ -124,6 +124,7 @@ export type V1ISummary = {
     | "STABLE_MODEL_CHOICE"
     | "STOCHASTIC_SUBSTITUTION"
     | "INCONCLUSIVE"
+    | "NOT_CLASSIFIED"
     | "DESCRIPTIVE_ONLY";
   expectedCells: number;
   validRuns: number;
@@ -272,6 +273,7 @@ export function summarizeV1IObservations(
   expectedCells: number,
   mode: V1IMode,
   bootstrapSeed = V1I_BOOTSTRAP_SEED,
+  requiredCells?: readonly V1IRequiredCell[],
 ): V1ISummary {
   assertNoDuplicateValidCells(observations);
   const armA = observations.filter((entry) => entry.arm === "A");
@@ -338,11 +340,25 @@ export function summarizeV1IObservations(
   const integrityRegressions = observations.filter(
     (entry) => !entry.valid || entry.invalidReason !== null,
   ).length;
-  const status = observations.length === expectedCells ? "COMPLETE" : "PARTIAL";
+  const observedCells = new Set(observations.map(v1ICellKey));
+  const requiredCellSet = requiredCells && new Set(requiredCells.map(v1ICellKey));
+  const allRequiredCellsPresent =
+    !requiredCellSet ||
+    (requiredCellSet.size === observedCells.size &&
+      [...requiredCellSet].every((cell) => observedCells.has(cell)));
+  const expectedPairedCases = requiredCells
+    ? new Set(requiredCells.map((cell) => cell.caseId)).size
+    : undefined;
+  const complete =
+    observations.length === expectedCells &&
+    allRequiredCellsPresent &&
+    (expectedPairedCases === undefined || deltas.length === expectedPairedCases);
+  const status = complete ? "COMPLETE" : "PARTIAL";
   return {
     status,
-    result:
-      mode === "real-adapter"
+    result: !complete
+      ? "NOT_CLASSIFIED"
+      : mode === "real-adapter"
         ? "DESCRIPTIVE_ONLY"
         : classifyResult(mode, delta, interval[0], modal.mean, integrityRegressions, armA, armB),
     expectedCells,

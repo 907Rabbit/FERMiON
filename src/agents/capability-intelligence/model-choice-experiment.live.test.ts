@@ -21,6 +21,7 @@ import {
   finalizeV1IArtifact,
   hashV1ICanonical,
   resolveV1IMode,
+  requiredV1ICells,
   splitV1IExperimentSets,
   summarizeV1IObservations,
   surfaceModeForV1IMode,
@@ -72,7 +73,9 @@ type ModelPayloadCapture = {
   restore: () => void;
 };
 
-const describeLive = LIVE ? describe : describe.skip;
+const SMOKE_TEST = LIVE && process.env.OPENCLAW_V1I_SMOKE_TEST === "1";
+const describeFullLive = LIVE && !SMOKE_TEST ? describe : describe.skip;
+const describeSmokeLive = SMOKE_TEST ? describe : describe.skip;
 const LIVE_MODE = resolveV1IMode(LIVE, process.env.OPENCLAW_V1I_MODE);
 
 describe("v1I model-choice experiment preparation", () => {
@@ -94,6 +97,10 @@ describe("v1I model-choice experiment preparation", () => {
     expect(new Set(harness.clientTools.map((tool) => tool.function.name))).toEqual(
       new Set(firstCase.tools.map((tool) => tool.name)),
     );
+    expect(buildSyntheticRunnerOverrides(harness)).toEqual({
+      clientTools: harness.clientTools,
+    });
+    expect(buildSyntheticRunnerOverrides(harness)).not.toHaveProperty("disableTools");
     expect(syntheticTools.size).toBeGreaterThan(0);
     expect(JSON.stringify(harness.clientTools)).not.toMatch(
       /requiredTools|relevantTools|expectedOutcome|toolRoles|rank/i,
@@ -137,9 +144,95 @@ describe("v1I harness evidence repair", () => {
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
+
+  it("preserves model-error status instead of collapsing it into HARNESS_ERROR", () => {
+    expect(invalidReasonForExecutionStatus("model-error")).toBe("MODEL_ERROR");
+    expect(invalidReasonForExecutionStatus("runtime-error")).toBe("HARNESS_ERROR");
+    expect(invalidReasonForExecutionStatus("aborted")).toBe("HARNESS_ERROR");
+    expect(invalidReasonForExecutionStatus("completed")).toBeNull();
+  });
 });
 
-describeLive("v1I model-choice experiment live", () => {
+describeSmokeLive("v1I model-choice experiment smoke", () => {
+  it(
+    "runs one synthetic case, arm, and replicate into a separate artifact",
+    { timeout: 600_000 },
+    async () => {
+      expect(LIVE_MODE).toBe("synthetic");
+      expect(ACTIVE_FILTERING_ENABLED).toBe(false);
+      const benchmarkCase = TOOL_RANKING_HELD_OUT_CASES[0];
+      if (!benchmarkCase) {
+        throw new Error("held-out corpus is empty");
+      }
+      const smokeRoot = path.resolve(
+        process.env.OPENCLAW_V1I_SMOKE_ARTIFACT_DIR ??
+          "artifacts/capability-intelligence/v1i-smoke",
+      );
+      fs.mkdirSync(smokeRoot, { recursive: true });
+      const smokeInput = {
+        mode: "synthetic" as const,
+        surfaceMode: "SYNTHETIC" as const,
+        benchmarkCase,
+        mappingClass: "SYNTHETIC" as const,
+        authorizedNames: benchmarkCase.tools.map((tool) => tool.name),
+        v1cTop8: rankTop8(benchmarkCase.tools, benchmarkCase.query),
+        arm: "A" as const,
+        replicate: 1,
+        attempt: 1,
+        scheduleSeed: scheduleSeedFor(benchmarkCase.id, 1),
+      };
+      const smokeManifest = {
+        harnessCommit: HARNESS_COMMIT,
+        model: modelConfigIdentity(),
+        modelConfigHash: hashV1ICanonical(modelConfigIdentity()),
+        activeFilteringEnabled: false,
+        caseId: benchmarkCase.id,
+        arm: smokeInput.arm,
+        replicate: smokeInput.replicate,
+      };
+      fs.writeFileSync(
+        path.join(smokeRoot, "smoke-manifest.json"),
+        `${JSON.stringify(smokeManifest, null, 2)}\n`,
+      );
+      await assertLiveModelAvailable();
+      const workspaceDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-v1i-smoke-"));
+      try {
+        const observation = await runV1IAttempt(
+          smokeInput,
+          () =>
+            runOne({
+              ...smokeInput,
+              config: buildLiveConfig(workspaceDir),
+              workspaceDir,
+            }),
+          (value) => {
+            fs.writeFileSync(
+              path.join(smokeRoot, "smoke-observation.json"),
+              `${JSON.stringify(value, null, 2)}\n`,
+            );
+          },
+        );
+        const result = {
+          status: observation.valid ? "PASS" : "FAIL",
+          harnessCommit: HARNESS_COMMIT,
+          modelConfigHash: smokeManifest.modelConfigHash,
+          activeFilteringEnabled: false,
+          observationValid: observation.valid,
+          rankingEpoch: observation.rankingEpoch,
+        };
+        fs.writeFileSync(
+          path.join(smokeRoot, "smoke-result.json"),
+          `${JSON.stringify(result, null, 2)}\n`,
+        );
+        expect(observation.valid).toBe(true);
+      } finally {
+        fs.rmSync(workspaceDir, { recursive: true, force: true });
+      }
+    },
+  );
+});
+
+describeFullLive("v1I model-choice experiment live", () => {
   it(
     "runs one explicitly selected evidence stratum without pooling",
     { timeout: 3_600_000 },
@@ -167,6 +260,9 @@ describeLive("v1I model-choice experiment live", () => {
       const artifactRoot = path.resolve(
         process.env.OPENCLAW_V1I_ARTIFACT_DIR ?? "artifacts/capability-intelligence/v1i",
       );
+      if (mode === "synthetic") {
+        assertSyntheticSmokePassed();
+      }
       const manifest = buildManifest(sets);
       const state = createV1IArtifactState(artifactRoot, manifest, mode);
       const completedCells = new Set(state.observations.map(v1ICellKey));
@@ -203,6 +299,8 @@ describeLive("v1I model-choice experiment live", () => {
           state.invalidAttempts,
           expectedCellsForV1IMode(mode),
           mode,
+          V1I_BOOTSTRAP_SEED,
+          requiredV1ICells(mode, cases),
         );
         state.manifest.completedAt = new Date().toISOString();
         fs.writeFileSync(
@@ -341,7 +439,7 @@ async function runOne(input: {
       const originalResultListener = params.onAgentToolResult;
       const result = await runEmbeddedAgent({
         ...params,
-        ...(harness ? { clientTools: [...harness.clientTools], disableTools: true } : {}),
+        ...(harness ? buildSyntheticRunnerOverrides(harness) : {}),
         ...(input.arm === "B" ? { extraSystemPrompt: ARM_B_INSTRUCTION } : {}),
         onEmbeddedReplayFact: (fact) => {
           if (fact.kind === "ranking") {
@@ -608,8 +706,9 @@ function describeInvalidRun(input: {
   observedRanking?: { epoch: string };
   requestBodies: readonly Record<string, unknown>[];
 }): string {
-  if (input.execution.status !== "completed") {
-    return "HARNESS_ERROR";
+  const statusReason = invalidReasonForExecutionStatus(input.execution.status);
+  if (statusReason) {
+    return statusReason;
   }
   if (!input.observedRanking?.epoch) {
     return "MISSING_RANKING_EPOCH";
@@ -627,6 +726,41 @@ function describeInvalidRun(input: {
     return "SCHEMA_DRIFT";
   }
   return "INCOMPLETE_TERMINAL_EVIDENCE";
+}
+
+function invalidReasonForExecutionStatus(status: string): string | null {
+  if (status === "completed") {
+    return null;
+  }
+  return status === "model-error" ? "MODEL_ERROR" : "HARNESS_ERROR";
+}
+
+function assertSyntheticSmokePassed(): void {
+  const smokeRoot = path.resolve(
+    process.env.OPENCLAW_V1I_SMOKE_ARTIFACT_DIR ?? "artifacts/capability-intelligence/v1i-smoke",
+  );
+  const resultPath = path.join(smokeRoot, "smoke-result.json");
+  if (!fs.existsSync(resultPath)) {
+    throw new Error(
+      `PREPARED_NOT_STARTED: synthetic smoke artifact is missing at ${resultPath}; run the one-cell smoke first`,
+    );
+  }
+  const result = JSON.parse(fs.readFileSync(resultPath, "utf8")) as Record<string, unknown>;
+  if (
+    result.status !== "PASS" ||
+    result.harnessCommit !== HARNESS_COMMIT ||
+    result.modelConfigHash !== hashV1ICanonical(modelConfigIdentity()) ||
+    result.activeFilteringEnabled !== false ||
+    result.observationValid !== true
+  ) {
+    throw new Error("PREPARED_NOT_STARTED: synthetic smoke artifact is not a matching pass");
+  }
+}
+
+function buildSyntheticRunnerOverrides(
+  harness: ReturnType<typeof createSyntheticBenchmarkToolHarness>,
+): Pick<RunEmbeddedAgentParams, "clientTools"> {
+  return { clientTools: [...harness.clientTools] };
 }
 
 function buildManifest(sets: ReturnType<typeof splitV1IExperimentSets>): V1IManifest {

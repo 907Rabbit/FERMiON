@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import type { BenchmarkRealToolMappingSummary } from "./benchmark-real-tool-mapping.js";
@@ -7,6 +8,15 @@ export const V1I_SCHEMA_VERSION = 1;
 export const V1I_EXPERIMENT_VERSION = "v1I";
 export const V1I_BOOTSTRAP_SEED = 0x1a1f1;
 export const V1I_REPLICATES = 3;
+
+/** Canonical JSON hashing is limited to the evidence protocol's JSON provenance values. */
+export function canonicalizeV1IValue(value: unknown): string {
+  return stringifyV1IValue(value, "$", new WeakSet());
+}
+
+export function hashV1ICanonical(value: unknown): string {
+  return createHash("sha256").update(canonicalizeV1IValue(value), "utf8").digest("hex");
+}
 
 export const V1I_MODES = ["synthetic", "real-exact", "real-adapter"] as const;
 export type V1IMode = (typeof V1I_MODES)[number];
@@ -368,7 +378,8 @@ export function createV1IArtifactState(
   if (fs.existsSync(manifestPath)) {
     const existing = JSON.parse(fs.readFileSync(manifestPath, "utf8")) as V1IManifest;
     if (
-      stableJson(manifestCompatibility(existing)) !== stableJson(manifestCompatibility(manifest))
+      canonicalizeV1IValue(manifestCompatibility(existing)) !==
+      canonicalizeV1IValue(manifestCompatibility(manifest))
     ) {
       throw new Error("incompatible v1I manifest; use a fresh artifact directory");
     }
@@ -570,15 +581,53 @@ function readJsonl<T>(filename: string): T[] {
     .map((line) => JSON.parse(line) as T);
 }
 
-function stableJson(value: unknown): string {
+function stringifyV1IValue(value: unknown, valuePath: string, stack: WeakSet<object>): string {
+  if (value === null) {
+    return "null";
+  }
+  if (typeof value === "string" || typeof value === "boolean") {
+    return JSON.stringify(value);
+  }
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) {
+      throw new TypeError(`unsupported v1I hash value at ${valuePath}: non-finite number`);
+    }
+    return JSON.stringify(value);
+  }
   if (Array.isArray(value)) {
-    return `[${value.map(stableJson).join(",")}]`;
+    if (stack.has(value)) {
+      throw new TypeError(`unsupported v1I hash value at ${valuePath}: circular array`);
+    }
+    stack.add(value);
+    try {
+      return `[${value.map((entry, index) => stringifyV1IValue(entry, `${valuePath}[${index}]`, stack)).join(",")}]`;
+    } finally {
+      stack.delete(value);
+    }
   }
-  if (value && typeof value === "object") {
-    return `{${Object.keys(value as Record<string, unknown>)
-      .toSorted()
-      .map((key) => `${JSON.stringify(key)}:${stableJson((value as Record<string, unknown>)[key])}`)
-      .join(",")}}`;
+  if (typeof value === "object") {
+    if (stack.has(value)) {
+      throw new TypeError(`unsupported v1I hash value at ${valuePath}: circular object`);
+    }
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) {
+      throw new TypeError(`unsupported v1I hash value at ${valuePath}: non-JSON object`);
+    }
+    stack.add(value);
+    try {
+      const record = value as Record<string, unknown>;
+      const keys = Object.keys(record).toSorted();
+      const fields = keys.map((key) => {
+        const descriptor = Object.getOwnPropertyDescriptor(record, key);
+        if (!descriptor || !("value" in descriptor)) {
+          throw new TypeError(`unsupported v1I hash value at ${valuePath}.${key}: accessor`);
+        }
+        return `${JSON.stringify(key)}:${stringifyV1IValue(descriptor.value, `${valuePath}.${key}`, stack)}`;
+      });
+      return `{${fields.join(",")}}`;
+    } finally {
+      stack.delete(value);
+    }
   }
-  return JSON.stringify(value);
+  throw new TypeError(`unsupported v1I hash value at ${valuePath}: ${typeof value}`);
 }

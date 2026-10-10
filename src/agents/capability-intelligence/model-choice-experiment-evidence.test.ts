@@ -6,9 +6,11 @@ import { summarizeBenchmarkRealToolMappings } from "./benchmark-real-tool-mappin
 import {
   appendV1IObservation,
   assertNoDuplicateValidCells,
+  canonicalizeV1IValue,
   createV1IArtifactState,
   expectedCellsForV1IMode,
   finalizeV1IArtifact,
+  hashV1ICanonical,
   missingV1ICells,
   resolveV1IMode,
   requiredV1ICells,
@@ -20,6 +22,20 @@ import {
 import { TOOL_RANKING_HELD_OUT_CASES } from "./tool-ranking-benchmark-cases.js";
 
 describe("v1I evidence protocol", () => {
+  it("hashes structured provenance canonically and rejects non-JSON values", () => {
+    expect(hashV1ICanonical({ b: 2, a: { y: false, x: ["one", null] } })).toBe(
+      hashV1ICanonical({ a: { x: ["one", null], y: false }, b: 2 }),
+    );
+    expect(hashV1ICanonical(["one", "two"])).not.toBe(hashV1ICanonical(["two", "one"]));
+    expect(canonicalizeV1IValue({ nested: [{ value: 1 }, { value: true }] })).toBe(
+      '{"nested":[{"value":1},{"value":true}]}',
+    );
+    expect(hashV1ICanonical("stable")).toBe(hashV1ICanonical("stable"));
+    expect(hashV1ICanonical(null)).toBe(hashV1ICanonical(null));
+    expect(() => hashV1ICanonical(undefined)).toThrow("unsupported v1I hash value");
+    expect(() => hashV1ICanonical(new Date(0))).toThrow("unsupported v1I hash value");
+  });
+
   it("splits the frozen corpus into 17 synthetic, 8 exact, 3 adapter, and 6 unsupported cases", () => {
     const summary = summarizeBenchmarkRealToolMappings(TOOL_RANKING_HELD_OUT_CASES);
     const sets = splitV1IExperimentSets(TOOL_RANKING_HELD_OUT_CASES, summary);
@@ -94,6 +110,22 @@ describe("v1I evidence protocol", () => {
       expect(() =>
         createV1IArtifactState(root, { ...manifest, modelConfigHash: "different" }, "synthetic"),
       ).toThrow("incompatible v1I manifest");
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("resumes a compatible manifest when the process crashed before JSONL output", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "v1i-manifest-only-test-"));
+    try {
+      const manifest = makeManifest();
+      const resumed = createV1IArtifactState(root, manifest, "synthetic");
+      expect(resumed.observations).toHaveLength(0);
+      expect(resumed.invalidAttempts).toHaveLength(0);
+      expect(missingV1ICells("synthetic", TOOL_RANKING_HELD_OUT_CASES, new Set())).toHaveLength(
+        102,
+      );
+      expect(fs.existsSync(path.join(root, "manifest.json"))).toBe(true);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }

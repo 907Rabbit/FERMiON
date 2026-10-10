@@ -4,10 +4,8 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
-import type {
-  EmbeddedAgentRunResult,
-  RunEmbeddedAgentParams,
-} from "../embedded-agent-runner/types.js";
+import type { RunEmbeddedAgentParams } from "../embedded-agent-runner/run/params.js";
+import type { EmbeddedAgentRunResult } from "../embedded-agent-runner/types.js";
 import {
   getBenchmarkRealToolMapping,
   summarizeBenchmarkRealToolMappings,
@@ -17,9 +15,11 @@ import type { EmbeddedReplayFact } from "./embedded-replay-observation.js";
 import {
   appendV1IObservation,
   assertNoDuplicateValidCells,
+  canonicalizeV1IValue,
   createV1IArtifactState,
   expectedCellsForV1IMode,
   finalizeV1IArtifact,
+  hashV1ICanonical,
   resolveV1IMode,
   splitV1IExperimentSets,
   summarizeV1IObservations,
@@ -98,6 +98,44 @@ describe("v1I model-choice experiment preparation", () => {
     expect(JSON.stringify(harness.clientTools)).not.toMatch(
       /requiredTools|relevantTools|expectedOutcome|toolRoles|rank/i,
     );
+  });
+});
+
+describe("v1I harness evidence repair", () => {
+  it("hashes the original array-shaped crash input without coercion", () => {
+    const observation = makeInvalidObservation({
+      ...makeTestInvalidObservationInput(),
+      reason: "SCHEMA_DRIFT",
+    });
+    expect(observation.valid).toBe(false);
+    expect(observation.authorizedSurfaceHash).toMatch(/^[0-9a-f]{64}$/);
+    expect(observation.schemaHash).toMatch(/^[0-9a-f]{64}$/);
+    expect(JSON.stringify(observation)).toContain('"valid":false');
+  });
+
+  it("records unexpected attempt failures as HARNESS_ERROR invalid observations", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "v1i-harness-error-test-"));
+    try {
+      const recorded: V1IObservation[] = [];
+      await runV1IAttempt(
+        makeTestInvalidObservationInput(),
+        async () => {
+          throw new Error("unexpected harness failure");
+        },
+        (observation) => {
+          recorded.push(observation);
+          appendV1IObservation(root, "synthetic", observation);
+        },
+      );
+      const persisted = JSON.parse(
+        fs.readFileSync(path.join(root, "synthetic-invalid.jsonl"), "utf8"),
+      ) as V1IObservation;
+      expect(recorded).toHaveLength(1);
+      expect(persisted.valid).toBe(false);
+      expect(persisted.invalidReason).toBe("HARNESS_ERROR");
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 });
 
@@ -236,46 +274,33 @@ async function runStratum(input: {
         ) {
           continue;
         }
-        let observation: ExperimentRun;
-        try {
-          observation = await runOne({
-            mode: input.mode,
-            surfaceMode: input.surfaceMode,
-            benchmarkCase,
-            eligibility,
-            mappingClass,
-            authorizedNames,
-            v1cTop8,
-            arm,
-            replicate,
-            scheduleSeed,
-            attempt:
-              input.nextAttemptByCell.get(
-                `${cell.surfaceMode}:${cell.caseId}:${cell.arm}:${cell.replicate}`,
-              ) ?? 1,
-            config: input.config,
-            workspaceDir: input.workspaceDir,
-          });
-        } catch (error) {
-          observation = makeInvalidObservation({
-            mode: input.mode,
-            surfaceMode: input.surfaceMode,
-            benchmarkCase,
-            mappingClass,
-            authorizedNames,
-            v1cTop8,
-            arm,
-            replicate,
-            scheduleSeed,
-            attempt:
-              input.nextAttemptByCell.get(
-                `${cell.surfaceMode}:${cell.caseId}:${cell.arm}:${cell.replicate}`,
-              ) ?? 1,
-            reason: classifyAttemptError(error),
-          });
-        }
+        const attemptInput = {
+          mode: input.mode,
+          surfaceMode: input.surfaceMode,
+          benchmarkCase,
+          mappingClass,
+          authorizedNames,
+          v1cTop8,
+          arm,
+          replicate,
+          attempt:
+            input.nextAttemptByCell.get(
+              `${cell.surfaceMode}:${cell.caseId}:${cell.arm}:${cell.replicate}`,
+            ) ?? 1,
+          scheduleSeed,
+        } satisfies Omit<InvalidObservationInput, "reason">;
+        const observation = await runV1IAttempt(
+          attemptInput,
+          () =>
+            runOne({
+              ...attemptInput,
+              eligibility,
+              config: input.config,
+              workspaceDir: input.workspaceDir,
+            }),
+          input.onObservation,
+        );
         runs.push(observation);
-        input.onObservation(observation);
       }
     }
   }
@@ -407,12 +432,12 @@ async function runOne(input: {
     modelId: MODEL_ID,
     provider: PROVIDER,
     contextLength: CONTEXT_LENGTH,
-    modelConfigHash: sha256(stableJson(modelConfigIdentity())),
+    modelConfigHash: hashV1ICanonical(modelConfigIdentity()),
     systemPromptHash: sha256(extractSystemPrompt(firstBody)),
     userPromptHash: sha256(input.benchmarkCase.query),
     experimentalInstructionHash: sha256(input.arm === "B" ? ARM_B_INSTRUCTION : ""),
-    authorizedSurfaceHash: sha256(toolNamesFromBody(firstBody)),
-    schemaHash: sha256(requestBodies.map((body) => body.tools ?? null)),
+    authorizedSurfaceHash: hashV1ICanonical(toolNamesFromBody(firstBody)),
+    schemaHash: hashV1ICanonical(requestBodies.map((body) => body.tools ?? null)),
     caseSetHash: frozenCaseSetHash(),
     rankerVersion: SHADOW_RANKER_VERSION,
     qualificationPolicyVersion: SHADOW_QUALIFICATION_POLICY_VERSION,
@@ -428,7 +453,7 @@ async function runOne(input: {
     preferredToolAttempted,
     substituteTool:
       firstExecutedTool && firstExecutedTool !== mappedRealTool ? firstExecutedTool : null,
-    benchmarkPreferredTool,
+    benchmarkPreferredTool: preferredBenchmarkTool,
     mappedRealTool,
     mappingClassification: input.mappingClass,
     substitutionWithoutPreferredAttempt,
@@ -531,20 +556,20 @@ function captureModelPayloads(): ModelPayloadCapture {
 }
 
 function sameSurfaceAcrossRequests(bodies: readonly Record<string, unknown>[]): boolean {
-  const first = stableJson(toolNamesFromBody(bodies[0] ?? {}));
-  return bodies.every((body) => stableJson(toolNamesFromBody(body)) === first);
+  const first = canonicalizeV1IValue(toolNamesFromBody(bodies[0] ?? {}));
+  return bodies.every((body) => canonicalizeV1IValue(toolNamesFromBody(body)) === first);
 }
 
 function sameSchemaAcrossRequests(bodies: readonly Record<string, unknown>[]): boolean {
-  const first = stableJson(bodies[0]?.tools ?? null);
-  return bodies.every((body) => stableJson(body.tools ?? null) === first);
+  const first = canonicalizeV1IValue(bodies[0]?.tools ?? null);
+  return bodies.every((body) => canonicalizeV1IValue(body.tools ?? null) === first);
 }
 
 function sameSurfaceAsExpected(
   body: Record<string, unknown>,
   expected: readonly string[],
 ): boolean {
-  return stableJson(toolNamesFromBody(body)) === stableJson([...expected]);
+  return canonicalizeV1IValue(toolNamesFromBody(body)) === canonicalizeV1IValue([...expected]);
 }
 
 function toolNamesFromBody(body: Record<string, unknown>): string[] {
@@ -607,16 +632,12 @@ function describeInvalidRun(input: {
 function buildManifest(sets: ReturnType<typeof splitV1IExperimentSets>): V1IManifest {
   const modelConfig = modelConfigIdentity();
   const caseHash = (entries: readonly ToolRankingBenchmarkCase[]) =>
-    sha256(
-      stableJson(
-        entries.map((entry) => ({ id: entry.id, query: entry.query, tools: entry.tools })),
-      ),
+    hashV1ICanonical(
+      entries.map((entry) => ({ id: entry.id, query: entry.query, tools: entry.tools })),
     );
   const surfaceHash = (entries: readonly ToolRankingBenchmarkCase[]) =>
-    sha256(
-      stableJson(
-        [...new Set(entries.flatMap((entry) => entry.tools.map((tool) => tool.name)))].toSorted(),
-      ),
+    hashV1ICanonical(
+      [...new Set(entries.flatMap((entry) => entry.tools.map((tool) => tool.name)))].toSorted(),
     );
   return {
     schemaVersion: V1I_SCHEMA_VERSION,
@@ -627,7 +648,7 @@ function buildManifest(sets: ReturnType<typeof splitV1IExperimentSets>): V1IMani
     provider: PROVIDER,
     contextLength: CONTEXT_LENGTH,
     modelConfig,
-    modelConfigHash: sha256(stableJson(modelConfig)),
+    modelConfigHash: hashV1ICanonical(modelConfig),
     rankerVersion: SHADOW_RANKER_VERSION,
     qualificationPolicyVersion: SHADOW_QUALIFICATION_POLICY_VERSION,
     scheduleSeed: V1I_BOOTSTRAP_SEED,
@@ -638,13 +659,11 @@ function buildManifest(sets: ReturnType<typeof splitV1IExperimentSets>): V1IMani
     syntheticSurfaceHash: surfaceHash(sets.synthetic),
     realExactSurfaceHash: surfaceHash(sets.realExact),
     realAdapterSurfaceHash: surfaceHash(sets.realAdapter),
-    schemaHash: sha256(
-      stableJson({
-        synthetic: sets.synthetic.map((entry) => entry.id),
-        realExact: sets.realExact.map((entry) => entry.id),
-        realAdapter: sets.realAdapter.map((entry) => entry.id),
-      }),
-    ),
+    schemaHash: hashV1ICanonical({
+      synthetic: sets.synthetic.map((entry) => entry.id),
+      realExact: sets.realExact.map((entry) => entry.id),
+      realAdapter: sets.realAdapter.map((entry) => entry.id),
+    }),
     systemPromptHash: sha256("runtime-system-prompt-captured-per-run"),
     experimentalInstructionHash: sha256(ARM_B_INSTRUCTION),
     startedAt: new Date().toISOString(),
@@ -667,7 +686,7 @@ function modelConfigIdentity(): Record<string, unknown> {
   };
 }
 
-function makeInvalidObservation(input: {
+type InvalidObservationInput = {
   mode: V1IMode;
   surfaceMode: V1ISurfaceMode;
   benchmarkCase: ToolRankingBenchmarkCase;
@@ -679,7 +698,31 @@ function makeInvalidObservation(input: {
   attempt: number;
   scheduleSeed: number;
   reason: string;
-}): ExperimentRun {
+};
+
+async function runV1IAttempt(
+  input: Omit<InvalidObservationInput, "reason">,
+  execute: () => Promise<ExperimentRun>,
+  onObservation: (observation: ExperimentRun) => void,
+): Promise<ExperimentRun> {
+  let observation: ExperimentRun;
+  try {
+    observation = await execute();
+  } catch (error) {
+    observation = makeInvalidObservationForError(input, error);
+  }
+  onObservation(observation);
+  return observation;
+}
+
+function makeInvalidObservationForError(
+  input: Omit<InvalidObservationInput, "reason">,
+  error: unknown,
+): ExperimentRun {
+  return makeInvalidObservation({ ...input, reason: classifyAttemptError(error) });
+}
+
+function makeInvalidObservation(input: InvalidObservationInput): ExperimentRun {
   const preferredBenchmarkTool = input.benchmarkCase.expectedTopTools[0] ?? "";
   const mappedRealTool =
     input.mode === "synthetic"
@@ -699,12 +742,12 @@ function makeInvalidObservation(input: {
     modelId: MODEL_ID,
     provider: PROVIDER,
     contextLength: CONTEXT_LENGTH,
-    modelConfigHash: sha256(stableJson(modelConfigIdentity())),
+    modelConfigHash: hashV1ICanonical(modelConfigIdentity()),
     systemPromptHash: sha256(""),
     userPromptHash: sha256(input.benchmarkCase.query),
     experimentalInstructionHash: sha256(input.arm === "B" ? ARM_B_INSTRUCTION : ""),
-    authorizedSurfaceHash: sha256(input.authorizedNames),
-    schemaHash: sha256(input.authorizedNames),
+    authorizedSurfaceHash: hashV1ICanonical(input.authorizedNames),
+    schemaHash: hashV1ICanonical(input.authorizedNames),
     caseSetHash: frozenCaseSetHash(),
     rankerVersion: SHADOW_RANKER_VERSION,
     qualificationPolicyVersion: SHADOW_QUALIFICATION_POLICY_VERSION,
@@ -732,6 +775,25 @@ function makeInvalidObservation(input: {
   };
 }
 
+function makeTestInvalidObservationInput(): Omit<InvalidObservationInput, "reason"> {
+  const benchmarkCase = TOOL_RANKING_HELD_OUT_CASES[0];
+  if (!benchmarkCase) {
+    throw new Error("held-out corpus is empty");
+  }
+  return {
+    mode: "synthetic",
+    surfaceMode: "SYNTHETIC",
+    benchmarkCase,
+    mappingClass: "SYNTHETIC",
+    authorizedNames: benchmarkCase.tools.map((tool) => tool.name),
+    v1cTop8: benchmarkCase.expectedTopTools,
+    arm: "A",
+    replicate: 1,
+    attempt: 1,
+    scheduleSeed: 1,
+  };
+}
+
 function classifyAttemptError(error: unknown): string {
   const message =
     error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
@@ -753,26 +815,11 @@ function sha256(value: string): string {
 }
 
 function frozenCaseSetHash(): string {
-  return sha256(
-    stableJson(
-      TOOL_RANKING_HELD_OUT_CASES.map((entry) => ({
-        id: entry.id,
-        query: entry.query,
-        tools: entry.tools,
-      })),
-    ),
+  return hashV1ICanonical(
+    TOOL_RANKING_HELD_OUT_CASES.map((entry) => ({
+      id: entry.id,
+      query: entry.query,
+      tools: entry.tools,
+    })),
   );
-}
-
-function stableJson(value: unknown): string {
-  if (Array.isArray(value)) {
-    return `[${value.map(stableJson).join(",")}]`;
-  }
-  if (value && typeof value === "object") {
-    return `{${Object.keys(value as Record<string, unknown>)
-      .toSorted()
-      .map((key) => `${JSON.stringify(key)}:${stableJson((value as Record<string, unknown>)[key])}`)
-      .join(",")}}`;
-  }
-  return JSON.stringify(value);
 }

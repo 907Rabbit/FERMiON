@@ -335,6 +335,15 @@ async function runEmbeddedAgentInternal(
           []
         ).slice(0, 8),
       });
+      params.capabilityIntelligenceExperiment?.onCheckpoint?.({
+        stage: "prepared-runtime-acquisition-entered",
+        toolCount: params.clientTools?.length ?? params.toolsAllow?.length ?? 0,
+        representativeToolNames: (
+          params.clientTools?.map((tool) => tool.function.name) ??
+          params.toolsAllow ??
+          []
+        ).slice(0, 8),
+      });
       const preparedModelRuntimeLease = await withEmbeddedRunLaneProgressHeartbeat(
         noteLaneTaskProgress,
         () =>
@@ -348,6 +357,15 @@ async function runEmbeddedAgentInternal(
                 ...(params.pluginGeneration ? { pluginGeneration: params.pluginGeneration } : {}),
               }),
       );
+      params.capabilityIntelligenceExperiment?.onCheckpoint?.({
+        stage: "prepared-runtime-acquisition-completed",
+        toolCount: params.clientTools?.length ?? params.toolsAllow?.length ?? 0,
+        representativeToolNames: (
+          params.clientTools?.map((tool) => tool.function.name) ??
+          params.toolsAllow ??
+          []
+        ).slice(0, 8),
+      });
       params.capabilityIntelligenceExperiment?.onCheckpoint?.({
         stage: "runtime-preparation-completed",
         toolCount: params.clientTools?.length ?? params.toolsAllow?.length ?? 0,

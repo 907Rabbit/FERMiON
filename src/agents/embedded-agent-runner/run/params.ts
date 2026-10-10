@@ -75,6 +75,8 @@ export type EmbeddedCapabilityIntelligenceCheckpointStage =
   | "session-target-resolution-completed"
   | "runner-entry"
   | "runtime-preparation-entered"
+  | "prepared-runtime-acquisition-entered"
+  | "prepared-runtime-acquisition-completed"
   | "runtime-preparation-completed"
   | "attempt-dispatch-entered"
   | "client-preparation-entered"

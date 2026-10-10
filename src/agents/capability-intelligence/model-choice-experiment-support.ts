@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
+import { withEnvAsync } from "../../test-utils/env.js";
 import type { RunEmbeddedAgentParams } from "../embedded-agent-runner/run/params.js";
 import { getBenchmarkRealToolMapping } from "./benchmark-real-tool-mapping.js";
 import {
@@ -162,12 +163,14 @@ export function smokeStageForCheckpoint(stage: string): V1ISmokeStage | undefine
   if (
     stage === "runner-entry" ||
     stage === "session-target-resolution-entered" ||
-    stage === "runtime-preparation-entered"
+    stage === "runtime-preparation-entered" ||
+    stage === "prepared-runtime-acquisition-entered"
   ) {
     return "workspaceSessionPreparation";
   }
   if (
     stage === "session-target-resolution-completed" ||
+    stage === "prepared-runtime-acquisition-completed" ||
     stage === "runtime-preparation-completed" ||
     stage === "attempt-dispatch-entered" ||
     stage === "client-preparation-entered" ||
@@ -213,6 +216,12 @@ export function smokeStageForCheckpoint(stage: string): V1ISmokeStage | undefine
     return "terminalCompletion";
   }
   return undefined;
+}
+
+// Synthetic v1I supplies its complete client surface directly. Avoid cold bundled-extension
+// discovery in this experiment-only path; production Gateway startup remains unchanged.
+export function withSyntheticModelChoiceEnvironment<T>(fn: () => Promise<T>): Promise<T> {
+  return withEnvAsync({ OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1" }, fn);
 }
 
 export type ExperimentDiagnostics = {

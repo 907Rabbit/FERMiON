@@ -74,6 +74,7 @@ import {
   scheduleSeedFor,
   smokeStageForCheckpoint,
   sha256,
+  withSyntheticModelChoiceEnvironment,
   type Arm,
   type InvalidObservationInput,
   type MappingClass,
@@ -680,6 +681,9 @@ async function runOne(input: {
       : never,
   ) => void;
 }): Promise<ExperimentRun> {
+  if (input.mode === "synthetic" && process.env.OPENCLAW_DISABLE_BUNDLED_PLUGINS !== "1") {
+    return await withSyntheticModelChoiceEnvironment(() => runOne(input));
+  }
   const harness =
     input.mode === "synthetic"
       ? createSyntheticBenchmarkToolHarness(input.benchmarkCase)
@@ -1143,7 +1147,6 @@ describe("v1I offline request preparation", () => {
     const abortController = new AbortController();
     let delegatedRequests = 0;
     try {
-      await installOfflinePreparedRuntimeMock();
       const observation = await runOne({
         mode: "synthetic",
         surfaceMode: "SYNTHETIC",

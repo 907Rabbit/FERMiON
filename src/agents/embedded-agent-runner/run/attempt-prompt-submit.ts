@@ -45,6 +45,7 @@ import type { EmbeddedRunAttemptParams } from "./types.js";
  */
 type PromptSubmissionSession = {
   messages: AgentMessage[];
+  getActiveToolNames?: () => string[];
   agent: {
     state: { messages: AgentMessage[] };
     streamFn: StreamFn;
@@ -69,7 +70,10 @@ type SteeringLease = {
 type TrajectoryRecorder = ReturnType<typeof createTrajectoryRuntimeRecorder>;
 
 export async function submitEmbeddedAttemptPrompt(input: {
-  attempt: Pick<EmbeddedRunAttemptParams, "sessionId" | "userTurnTranscriptRecorder">;
+  attempt: Pick<
+    EmbeddedRunAttemptParams,
+    "sessionId" | "userTurnTranscriptRecorder" | "capabilityIntelligenceExperiment"
+  >;
   activeSession: PromptSubmissionSession;
   appendContext?: string;
   contextTokenBudget: number;
@@ -160,6 +164,12 @@ export async function submitEmbeddedAttemptPrompt(input: {
   };
   const cleanupProviderPromptHistoryTransform = installProviderPromptHistoryTransform();
   try {
+    const activeToolNames = activeSession.getActiveToolNames?.() ?? [];
+    input.attempt.capabilityIntelligenceExperiment?.onCheckpoint?.({
+      stage: "model-loop-entered",
+      toolCount: activeToolNames.length,
+      representativeToolNames: activeToolNames.slice(0, 8),
+    });
     if (input.runtimeOnly) {
       await input.promptActiveSession(input.transcriptPrompt, {
         preflightResult: armModelPromptTransform,
@@ -178,6 +188,11 @@ export async function submitEmbeddedAttemptPrompt(input: {
         cleanupRuntimeContextMessage();
       }
     }
+    input.attempt.capabilityIntelligenceExperiment?.onCheckpoint?.({
+      stage: "model-loop-completed",
+      toolCount: activeToolNames.length,
+      representativeToolNames: activeToolNames.slice(0, 8),
+    });
     if (input.leasedSteering) {
       ackPendingAgentSteeringItems(input.leasedSteering);
       input.onSteeringAcknowledged();

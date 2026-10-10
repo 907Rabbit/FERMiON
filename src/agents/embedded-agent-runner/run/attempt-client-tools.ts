@@ -39,6 +39,13 @@ export function prepareEmbeddedAttemptClientTools(params: {
   uncompactedEffectiveTools: AgentTool[];
   clientTools: EmbeddedRunAttemptParams["clientTools"];
 }) {
+  params.attempt.capabilityIntelligenceExperiment?.onCheckpoint?.({
+    stage: "client-preparation-entered",
+    toolCount: params.clientTools?.length ?? 0,
+    representativeToolNames: (params.clientTools ?? [])
+      .slice(0, 8)
+      .map((tool) => tool.function.name),
+  });
   // Reserve synchronously so parallel client-tool batches preserve assistant source order.
   const clientToolCallSlots: EmbeddedAttemptClientToolCallSlot[] = [];
   const clientToolCallSlotIndexes = new Map<string, number>();
@@ -177,6 +184,11 @@ export function prepareEmbeddedAttemptClientTools(params: {
   });
   const allCustomTools = [...customTools, ...clientToolDefs];
   const sessionToolAllowlist = toSessionToolAllowlist(collectRegisteredToolNames(allCustomTools));
+  params.attempt.capabilityIntelligenceExperiment?.onCheckpoint?.({
+    stage: "client-preparation-completed",
+    toolCount: clientToolDefs.length,
+    representativeToolNames: clientToolDefs.slice(0, 8).map((tool) => tool.name),
+  });
   return {
     allCustomTools,
     builtinToolNames,

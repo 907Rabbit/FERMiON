@@ -66,6 +66,38 @@ export type { ClientToolDefinition } from "../../command/shared-types.js";
 
 export type EmbeddedRunTrigger = "cron" | "heartbeat" | "manual" | "memory" | "overflow" | "user";
 
+export type EmbeddedCapabilityIntelligenceCheckpointStage =
+  | "synthetic-constructed"
+  | "embedded-input-accepted"
+  | "session-target-resolution-entered"
+  | "session-target-resolution-completed"
+  | "runner-entry"
+  | "runtime-preparation-entered"
+  | "runtime-preparation-completed"
+  | "attempt-dispatch-entered"
+  | "client-preparation-entered"
+  | "client-preparation-completed"
+  | "attempt-bundle-completed"
+  | "prompt-phase-entered"
+  | "prompt-tool-surface-completed"
+  | "provider-adapter-entered"
+  | "prompt-preflight-entered"
+  | "prompt-preflight-completed"
+  | "model-loop-entered"
+  | "model-loop-completed"
+  | "prompt-submission-completed"
+  | "provider-request-constructed";
+
+export type EmbeddedCapabilityIntelligenceExperimentHooks = {
+  onCheckpoint?: (checkpoint: {
+    stage: EmbeddedCapabilityIntelligenceCheckpointStage;
+    toolCount: number;
+    representativeToolNames: readonly string[];
+  }) => void;
+  onRequestPreparationError?: (input: { error: unknown; stage: string }) => void;
+  onProviderRequest?: (input: { payload: unknown; model: unknown }) => void | Promise<void>;
+};
+
 export type ResolvedToolPromptFinalizer = (params: {
   prompt: string;
   messageToolAvailable: boolean;
@@ -248,6 +280,8 @@ export type RunEmbeddedAgentParams = {
   clientTools?: ClientToolDefinition[];
   /** Internal synthetic experiment mode: expose client tools without built-ins. */
   clientToolsOnly?: boolean;
+  /** Experiment-only request-preparation diagnostics; absent on ordinary runs. */
+  capabilityIntelligenceExperiment?: EmbeddedCapabilityIntelligenceExperimentHooks;
   /** Disable built-in tools for this run (LLM-only mode). */
   disableTools?: boolean;
   provider?: string;

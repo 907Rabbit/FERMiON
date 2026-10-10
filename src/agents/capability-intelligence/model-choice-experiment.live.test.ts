@@ -1,9 +1,8 @@
-import { execFileSync } from "node:child_process";
-import { createHash } from "node:crypto";
+/* oxlint-disable max-lines -- v1I live/offline evidence paths share one frozen harness. */
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { RunEmbeddedAgentParams } from "../embedded-agent-runner/run/params.js";
 import type { EmbeddedAgentRunResult } from "../embedded-agent-runner/types.js";
@@ -30,8 +29,6 @@ import {
   V1I_EXPERIMENT_VERSION,
   V1I_SCHEMA_VERSION,
   V1I_BOOTSTRAP_SEED,
-  type V1IManifest,
-  type V1IMappingClassification,
   type V1IMode,
   type V1IObservation,
   type V1ISurfaceMode,
@@ -49,18 +46,31 @@ import {
 } from "./tool-ranking-benchmark-cases.js";
 
 const LIVE = process.env.OPENCLAW_V1I_LIVE_TEST === "1";
-const MODEL_ID = "qwen/qwen3.5-9b";
-const PROVIDER = "lmstudio";
-const LM_STUDIO_BASE_URL = "http://127.0.0.1:1234/v1";
-const CONTEXT_LENGTH = 262_144;
-const HARNESS_COMMIT = resolveRepositoryHarnessCommit();
-const ARM_B_INSTRUCTION = `## Tool choice
-When multiple tools can perform a task, prefer the most specific purpose-built authorized tool.
-Use generic tools such as exec or read as fallbacks when the purpose-built tool cannot perform the required operation.
-Do not use a generic tool merely to reproduce functionality already provided directly by a more specific available tool.
-If a purpose-built tool is unavailable, inadequate, or fails, a generic fallback is appropriate.`;
-type Arm = "A" | "B";
-type MappingClass = V1IMappingClassification;
+import {
+  ARM_B_INSTRUCTION,
+  CONTEXT_LENGTH,
+  HARNESS_COMMIT,
+  LM_STUDIO_BASE_URL,
+  MODEL_ID,
+  PROVIDER,
+  assertSyntheticSmokePassed,
+  buildManifest,
+  buildSyntheticRunnerOverrides,
+  classifyRequestPreparationFailure,
+  createExperimentDiagnostics,
+  frozenCaseSetHash,
+  makeInvalidObservation,
+  makeTestInvalidObservationInput,
+  modelConfigIdentity,
+  orderedArms,
+  resolveHarnessCommit,
+  runV1IAttempt,
+  scheduleSeedFor,
+  sha256,
+  type Arm,
+  type InvalidObservationInput,
+  type MappingClass,
+} from "./model-choice-experiment-support.js";
 
 type CapturedModelRequest = {
   body: Record<string, unknown>;
@@ -71,8 +81,17 @@ type ExperimentRun = V1IObservation;
 
 type ModelPayloadCapture = {
   requests: CapturedModelRequest[];
+  delegatedRequests: number;
+  recordProviderRequest: (request: CapturedModelRequest) => void;
   restore: () => void;
 };
+
+class V1IProviderRequestCapturedError extends Error {
+  constructor() {
+    super("v1I provider request captured before network I/O");
+    this.name = "V1IProviderRequestCapturedError";
+  }
+}
 
 const SMOKE_TEST = LIVE && process.env.OPENCLAW_V1I_SMOKE_TEST === "1";
 const describeFullLive = LIVE && !SMOKE_TEST ? describe : describe.skip;
@@ -437,12 +456,75 @@ async function runOne(input: {
   scheduleSeed: number;
   config: OpenClawConfig;
   workspaceDir: string;
+  requestCapture?: {
+    stopAfterCapture?: boolean;
+    holdAfterCapture?: boolean;
+    onRequestCaptured?: (request: CapturedModelRequest) => void;
+    onDelegatedRequest?: () => void;
+  };
+  abortSignal?: AbortSignal;
+  timeoutMs?: number;
+  directRunner?: boolean;
+  provider?: string;
+  model?: string;
+  onCheckpoint?: (
+    checkpoint: NonNullable<
+      NonNullable<RunEmbeddedAgentParams["capabilityIntelligenceExperiment"]>["onCheckpoint"]
+    > extends (checkpoint: infer T) => void
+      ? T
+      : never,
+  ) => void;
 }): Promise<ExperimentRun> {
   const harness =
     input.mode === "synthetic"
       ? createSyntheticBenchmarkToolHarness(input.benchmarkCase)
       : undefined;
-  const capture = captureModelPayloads();
+  const runProvider = input.provider ?? PROVIDER;
+  const runModel = input.model ?? MODEL_ID;
+  const diagnostics = createExperimentDiagnostics();
+  const diagnosticsCheckpoint = diagnostics.hooks.onCheckpoint;
+  diagnostics.hooks.onCheckpoint = (checkpoint) => {
+    diagnosticsCheckpoint?.(checkpoint);
+    input.onCheckpoint?.(checkpoint);
+  };
+  diagnostics.hooks.onCheckpoint?.({
+    stage: "synthetic-constructed",
+    toolCount: harness?.clientTools.length ?? input.authorizedNames.length,
+    representativeToolNames: (harness?.clientTools ?? input.authorizedNames)
+      .slice(0, 8)
+      .map((tool) => (typeof tool === "string" ? tool : tool.function.name)),
+  });
+  const capture = captureModelPayloads(diagnostics.hooks, input.requestCapture);
+  const diagnosticsProviderRequest = diagnostics.hooks.onProviderRequest;
+  diagnostics.hooks.onProviderRequest = async ({ payload, model }) => {
+    const body =
+      payload && typeof payload === "object" && !Array.isArray(payload)
+        ? (payload as Record<string, unknown>)
+        : {};
+    const request = { body, url: "provider-adapter" };
+    capture.recordProviderRequest(request);
+    input.requestCapture?.onRequestCaptured?.(request);
+    const toolNames = toolNamesFromBody(body);
+    diagnostics.hooks.onCheckpoint?.({
+      stage: "provider-request-constructed",
+      toolCount: toolNames.length,
+      representativeToolNames: toolNames,
+    });
+    await diagnosticsProviderRequest?.({ payload, model });
+    if (input.requestCapture?.stopAfterCapture) {
+      throw new V1IProviderRequestCapturedError();
+    }
+    if (input.requestCapture?.holdAfterCapture) {
+      await new Promise<void>((_, reject) => {
+        const signal = input.abortSignal;
+        if (signal?.aborted) {
+          reject(abortReason(signal));
+          return;
+        }
+        signal?.addEventListener("abort", () => reject(abortReason(signal)), { once: true });
+      });
+    }
+  };
   const startTime = new Date().toISOString();
   let observedRanking: Extract<EmbeddedReplayFact, { kind: "ranking" }> | undefined;
   let observedFailure = false;
@@ -450,26 +532,44 @@ async function runOne(input: {
     | Awaited<ReturnType<typeof import("./embedded-replay-runtime.js").runEmbeddedReplay>>
     | undefined;
   try {
-    const { runEmbeddedReplay } = await import("./embedded-replay-runtime.js");
     const { runEmbeddedAgent } = await import("../embedded-agent-runner/run-orchestrator.js");
     const runner = async (params: RunEmbeddedAgentParams): Promise<EmbeddedAgentRunResult> => {
       const originalFactListener = params.onEmbeddedReplayFact;
       const originalResultListener = params.onAgentToolResult;
-      const result = await runEmbeddedAgent({
-        ...params,
-        ...(harness ? buildSyntheticRunnerOverrides(harness) : {}),
-        ...(input.arm === "B" ? { extraSystemPrompt: ARM_B_INSTRUCTION } : {}),
-        onEmbeddedReplayFact: (fact) => {
-          if (fact.kind === "ranking") {
-            observedRanking = fact;
-          }
-          originalFactListener?.(fact);
-        },
-        onAgentToolResult: (event) => {
-          observedFailure ||= event.isError;
-          originalResultListener?.(event);
-        },
+      diagnostics.hooks.onCheckpoint?.({
+        stage: "embedded-input-accepted",
+        toolCount: params.clientTools?.length ?? params.toolsAllow?.length ?? 0,
+        representativeToolNames: (
+          params.clientTools?.map((tool) => tool.function.name) ??
+          params.toolsAllow ??
+          []
+        ).slice(0, 8),
       });
+      let result: EmbeddedAgentRunResult;
+      try {
+        result = await runEmbeddedAgent({
+          ...params,
+          ...(harness ? buildSyntheticRunnerOverrides(harness) : {}),
+          ...(input.arm === "B" ? { extraSystemPrompt: ARM_B_INSTRUCTION } : {}),
+          capabilityIntelligenceExperiment: diagnostics.hooks,
+          onEmbeddedReplayFact: (fact) => {
+            if (fact.kind === "ranking") {
+              observedRanking = fact;
+            }
+            originalFactListener?.(fact);
+          },
+          onAgentToolResult: (event) => {
+            observedFailure ||= event.isError;
+            originalResultListener?.(event);
+          },
+        });
+      } catch (error) {
+        diagnostics.hooks.onRequestPreparationError?.({
+          error,
+          stage: "run-embedded-agent",
+        });
+        throw error;
+      }
       if (harness && observedRanking) {
         for (const call of result.meta.pendingToolCalls ?? []) {
           originalFactListener?.({
@@ -484,23 +584,75 @@ async function runOne(input: {
       }
       return result;
     };
-    execution = await runEmbeddedReplay({
-      request: {
-        runId: `v1i-${input.surfaceMode.toLowerCase()}-${input.benchmarkCase.id}-${input.arm}-${input.replicate}`,
-        turnId: "turn-1",
-        caseId: input.benchmarkCase.id,
-        prompt: input.benchmarkCase.query,
-        authorizedToolNames: input.authorizedNames,
-      },
-      options: {
-        workspaceDir: input.workspaceDir,
-        timeoutMs: 120_000,
-        provider: PROVIDER,
-        model: MODEL_ID,
-        config: input.config,
-        runner,
-      },
-    });
+    const runId = `v1i-${input.surfaceMode.toLowerCase()}-${input.benchmarkCase.id}-${input.arm}-${input.replicate}`;
+    if (input.directRunner) {
+      const { embeddedReplaySessionId, embeddedReplaySessionKey } =
+        await import("./embedded-replay-runtime.js");
+      const { prepareSystemAgentRunAdmission } = await import("../admitted-run-context.js");
+      const preparedRunAdmission = prepareSystemAgentRunAdmission(
+        input.config,
+        runId,
+        "main",
+        "capability-intelligence.embedded-replay",
+      );
+      try {
+        await runner({
+          runId,
+          prompt: input.benchmarkCase.query,
+          toolsAllow: [...input.authorizedNames],
+          sessionId: embeddedReplaySessionId(runId),
+          sessionKey: embeddedReplaySessionKey({ caseId: input.benchmarkCase.id, runId }),
+          workspaceDir: input.workspaceDir,
+          timeoutMs: input.timeoutMs ?? 120_000,
+          disableTrajectory: true,
+          preparedRunAdmission,
+          authProfileFailurePolicy: "local",
+          cleanupBundleMcpOnRunEnd: true,
+          ...(input.abortSignal === undefined ? {} : { abortSignal: input.abortSignal }),
+          provider: runProvider,
+          model: runModel,
+          config: input.config,
+        });
+      } catch (error) {
+        diagnostics.hooks.onRequestPreparationError?.({ error, stage: "run-embedded-agent" });
+      } finally {
+        preparedRunAdmission.close();
+      }
+      execution = {
+        status: input.abortSignal?.aborted ? "aborted" : "runtime-error",
+        result: {
+          runId,
+          turnId: "turn-1",
+          terminal: input.abortSignal?.aborted ? "aborted" : "failed",
+          executedTools: [],
+        },
+        versions: {
+          schemaVersion: 1,
+          rankerVersion: SHADOW_RANKER_VERSION,
+          qualificationPolicyVersion: SHADOW_QUALIFICATION_POLICY_VERSION,
+        },
+      };
+    } else {
+      const { runEmbeddedReplay } = await import("./embedded-replay-runtime.js");
+      execution = await runEmbeddedReplay({
+        request: {
+          runId,
+          turnId: "turn-1",
+          caseId: input.benchmarkCase.id,
+          prompt: input.benchmarkCase.query,
+          authorizedToolNames: input.authorizedNames,
+        },
+        options: {
+          workspaceDir: input.workspaceDir,
+          timeoutMs: input.timeoutMs ?? 120_000,
+          provider: runProvider,
+          model: runModel,
+          config: input.config,
+          runner,
+          ...(input.abortSignal === undefined ? {} : { abortSignal: input.abortSignal }),
+        },
+      });
+    }
   } finally {
     capture.restore();
   }
@@ -534,6 +686,12 @@ async function runOne(input: {
   const substitutionWithoutPreferredAttempt = Boolean(
     firstExecutedTool && firstExecutedTool !== mappedRealTool && !preferredToolAttempted,
   );
+  const terminalFailureReason = terminalFailureReasonForExecution({
+    status: completedExecution.status,
+    requestCount: requestBodies.length,
+    terminalSuccess,
+    observedFailure,
+  });
   const endTime = new Date().toISOString();
   return {
     surfaceMode: input.surfaceMode,
@@ -545,8 +703,8 @@ async function runOne(input: {
     replicate: input.replicate,
     attempt: input.attempt,
     scheduleSeed: input.scheduleSeed,
-    modelId: MODEL_ID,
-    provider: PROVIDER,
+    modelId: runModel,
+    provider: runProvider,
     contextLength: CONTEXT_LENGTH,
     modelConfigHash: hashV1ICanonical(modelConfigIdentity()),
     systemPromptHash: sha256(extractSystemPrompt(firstBody)),
@@ -563,12 +721,7 @@ async function runOne(input: {
     firstExecutedTool,
     executedToolSequence,
     terminalSuccess,
-    terminalFailureReason: terminalFailureReasonForExecution({
-      status: completedExecution.status,
-      requestCount: requestBodies.length,
-      terminalSuccess,
-      observedFailure,
-    }),
+    terminalFailureReason,
     preferredToolAuthorized,
     preferredToolInTop8,
     preferredToolAttempted,
@@ -589,6 +742,14 @@ async function runOne(input: {
           observedRanking,
           requestBodies,
         }),
+    requestPreparationDiagnostics: {
+      normalizedRuntimeStatus: completedExecution.status,
+      highLevelClassification: terminalFailureReason,
+      failureClass: classifyRequestPreparationFailure(diagnostics.readFailure()),
+      checkpoints: diagnostics.checkpoints,
+      lastSuccessfulCheckpoint: diagnostics.checkpoints.at(-1)?.stage ?? null,
+      ...(diagnostics.readFailure() ? { failure: diagnostics.readFailure() } : {}),
+    },
     startTime,
     endTime,
   };
@@ -605,6 +766,7 @@ function rankTop8(
 
 function buildLiveConfig(workspaceDir: string): OpenClawConfig {
   const modelRef = `${PROVIDER}/${MODEL_ID}`;
+  fs.mkdirSync(path.join(workspaceDir, "agent"), { recursive: true });
   return {
     agents: {
       defaults: {
@@ -614,7 +776,16 @@ function buildLiveConfig(workspaceDir: string): OpenClawConfig {
         skipBootstrap: true,
         skills: [],
       },
+      list: [
+        {
+          id: "main",
+          default: true,
+          workspace: workspaceDir,
+          agentDir: path.join(workspaceDir, "agent"),
+        },
+      ],
     },
+    session: { store: path.join(workspaceDir, "sessions.json") },
     models: {
       mode: "replace",
       providers: {
@@ -640,6 +811,324 @@ function buildLiveConfig(workspaceDir: string): OpenClawConfig {
   };
 }
 
+function buildOfflineRequestConfig(workspaceDir: string): OpenClawConfig {
+  const agentDir = path.join(workspaceDir, "agent");
+  fs.mkdirSync(agentDir, { recursive: true });
+  return {
+    agents: {
+      defaults: {
+        model: { primary: "openai/mock-replay" },
+        workspace: workspaceDir,
+        skipBootstrap: true,
+        skills: [],
+      },
+      list: [{ id: "main", default: true, workspace: workspaceDir, agentDir }],
+    },
+    session: { store: path.join(workspaceDir, "sessions.json") },
+    models: {
+      mode: "replace",
+      providers: {
+        openai: {
+          baseUrl: "http://127.0.0.1:1/v1",
+          apiKey: "offline-v1i",
+          api: "openai-responses",
+          request: { allowPrivateNetwork: true },
+          models: [
+            {
+              id: "mock-replay",
+              name: "mock-replay",
+              reasoning: false,
+              input: ["text" as const],
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+              contextWindow: 16_000,
+              maxTokens: 512,
+            },
+          ],
+        },
+      },
+    },
+  };
+}
+
+describe("v1I offline request preparation", () => {
+  it("serializes the raw request-preparation failure and last checkpoint", async () => {
+    const benchmarkCase = TOOL_RANKING_HELD_OUT_CASES[0];
+    if (!benchmarkCase) {
+      throw new Error("held-out corpus is empty");
+    }
+    const originalFetch = globalThis.fetch;
+    const workspaceDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-v1i-offline-"));
+    globalThis.fetch = async (input, init) => {
+      const url =
+        typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.endsWith("/chat/completions")) {
+        const body = [
+          `data: ${JSON.stringify({
+            id: "offline-v1i",
+            object: "chat.completion.chunk",
+            created: 0,
+            model: MODEL_ID,
+            choices: [{ index: 0, delta: { content: "offline" }, finish_reason: null }],
+          })}`,
+          `data: ${JSON.stringify({
+            id: "offline-v1i",
+            object: "chat.completion.chunk",
+            created: 0,
+            model: MODEL_ID,
+            choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+            usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+          })}`,
+          "data: [DONE]",
+          "",
+        ].join("\n\n");
+        return new Response(body, {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        });
+      }
+      throw new Error(`unexpected offline request: ${url} ${init?.method ?? "GET"}`);
+    };
+    try {
+      const configured = buildLiveConfig(workspaceDir);
+      expect(configured.agents?.list).toEqual([
+        {
+          id: "main",
+          default: true,
+          workspace: workspaceDir,
+          agentDir: path.join(workspaceDir, "agent"),
+        },
+      ]);
+      const failingConfig = {
+        ...configured,
+        agents: { defaults: configured.agents?.defaults },
+      } satisfies OpenClawConfig;
+      const observation = await runOne({
+        mode: "synthetic",
+        surfaceMode: "SYNTHETIC",
+        benchmarkCase,
+        mappingClass: "SYNTHETIC",
+        authorizedNames: benchmarkCase.tools.map((tool) => tool.name),
+        v1cTop8: rankTop8(benchmarkCase.tools, benchmarkCase.query),
+        arm: "A",
+        replicate: 1,
+        attempt: 1,
+        scheduleSeed: scheduleSeedFor(benchmarkCase.id, 1),
+        config: failingConfig,
+        workspaceDir,
+      });
+      expect(observation.valid).toBe(false);
+      expect(observation.invalidReason).toBe("REQUEST_PREPARATION_ERROR");
+      expect(observation.requestPreparationDiagnostics).toMatchObject({
+        normalizedRuntimeStatus: "runtime-error",
+        highLevelClassification: "REQUEST_PREPARATION_ERROR",
+        failureClass: "OTHER_REQUEST_PREPARATION_ERROR",
+        lastSuccessfulCheckpoint: "embedded-input-accepted",
+        failure: {
+          errorName: "RunWorkspaceRosterRequiredError",
+          failureFile: expect.stringContaining("src/agents/workspace-run.ts"),
+          failureFunction: "resolveRunWorkspaceDir",
+          failureStage: "run-embedded-agent",
+        },
+      });
+      expect(observation.requestPreparationDiagnostics?.failure?.errorMessage).toContain(
+        "No agents configured",
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+      try {
+        fs.rmSync(workspaceDir, {
+          recursive: true,
+          force: true,
+          maxRetries: 3,
+          retryDelay: 50,
+        });
+      } catch {
+        // Windows can retain the agent database lock until this test process exits.
+      }
+    }
+  }, 60_000);
+
+  it("proves the 31-tool request boundary without entering provider completion", async () => {
+    const benchmarkCase = TOOL_RANKING_HELD_OUT_CASES[0];
+    if (!benchmarkCase) {
+      throw new Error("held-out corpus is empty");
+    }
+    const workspaceDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-v1i-request-boundary-"));
+    const captured: CapturedModelRequest[] = [];
+    const abortController = new AbortController();
+    let delegatedRequests = 0;
+    try {
+      await installOfflinePreparedRuntimeMock();
+      const observation = await runOne({
+        mode: "synthetic",
+        surfaceMode: "SYNTHETIC",
+        benchmarkCase,
+        mappingClass: "SYNTHETIC",
+        authorizedNames: benchmarkCase.tools.map((tool) => tool.name),
+        v1cTop8: rankTop8(benchmarkCase.tools, benchmarkCase.query),
+        arm: "A",
+        replicate: 1,
+        attempt: 1,
+        scheduleSeed: scheduleSeedFor(benchmarkCase.id, 1),
+        config: buildOfflineRequestConfig(workspaceDir),
+        workspaceDir,
+        directRunner: true,
+        provider: "openai",
+        model: "mock-replay",
+        abortSignal: abortController.signal,
+        requestCapture: {
+          stopAfterCapture: true,
+          onRequestCaptured: (request) => {
+            captured.push(request);
+            abortController.abort(new V1IProviderRequestCapturedError());
+          },
+          onDelegatedRequest: () => {
+            delegatedRequests += 1;
+          },
+        },
+      });
+      const names = toolNamesFromBody(captured[0]?.body ?? {});
+      const checkpoints = observation.requestPreparationDiagnostics?.checkpoints ?? [];
+      const checkpoint = (stage: string) => checkpoints.find((entry) => entry.stage === stage);
+      expect(observation.valid).toBe(false);
+      expect(observation.invalidReason).toBe("HARNESS_ERROR");
+      expect(captured).toHaveLength(1);
+      expect(names).toHaveLength(31);
+      expect(new Set(names)).toHaveLength(31);
+      expect(new Set(names)).toEqual(new Set(benchmarkCase.tools.map((tool) => tool.name)));
+      expect(names).toEqual(expect.arrayContaining(["git_diff", "pytest", "calendar", "email"]));
+      expect(checkpoint("client-preparation-completed")?.toolCount).toBe(31);
+      expect(checkpoint("attempt-bundle-completed")?.toolCount).toBeGreaterThan(0);
+      expect(checkpoint("prompt-phase-entered")?.toolCount).toBe(31);
+      expect(checkpoint("prompt-tool-surface-completed")?.toolCount).toBe(31);
+      expect(checkpoint("provider-request-constructed")?.toolCount).toBe(31);
+      expect(observation.requestPreparationDiagnostics?.failure?.errorName).toBe(
+        "V1IProviderRequestCapturedError",
+      );
+      expect(checkpoints.every((entry) => entry.observedAt && entry.elapsedMs !== undefined)).toBe(
+        true,
+      );
+      expect(delegatedRequests).toBe(0);
+    } finally {
+      try {
+        fs.rmSync(workspaceDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {
+        // Windows can retain the agent database lock until this test process exits.
+      }
+    }
+  }, 60_000);
+
+  it("bounds a stalled provider boundary with the last checkpoint", async () => {
+    const benchmarkCase = TOOL_RANKING_HELD_OUT_CASES[0];
+    if (!benchmarkCase) {
+      throw new Error("held-out corpus is empty");
+    }
+    const workspaceDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-v1i-request-stall-"));
+    const abortController = new AbortController();
+    let delegatedRequests = 0;
+    try {
+      await installOfflinePreparedRuntimeMock();
+      const observation = await runOne({
+        mode: "synthetic",
+        surfaceMode: "SYNTHETIC",
+        benchmarkCase,
+        mappingClass: "SYNTHETIC",
+        authorizedNames: benchmarkCase.tools.map((tool) => tool.name),
+        v1cTop8: rankTop8(benchmarkCase.tools, benchmarkCase.query),
+        arm: "A",
+        replicate: 1,
+        attempt: 1,
+        scheduleSeed: scheduleSeedFor(benchmarkCase.id, 1),
+        config: buildOfflineRequestConfig(workspaceDir),
+        workspaceDir,
+        abortSignal: abortController.signal,
+        timeoutMs: 1_000,
+        directRunner: true,
+        provider: "openai",
+        model: "mock-replay",
+        requestCapture: {
+          holdAfterCapture: true,
+          onRequestCaptured: () => {
+            abortController.abort(new Error("v1I deterministic provider stall timeout"));
+          },
+          onDelegatedRequest: () => {
+            delegatedRequests += 1;
+          },
+        },
+      });
+      const checkpoints = observation.requestPreparationDiagnostics?.checkpoints ?? [];
+      expect(observation.valid).toBe(false);
+      expect(observation.requestPreparationDiagnostics?.normalizedRuntimeStatus).toBe("aborted");
+      expect(checkpoints.at(-1)?.stage).toBe("provider-request-constructed");
+      expect(observation.requestPreparationDiagnostics?.lastSuccessfulCheckpoint).toBe(
+        "provider-request-constructed",
+      );
+      expect(delegatedRequests).toBe(0);
+    } finally {
+      abortController.abort(new Error("v1I deterministic provider stall timeout"));
+      try {
+        fs.rmSync(workspaceDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {
+        // Windows can retain the agent database lock until this test process exits.
+      }
+    }
+  }, 30_000);
+});
+
+async function installOfflinePreparedRuntimeMock(): Promise<void> {
+  vi.doMock("../prepared-model-runtime.js", async () => {
+    const actual = await vi.importActual<typeof import("../prepared-model-runtime.js")>(
+      "../prepared-model-runtime.js",
+    );
+    const { AuthStorage } = await import("../sessions/auth-storage.js");
+    const { ModelRegistry } = await import("../sessions/model-registry.js");
+    const { buildInlineProviderModels } =
+      await import("../embedded-agent-runner/model.inline-provider.js");
+    const { createEmptyPluginRegistry } = await import("../../plugins/registry-empty.js");
+    const { createEmptyPluginMetadataSnapshot } =
+      await import("../test-helpers/embedded-agent-runner-e2e-mocks.js");
+    const acquire = async (input: {
+      agentId?: string;
+      agentDir: string;
+      inheritedAuthDir?: string;
+      workspaceDir?: string;
+      allowGatewaySubagentBinding?: boolean;
+      config: { models?: { providers?: Parameters<typeof buildInlineProviderModels>[0] } };
+    }) => {
+      const authStorage = AuthStorage.inMemory();
+      authStorage.setRuntimeApiKey(PROVIDER, "lmstudio");
+      const modelRegistry = ModelRegistry.inMemory(authStorage);
+      const providers = input.config.models?.providers ?? {};
+      return {
+        snapshot: {
+          ...(input.agentId !== undefined ? { agentId: input.agentId } : {}),
+          agentDir: input.agentDir,
+          ...(input.inheritedAuthDir !== undefined
+            ? { inheritedAuthDir: input.inheritedAuthDir }
+            : {}),
+          ...(input.workspaceDir !== undefined ? { workspaceDir: input.workspaceDir } : {}),
+          activeProjectKeys: [],
+          config: input.config,
+          authModes: {},
+          metadataSnapshot: createEmptyPluginMetadataSnapshot(input.workspaceDir),
+          pluginRegistry: createEmptyPluginRegistry(),
+          allowGatewaySubagentBinding: input.allowGatewaySubagentBinding === true,
+          modelCatalog: { entries: [], routeVariants: [] },
+          configuredRuntimeModels: [],
+          inlineProviderModels: buildInlineProviderModels(providers),
+          createStores: () => ({ authStorage, modelRegistry }),
+        },
+        release: () => {},
+      };
+    };
+    return {
+      ...actual,
+      acquireAgentRunPreparedModelRuntime: acquire,
+      acquireReadOnlyPreparedModelRuntime: acquire,
+    } as typeof actual;
+  });
+}
+
 async function assertLiveModelAvailable(): Promise<void> {
   const response = await fetch("http://127.0.0.1:1234/api/v1/models");
   if (!response.ok) {
@@ -651,25 +1140,73 @@ async function assertLiveModelAvailable(): Promise<void> {
   }
 }
 
-function captureModelPayloads(): ModelPayloadCapture {
+function abortReason(signal: AbortSignal | undefined): Error {
+  return signal?.reason instanceof Error
+    ? signal.reason
+    : new DOMException("The operation was aborted", "AbortError");
+}
+
+function captureModelPayloads(
+  hooks?: NonNullable<RunEmbeddedAgentParams["capabilityIntelligenceExperiment"]>,
+  options?: {
+    stopAfterCapture?: boolean;
+    holdAfterCapture?: boolean;
+    onRequestCaptured?: (request: CapturedModelRequest) => void;
+    onDelegatedRequest?: () => void;
+  },
+): ModelPayloadCapture {
   const requests: CapturedModelRequest[] = [];
+  let providerRequestRecorded = false;
+  let delegatedRequests = 0;
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (input, init) => {
     const url =
       typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
     const body = init?.body ?? (input instanceof Request ? await input.clone().text() : undefined);
     if (
-      url.startsWith(LM_STUDIO_BASE_URL) &&
+      (url.startsWith(LM_STUDIO_BASE_URL) ||
+        url.includes("/chat/completions") ||
+        url.includes("/responses")) &&
       typeof body === "string" &&
       body.trim().startsWith("{")
     ) {
       const parsed = JSON.parse(body) as Record<string, unknown>;
-      requests.push({ body: parsed, url });
+      const request = { body: parsed, url };
+      if (!providerRequestRecorded) {
+        requests.push(request);
+        options?.onRequestCaptured?.(request);
+      }
+      const toolNames = toolNamesFromBody(parsed);
+      hooks?.onCheckpoint?.({
+        stage: "provider-request-constructed",
+        toolCount: toolNames.length,
+        representativeToolNames: toolNames,
+      });
+      if (options?.stopAfterCapture) {
+        throw new V1IProviderRequestCapturedError();
+      }
+      if (options?.holdAfterCapture) {
+        const signal = init?.signal;
+        return await new Promise<Response>((_, reject) => {
+          if (signal?.aborted) {
+            reject(abortReason(signal));
+            return;
+          }
+          signal?.addEventListener("abort", () => reject(abortReason(signal)), { once: true });
+        });
+      }
     }
+    options?.onDelegatedRequest?.();
+    delegatedRequests += 1;
     return await originalFetch(input, init);
   };
   return {
     requests,
+    delegatedRequests,
+    recordProviderRequest: (request) => {
+      providerRequestRecorded = true;
+      requests.push(request);
+    },
     restore: () => {
       globalThis.fetch = originalFetch;
     },
@@ -777,261 +1314,4 @@ function terminalFailureReasonForExecution(input: {
     return "TOOL_ERROR";
   }
   return invalidReasonForExecutionStatus(input.status, input.requestCount) ?? "HARNESS_ERROR";
-}
-
-function assertSyntheticSmokePassed(): void {
-  const smokeRoot = path.resolve(
-    process.env.OPENCLAW_V1I_SMOKE_ARTIFACT_DIR ?? "artifacts/capability-intelligence/v1i-smoke",
-  );
-  const resultPath = path.join(smokeRoot, "smoke-result.json");
-  if (!fs.existsSync(resultPath)) {
-    throw new Error(
-      `PREPARED_NOT_STARTED: synthetic smoke artifact is missing at ${resultPath}; run the one-cell smoke first`,
-    );
-  }
-  const result = JSON.parse(fs.readFileSync(resultPath, "utf8")) as Record<string, unknown>;
-  if (
-    result.status !== "PASS" ||
-    result.harnessCommit !== HARNESS_COMMIT ||
-    result.modelConfigHash !== hashV1ICanonical(modelConfigIdentity()) ||
-    result.activeFilteringEnabled !== false ||
-    result.observationValid !== true
-  ) {
-    throw new Error("PREPARED_NOT_STARTED: synthetic smoke artifact is not a matching pass");
-  }
-}
-
-function buildSyntheticRunnerOverrides(
-  harness: ReturnType<typeof createSyntheticBenchmarkToolHarness>,
-): Pick<RunEmbeddedAgentParams, "clientTools" | "clientToolsOnly" | "disableTools"> {
-  return { clientTools: [...harness.clientTools], clientToolsOnly: true, disableTools: true };
-}
-
-function resolveRepositoryHarnessCommit(): string {
-  const explicit = process.env.OPENCLAW_V1I_HARNESS_COMMIT;
-  try {
-    const head = execFileSync("git", ["rev-parse", "HEAD"], {
-      cwd: process.cwd(),
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-    }).trim();
-    const sourceStatus = execFileSync(
-      "git",
-      ["status", "--porcelain=v1", "--untracked-files=all", "--", "src"],
-      {
-        cwd: process.cwd(),
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "ignore"],
-      },
-    );
-    return resolveHarnessCommit({ explicit, head, sourceDirty: sourceStatus.trim().length > 0 });
-  } catch {
-    return resolveHarnessCommit({ explicit, sourceDirty: true });
-  }
-}
-
-function resolveHarnessCommit(input: {
-  explicit?: string;
-  head?: string;
-  sourceDirty: boolean;
-}): string {
-  if (input.explicit?.trim()) {
-    return input.explicit.trim();
-  }
-  return !input.sourceDirty && input.head?.trim() ? input.head.trim() : "uncommitted-harness";
-}
-
-function buildManifest(sets: ReturnType<typeof splitV1IExperimentSets>): V1IManifest {
-  const modelConfig = modelConfigIdentity();
-  const caseHash = (entries: readonly ToolRankingBenchmarkCase[]) =>
-    hashV1ICanonical(
-      entries.map((entry) => ({ id: entry.id, query: entry.query, tools: entry.tools })),
-    );
-  const surfaceHash = (entries: readonly ToolRankingBenchmarkCase[]) =>
-    hashV1ICanonical(
-      [...new Set(entries.flatMap((entry) => entry.tools.map((tool) => tool.name)))].toSorted(),
-    );
-  return {
-    schemaVersion: V1I_SCHEMA_VERSION,
-    experimentVersion: V1I_EXPERIMENT_VERSION,
-    harnessCommit: HARNESS_COMMIT,
-    branch: process.env.OPENCLAW_V1I_BRANCH ?? "capability-intelligence-next",
-    modelId: MODEL_ID,
-    provider: PROVIDER,
-    contextLength: CONTEXT_LENGTH,
-    modelConfig,
-    modelConfigHash: hashV1ICanonical(modelConfig),
-    rankerVersion: SHADOW_RANKER_VERSION,
-    qualificationPolicyVersion: SHADOW_QUALIFICATION_POLICY_VERSION,
-    scheduleSeed: V1I_BOOTSTRAP_SEED,
-    caseSetHash: caseHash(TOOL_RANKING_HELD_OUT_CASES),
-    syntheticCaseSetHash: caseHash(sets.synthetic),
-    realExactCaseSetHash: caseHash(sets.realExact),
-    realAdapterCaseSetHash: caseHash(sets.realAdapter),
-    syntheticSurfaceHash: surfaceHash(sets.synthetic),
-    realExactSurfaceHash: surfaceHash(sets.realExact),
-    realAdapterSurfaceHash: surfaceHash(sets.realAdapter),
-    schemaHash: hashV1ICanonical({
-      synthetic: sets.synthetic.map((entry) => entry.id),
-      realExact: sets.realExact.map((entry) => entry.id),
-      realAdapter: sets.realAdapter.map((entry) => entry.id),
-    }),
-    systemPromptHash: sha256("runtime-system-prompt-captured-per-run"),
-    experimentalInstructionHash: sha256(ARM_B_INSTRUCTION),
-    startedAt: new Date().toISOString(),
-    completedAt: null,
-    activeFilteringEnabled: false,
-  };
-}
-
-function modelConfigIdentity(): Record<string, unknown> {
-  return {
-    provider: PROVIDER,
-    model: MODEL_ID,
-    baseUrl: LM_STUDIO_BASE_URL,
-    api: "openai-completions",
-    contextLength: CONTEXT_LENGTH,
-    maxTokens: 512,
-    temperature: null,
-    topP: null,
-    seed: null,
-  };
-}
-
-type InvalidObservationInput = {
-  mode: V1IMode;
-  surfaceMode: V1ISurfaceMode;
-  benchmarkCase: ToolRankingBenchmarkCase;
-  mappingClass: MappingClass;
-  authorizedNames: readonly string[];
-  v1cTop8: readonly string[];
-  arm: Arm;
-  replicate: number;
-  attempt: number;
-  scheduleSeed: number;
-  reason: string;
-};
-
-async function runV1IAttempt(
-  input: Omit<InvalidObservationInput, "reason">,
-  execute: () => Promise<ExperimentRun>,
-  onObservation: (observation: ExperimentRun) => void,
-): Promise<ExperimentRun> {
-  let observation: ExperimentRun;
-  try {
-    observation = await execute();
-  } catch (error) {
-    observation = makeInvalidObservationForError(input, error);
-  }
-  onObservation(observation);
-  return observation;
-}
-
-function makeInvalidObservationForError(
-  input: Omit<InvalidObservationInput, "reason">,
-  error: unknown,
-): ExperimentRun {
-  return makeInvalidObservation({ ...input, reason: classifyAttemptError(error) });
-}
-
-function makeInvalidObservation(input: InvalidObservationInput): ExperimentRun {
-  const preferredBenchmarkTool = input.benchmarkCase.expectedTopTools[0] ?? "";
-  const mappedRealTool =
-    input.mode === "synthetic"
-      ? preferredBenchmarkTool
-      : getBenchmarkRealToolMapping(preferredBenchmarkTool).realTool;
-  const now = new Date().toISOString();
-  return {
-    schemaVersion: V1I_SCHEMA_VERSION,
-    experimentVersion: V1I_EXPERIMENT_VERSION,
-    harnessCommit: HARNESS_COMMIT,
-    surfaceMode: input.surfaceMode,
-    caseId: input.benchmarkCase.id,
-    arm: input.arm,
-    replicate: input.replicate,
-    attempt: input.attempt,
-    scheduleSeed: input.scheduleSeed,
-    modelId: MODEL_ID,
-    provider: PROVIDER,
-    contextLength: CONTEXT_LENGTH,
-    modelConfigHash: hashV1ICanonical(modelConfigIdentity()),
-    systemPromptHash: sha256(""),
-    userPromptHash: sha256(input.benchmarkCase.query),
-    experimentalInstructionHash: sha256(input.arm === "B" ? ARM_B_INSTRUCTION : ""),
-    authorizedSurfaceHash: hashV1ICanonical(input.authorizedNames),
-    schemaHash: hashV1ICanonical(input.authorizedNames),
-    caseSetHash: frozenCaseSetHash(),
-    rankerVersion: SHADOW_RANKER_VERSION,
-    qualificationPolicyVersion: SHADOW_QUALIFICATION_POLICY_VERSION,
-    rankingEpoch: null,
-    benchmarkPreferredTool: preferredBenchmarkTool,
-    mappedRealTool,
-    mappingClassification: input.mappingClass,
-    v1cTop8: input.v1cTop8,
-    selectedTools: [],
-    firstExecutedTool: null,
-    executedToolSequence: [],
-    terminalSuccess: false,
-    terminalFailureReason: input.reason,
-    preferredToolAuthorized:
-      mappedRealTool !== null && input.authorizedNames.includes(mappedRealTool),
-    preferredToolInTop8: mappedRealTool !== null && input.v1cTop8.includes(mappedRealTool),
-    preferredToolAttempted: false,
-    substituteTool: null,
-    substitutionWithoutPreferredAttempt: false,
-    fallbackAfterPreferredFailure: false,
-    valid: false,
-    invalidReason: input.reason,
-    startTime: now,
-    endTime: now,
-  };
-}
-
-function makeTestInvalidObservationInput(): Omit<InvalidObservationInput, "reason"> {
-  const benchmarkCase = TOOL_RANKING_HELD_OUT_CASES[0];
-  if (!benchmarkCase) {
-    throw new Error("held-out corpus is empty");
-  }
-  return {
-    mode: "synthetic",
-    surfaceMode: "SYNTHETIC",
-    benchmarkCase,
-    mappingClass: "SYNTHETIC",
-    authorizedNames: benchmarkCase.tools.map((tool) => tool.name),
-    v1cTop8: benchmarkCase.expectedTopTools,
-    arm: "A",
-    replicate: 1,
-    attempt: 1,
-    scheduleSeed: 1,
-  };
-}
-
-function classifyAttemptError(error: unknown): string {
-  const message =
-    error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
-  return message.includes("fetch") || message.includes("provider")
-    ? "PROVIDER_ERROR"
-    : "HARNESS_ERROR";
-}
-
-function orderedArms(seed: number): readonly Arm[] {
-  return seed % 2 === 0 ? ["A", "B"] : ["B", "A"];
-}
-
-function scheduleSeedFor(caseId: string, replicate: number): number {
-  return Number.parseInt(sha256(`${caseId}:${replicate}`).slice(0, 8), 16);
-}
-
-function sha256(value: string): string {
-  return createHash("sha256").update(value).digest("hex");
-}
-
-function frozenCaseSetHash(): string {
-  return hashV1ICanonical(
-    TOOL_RANKING_HELD_OUT_CASES.map((entry) => ({
-      id: entry.id,
-      query: entry.query,
-      tools: entry.tools,
-    })),
-  );
 }

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { AGENT_RESERVED_TOOL_NAMES } from "../embedded-agent-runner/tool-name-allowlist.js";
 import { createSyntheticBenchmarkToolHarness } from "./synthetic-benchmark-tools.js";
 import { TOOL_RANKING_HELD_OUT_CASES } from "./tool-ranking-benchmark-cases.js";
 
@@ -39,5 +40,40 @@ describe("synthetic benchmark tools", () => {
       invocationIndex: 1,
       result: { ok: true, synthetic: true, tool: "calendar" },
     });
+  });
+
+  it("keeps the complete 31-tool synthetic client surface structurally valid", () => {
+    const benchmarkCase = TOOL_RANKING_HELD_OUT_CASES[0];
+    if (!benchmarkCase) {
+      throw new Error("held-out corpus is empty");
+    }
+    const harness = createSyntheticBenchmarkToolHarness(benchmarkCase);
+    const names = harness.clientTools.map((tool) => tool.function.name);
+
+    expect(names).toHaveLength(31);
+    expect(new Set(names).size).toBe(31);
+    expect(names.filter((name) => AGENT_RESERVED_TOOL_NAMES.includes(name))).toEqual(
+      expect.arrayContaining(["read", "edit", "write"]),
+    );
+    for (const tool of harness.clientTools) {
+      expect(tool).toMatchObject({
+        type: "function",
+        function: {
+          name: expect.stringMatching(/\S/),
+          description: expect.stringMatching(/\S/),
+          parameters: { type: "object" },
+          strict: false,
+        },
+      });
+      expect(harness.invoke(tool.function.name, {})).toMatchObject({
+        caseId: benchmarkCase.id,
+        tool: tool.function.name,
+        result: {
+          ok: true,
+          synthetic: true,
+          tool: tool.function.name,
+        },
+      });
+    }
   });
 });

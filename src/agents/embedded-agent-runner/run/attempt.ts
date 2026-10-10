@@ -283,6 +283,11 @@ export async function runEmbeddedAttempt(
     bundleMcpRuntime = preparedBundleTools.bundleMcpRuntime;
     bundleLspRuntime = preparedBundleTools.bundleLspRuntime;
     const { clientTools, uncompactedEffectiveTools } = preparedBundleTools;
+    params.capabilityIntelligenceExperiment?.onCheckpoint?.({
+      stage: "attempt-bundle-completed",
+      toolCount: clientTools?.length ?? 0,
+      representativeToolNames: (clientTools ?? []).slice(0, 8).map((tool) => tool.function.name),
+    });
     // Catalog preparation registers global run state before tool projection and
     // diagnostics, so arm cleanup before either can fail and leak the catalog.
     toolSearchCatalogApplied = toolSearchCatalogRef !== undefined;
@@ -453,7 +458,13 @@ export async function runEmbeddedAttempt(
             },
           }),
         { config: params.config },
-      );
+      ).catch((error: unknown) => {
+        params.capabilityIntelligenceExperiment?.onRequestPreparationError?.({
+          error,
+          stage: "attempt-session-runtime",
+        });
+        throw error;
+      });
       const executionResult = await runEmbeddedAttemptExecutionPhase({
         attempt: params,
         ...(activeContextEngine ? { activeContextEngine } : {}),
@@ -540,6 +551,10 @@ export async function runEmbeddedAttempt(
       });
     }
   } catch (error) {
+    params.capabilityIntelligenceExperiment?.onRequestPreparationError?.({
+      error,
+      stage: "embedded-attempt",
+    });
     const terminalOutcome = buildAgentRunTerminalOutcomeFromAttempt({
       terminal: executionState.terminal,
       abortSignal: params.abortSignal,

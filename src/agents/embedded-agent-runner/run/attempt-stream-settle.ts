@@ -12,7 +12,7 @@ import type { AgentRunAttemptFailureSource } from "../../agent-run-terminal-outc
 import type { subscribeEmbeddedAgentSession } from "../../embedded-agent-subscribe.js";
 import { wrapStreamFnTextTransforms } from "../../plugin-text-transforms.js";
 import { registerProviderStreamForModel } from "../../provider-stream.js";
-import type { AgentMessage } from "../../runtime/index.js";
+import type { AgentMessage, StreamFn } from "../../runtime/index.js";
 import type { SandboxContext } from "../../sandbox/types.js";
 import type { AgentSession, SessionManager, SettingsManager } from "../../sessions/index.js";
 import { projectToolSearchTargetTranscriptMessages } from "../../tool-search.js";
@@ -532,6 +532,33 @@ export async function prepareEmbeddedAttemptTransport(input: {
           }),
       )
     : undefined;
+  const observeProviderRequest = (streamFn: StreamFn | undefined): StreamFn | undefined => {
+    if (!streamFn || !attempt.capabilityIntelligenceExperiment?.onProviderRequest) {
+      return streamFn;
+    }
+    return (model, context, options) => {
+      const existingOnPayload = options?.onPayload;
+      return streamFn(model, context, {
+        ...options,
+        onPayload: async (payload, payloadModel) => {
+          try {
+            await attempt.capabilityIntelligenceExperiment?.onProviderRequest?.({
+              payload,
+              model: payloadModel,
+            });
+          } catch (error) {
+            attempt.capabilityIntelligenceExperiment?.onRequestPreparationError?.({
+              error,
+              stage: "provider-request-constructed",
+            });
+            throw error;
+          }
+          return (await existingOnPayload?.(payload, payloadModel)) ?? payload;
+        },
+      });
+    };
+  };
+  const observedProviderStreamFn = observeProviderRequest(directProviderStreamFn);
   const transportApiKey = await resolveEmbeddedAgentApiKey({
     provider: attempt.model.provider,
     resolvedApiKey: attempt.resolvedApiKey,
@@ -539,13 +566,13 @@ export async function prepareEmbeddedAttemptTransport(input: {
   });
   const streamStrategy = describeEmbeddedAgentStreamStrategy({
     currentStreamFn: defaultSessionStreamFn,
-    providerStreamFn: directProviderStreamFn,
+    providerStreamFn: observedProviderStreamFn,
     model: attempt.model,
     resolvedApiKey: transportApiKey,
   });
-  session.agent.streamFn = resolveEmbeddedAgentStreamFn({
+  const resolvedAgentStreamFn = resolveEmbeddedAgentStreamFn({
     currentStreamFn: defaultSessionStreamFn,
-    providerStreamFn: directProviderStreamFn,
+    providerStreamFn: observedProviderStreamFn,
     sessionId: attempt.sessionId,
     promptCacheKey: attempt.promptCacheKey,
     signal: input.abortSignal,
@@ -555,6 +582,9 @@ export async function prepareEmbeddedAttemptTransport(input: {
     authProfileId: resolveAttemptStreamAuthProfileId(attempt),
     authStorage: attempt.authStorage,
   });
+  session.agent.streamFn = directProviderStreamFn
+    ? resolvedAgentStreamFn
+    : observeProviderRequest(resolvedAgentStreamFn)!;
   // Install inside provider/config wrappers so their full onPayload chain runs
   // before admission hashes the request body that the built-in transport sends.
   session.agent.streamFn = wrapStreamFnWithProviderPromptState({

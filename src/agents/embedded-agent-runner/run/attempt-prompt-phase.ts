@@ -157,6 +157,11 @@ export async function runEmbeddedAttemptPromptPhase(input: {
   };
 }): Promise<{ promptStartedAt: number }> {
   const { activeSession, attempt, sessionManager } = input;
+  input.attempt.capabilityIntelligenceExperiment?.onCheckpoint?.({
+    stage: "prompt-phase-entered",
+    toolCount: input.toolPolicy.effectiveTools.length,
+    representativeToolNames: input.toolPolicy.effectiveTools.slice(0, 8).map((tool) => tool.name),
+  });
   let skipPromptSubmission = false;
   let leasedSteering: PromptAssemblyResult["leasedSteering"];
 
@@ -225,6 +230,13 @@ export async function runEmbeddedAttemptPromptPhase(input: {
         catalogRef: input.toolPolicy.toolSearchCatalogRef,
         codeModeControlsEnabled: input.toolPolicy.codeModeControlsEnabled,
         forceToolNames: input.toolPolicy.forceToolNames,
+      });
+      input.attempt.capabilityIntelligenceExperiment?.onCheckpoint?.({
+        stage: "prompt-tool-surface-completed",
+        toolCount: promptToolSurface.effectiveTools.length,
+        representativeToolNames: promptToolSurface.effectiveTools
+          .slice(0, 8)
+          .map((tool) => tool.name),
       });
       return promptToolSurface.activeToolNames;
     },
@@ -399,6 +411,15 @@ export async function runEmbeddedAttemptPromptPhase(input: {
     publishDispatchState(state);
 
     const { activeContextEngine, ...preflight } = input.preflight;
+    input.attempt.capabilityIntelligenceExperiment?.onCheckpoint?.({
+      stage: "prompt-preflight-entered",
+      toolCount: promptToolSurface?.effectiveTools.length ?? input.toolPolicy.effectiveTools.length,
+      representativeToolNames: (
+        promptToolSurface?.effectiveTools ?? input.toolPolicy.effectiveTools
+      )
+        .slice(0, 8)
+        .map((tool) => tool.name),
+    });
     state = await prepareEmbeddedAttemptPromptPreflight({
       ...preflight,
       attempt,
@@ -412,9 +433,28 @@ export async function runEmbeddedAttemptPromptPhase(input: {
       systemPrompt: promptContext.systemPromptForHook,
       toolResultMaxChars: promptContext.promptToolResultMaxChars,
     });
+    input.attempt.capabilityIntelligenceExperiment?.onCheckpoint?.({
+      stage: "prompt-preflight-completed",
+      toolCount: promptToolSurface?.effectiveTools.length ?? input.toolPolicy.effectiveTools.length,
+      representativeToolNames: (
+        promptToolSurface?.effectiveTools ?? input.toolPolicy.effectiveTools
+      )
+        .slice(0, 8)
+        .map((tool) => tool.name),
+    });
     publishDispatchState(state);
 
     if (!state.skipPromptSubmission) {
+      input.attempt.capabilityIntelligenceExperiment?.onCheckpoint?.({
+        stage: "provider-adapter-entered",
+        toolCount:
+          promptToolSurface?.effectiveTools.length ?? input.toolPolicy.effectiveTools.length,
+        representativeToolNames: (
+          promptToolSurface?.effectiveTools ?? input.toolPolicy.effectiveTools
+        )
+          .slice(0, 8)
+          .map((tool) => tool.name),
+      });
       await submitEmbeddedAttemptPrompt({
         ...(promptBuildAppendContext ? { appendContext: promptBuildAppendContext } : {}),
         attempt,
@@ -438,6 +478,16 @@ export async function runEmbeddedAttemptPromptPhase(input: {
         transcriptLeafId,
         transcriptPrompt: promptContext.promptForSession,
         ...input.submission,
+      });
+      input.attempt.capabilityIntelligenceExperiment?.onCheckpoint?.({
+        stage: "prompt-submission-completed",
+        toolCount:
+          promptToolSurface?.effectiveTools.length ?? input.toolPolicy.effectiveTools.length,
+        representativeToolNames: (
+          promptToolSurface?.effectiveTools ?? input.toolPolicy.effectiveTools
+        )
+          .slice(0, 8)
+          .map((tool) => tool.name),
       });
     } else {
       releaseLeasedSteering(state.promptError ?? "prompt submission skipped");

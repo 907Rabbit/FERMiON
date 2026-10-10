@@ -25,6 +25,38 @@ export type V1ISurfaceMode = "SYNTHETIC" | "REAL_EXACT_ONLY" | "REAL_ADAPTER";
 export type V1IArm = "A" | "B";
 export type V1IMappingClassification = "SYNTHETIC" | "EXACT" | "ADAPTER";
 
+export type V1IExperimentCheckpoint = {
+  stage: string;
+  toolCount: number;
+  representativeToolNames: readonly string[];
+  observedAt?: string;
+  elapsedMs?: number;
+};
+
+export type V1IRequestPreparationClass =
+  | "CLIENT_TOOL_VALIDATION_ERROR"
+  | "ATTEMPT_BUNDLE_ERROR"
+  | "PROMPT_PREPARATION_ERROR"
+  | "TOOL_SCHEMA_CONVERSION_ERROR"
+  | "PROVIDER_REQUEST_BUILD_ERROR"
+  | "OTHER_REQUEST_PREPARATION_ERROR";
+
+export type V1IRequestPreparationDiagnostics = {
+  normalizedRuntimeStatus: string;
+  highLevelClassification: string | null;
+  failureClass: V1IRequestPreparationClass | null;
+  checkpoints: readonly V1IExperimentCheckpoint[];
+  lastSuccessfulCheckpoint: string | null;
+  failure?: {
+    errorName: string;
+    errorMessage: string;
+    errorStack: string | null;
+    failureFile: string | null;
+    failureFunction: string | null;
+    failureStage: string;
+  };
+};
+
 export type V1IObservation = {
   schemaVersion: number;
   experimentVersion: string;
@@ -65,6 +97,7 @@ export type V1IObservation = {
   fallbackAfterPreferredFailure: boolean;
   valid: boolean;
   invalidReason: string | null;
+  requestPreparationDiagnostics?: V1IRequestPreparationDiagnostics;
   startTime: string;
   endTime: string;
 };

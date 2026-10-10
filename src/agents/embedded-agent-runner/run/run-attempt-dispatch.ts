@@ -408,6 +408,7 @@ export async function dispatchEmbeddedRunAttempt(input: {
     media: promptMedia.media,
     clientTools: params.clientTools,
     clientToolsOnly: params.clientToolsOnly,
+    capabilityIntelligenceExperiment: params.capabilityIntelligenceExperiment,
     disableTools: params.disableTools,
     provider: runtime.provider,
     modelId: runtime.modelId,

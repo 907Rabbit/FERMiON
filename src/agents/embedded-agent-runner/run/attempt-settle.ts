@@ -128,6 +128,7 @@ export async function runEmbeddedAttemptSettledPhase(
   const {
     agentSession: {
       activeSession,
+      clientToolDefs,
       clientToolCallSlots,
       hasDeliveredSourceReply,
       hookRunner,
@@ -157,6 +158,11 @@ export async function runEmbeddedAttemptSettledPhase(
   const { effectiveTools, emptyExplicitToolAllowlistError, toolSearch } = toolCatalog;
   const { tools, uncompactedEffectiveTools } = bundleTools;
   const { toolSearchTargetTranscriptProjections } = toolBase;
+  const clientToolsOnly = attempt.clientToolsOnly === true && attempt.disableTools === true;
+  // The synthetic experiment disables built-ins but still needs its prepared client tools in the
+  // prompt policy. Without this projection, client definitions remain registered yet the model
+  // receives an empty effective surface.
+  const promptEffectiveTools = clientToolsOnly ? clientToolDefs : effectiveTools;
   const hookAgentId = input.setup.sessionAgentId;
   let yieldAborted = false;
   const preparedStreamRuntime = input.preparedStreamRuntime;
@@ -275,9 +281,11 @@ export async function runEmbeddedAttemptSettledPhase(
       },
       toolPolicy: {
         baseline: promptToolPolicyBaseline,
-        effectiveTools,
-        uncompactedEffectiveTools,
-        tools,
+        effectiveTools: promptEffectiveTools,
+        uncompactedEffectiveTools: clientToolsOnly
+          ? promptEffectiveTools
+          : uncompactedEffectiveTools,
+        tools: clientToolsOnly ? promptEffectiveTools : tools,
         codeModeControlsEnabled: toolBase.codeModeControlsEnabledForRun,
         toolSearchCatalogRef: toolBase.toolSearchCatalogRef,
         forceToolNames: [

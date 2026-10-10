@@ -83,6 +83,15 @@ const EMPTY_EMBEDDED_AGENT_CONFIG: OpenClawConfig = Object.freeze({});
 export function runEmbeddedAgent(
   paramsInput: RunEmbeddedAgentParams,
 ): Promise<EmbeddedAgentRunResult> {
+  paramsInput.capabilityIntelligenceExperiment?.onCheckpoint?.({
+    stage: "runner-entry",
+    toolCount: paramsInput.clientTools?.length ?? paramsInput.toolsAllow?.length ?? 0,
+    representativeToolNames: (
+      paramsInput.clientTools?.map((tool) => tool.function.name) ??
+      paramsInput.toolsAllow ??
+      []
+    ).slice(0, 8),
+  });
   const internalParamsInput = paramsInput as RunEmbeddedAgentInternalParams;
   const requestedProvider = normalizeOptionalString(internalParamsInput.provider);
   const requestedModel = normalizeOptionalString(internalParamsInput.model);
@@ -127,10 +136,28 @@ async function runEmbeddedAgentInternal(
     agentId: paramsBase.agentId,
   });
   assertAgentHarnessRunAdmission({ ...paramsBase, sessionKey: effectiveSessionKey });
+  paramsBase.capabilityIntelligenceExperiment?.onCheckpoint?.({
+    stage: "session-target-resolution-entered",
+    toolCount: paramsBase.clientTools?.length ?? paramsBase.toolsAllow?.length ?? 0,
+    representativeToolNames: (
+      paramsBase.clientTools?.map((tool) => tool.function.name) ??
+      paramsBase.toolsAllow ??
+      []
+    ).slice(0, 8),
+  });
   const runSessionTarget = await resolveAgentRunSessionTarget({
     ...paramsBase,
     missingSessionKey: "create",
     sessionKey: effectiveSessionKey,
+  });
+  paramsBase.capabilityIntelligenceExperiment?.onCheckpoint?.({
+    stage: "session-target-resolution-completed",
+    toolCount: paramsBase.clientTools?.length ?? paramsBase.toolsAllow?.length ?? 0,
+    representativeToolNames: (
+      paramsBase.clientTools?.map((tool) => tool.function.name) ??
+      paramsBase.toolsAllow ??
+      []
+    ).slice(0, 8),
   });
   let params: RunEmbeddedAgentParamsWithSessionFile = withExecutionPhaseDiagnostics({
     ...paramsBase,
@@ -140,6 +167,15 @@ async function runEmbeddedAgentInternal(
     sessionTarget: runSessionTarget,
     sessionFile: runSessionTarget.sessionKey,
     skillWorkshopProposalMutationBudget,
+  });
+  params.capabilityIntelligenceExperiment?.onCheckpoint?.({
+    stage: "runner-entry",
+    toolCount: params.clientTools?.length ?? params.toolsAllow?.length ?? 0,
+    representativeToolNames: (
+      params.clientTools?.map((tool) => tool.function.name) ??
+      params.toolsAllow ??
+      []
+    ).slice(0, 8),
   });
   const sessionLane = resolveSessionLane(params.sessionKey?.trim() || params.sessionId);
   const globalLane = resolveGlobalLane(params.lane);
@@ -290,6 +326,15 @@ async function runEmbeddedAgentInternal(
       // gateway run generations in its own bounded cache so one-off paths cannot accumulate.
       // Cold plugin loading and provider discovery can exceed the lane no-progress budget.
       // Active runtime acquisition is progress, not a hung lane task.
+      params.capabilityIntelligenceExperiment?.onCheckpoint?.({
+        stage: "runtime-preparation-entered",
+        toolCount: params.clientTools?.length ?? params.toolsAllow?.length ?? 0,
+        representativeToolNames: (
+          params.clientTools?.map((tool) => tool.function.name) ??
+          params.toolsAllow ??
+          []
+        ).slice(0, 8),
+      });
       const preparedModelRuntimeLease = await withEmbeddedRunLaneProgressHeartbeat(
         noteLaneTaskProgress,
         () =>
@@ -303,6 +348,15 @@ async function runEmbeddedAgentInternal(
                 ...(params.pluginGeneration ? { pluginGeneration: params.pluginGeneration } : {}),
               }),
       );
+      params.capabilityIntelligenceExperiment?.onCheckpoint?.({
+        stage: "runtime-preparation-completed",
+        toolCount: params.clientTools?.length ?? params.toolsAllow?.length ?? 0,
+        representativeToolNames: (
+          params.clientTools?.map((tool) => tool.function.name) ??
+          params.toolsAllow ??
+          []
+        ).slice(0, 8),
+      });
       startupStages.mark("prepared-runtime");
       const preparedModelRuntimeOwnerSnapshot = preparedModelRuntimeLease.snapshot;
       try {
@@ -434,6 +488,15 @@ async function runEmbeddedAgentInternal(
             };
           }
 
+          params.capabilityIntelligenceExperiment?.onCheckpoint?.({
+            stage: "attempt-dispatch-entered",
+            toolCount: params.clientTools?.length ?? params.toolsAllow?.length ?? 0,
+            representativeToolNames: (
+              params.clientTools?.map((tool) => tool.function.name) ??
+              params.toolsAllow ??
+              []
+            ).slice(0, 8),
+          });
           return await executePreparedEmbeddedRun({
             runParams: params,
             contextEngineAgentId,

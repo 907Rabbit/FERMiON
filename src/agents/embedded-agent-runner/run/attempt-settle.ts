@@ -216,6 +216,11 @@ export async function runEmbeddedAttemptSettledPhase(
   };
 
   try {
+    input.attempt.capabilityIntelligenceExperiment?.onCheckpoint?.({
+      stage: "prompt-dispatch-started",
+      toolCount: promptEffectiveTools.length,
+      representativeToolNames: promptEffectiveTools.slice(0, 8).map((tool) => tool.name),
+    });
     const { promptStartedAt } = await runEmbeddedAttemptPromptPhase({
       attempt,
       activeSession,

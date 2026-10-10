@@ -65,6 +65,11 @@ export async function runEmbeddedAttemptExecutionPhase(
     sessionKey: attempt.sessionKey,
     runId: attempt.runId,
   });
+  input.attempt.capabilityIntelligenceExperiment?.onCheckpoint?.({
+    stage: "attempt-execution-phase-entered",
+    toolCount: toolCatalog.effectiveTools.length,
+    representativeToolNames: toolCatalog.effectiveTools.slice(0, 8).map((tool) => tool.name),
+  });
   const mergeTerminal = (incoming: AgentRunAttemptTerminal) => {
     state.terminal = mergeAgentRunAttemptTerminal(state.terminal, incoming);
   };
@@ -100,6 +105,11 @@ export async function runEmbeddedAttemptExecutionPhase(
 
   let preparedHistory: Awaited<ReturnType<typeof prepareEmbeddedAttemptHistory>>;
   try {
+    input.attempt.capabilityIntelligenceExperiment?.onCheckpoint?.({
+      stage: "attempt-history-preparation-entered",
+      toolCount: toolCatalog.effectiveTools.length,
+      representativeToolNames: toolCatalog.effectiveTools.slice(0, 8).map((tool) => tool.name),
+    });
     preparedHistory = await prepareEmbeddedAttemptHistory({
       attempt,
       activeSession,
@@ -118,6 +128,11 @@ export async function runEmbeddedAttemptExecutionPhase(
       systemPromptText: sessionRuntimeState.systemPromptText,
       transcriptPolicy,
       setActiveSessionSystemPrompt,
+    });
+    input.attempt.capabilityIntelligenceExperiment?.onCheckpoint?.({
+      stage: "attempt-history-preparation-completed",
+      toolCount: toolCatalog.effectiveTools.length,
+      representativeToolNames: toolCatalog.effectiveTools.slice(0, 8).map((tool) => tool.name),
     });
   } catch (error) {
     await flushPendingToolResultsAfterIdle({

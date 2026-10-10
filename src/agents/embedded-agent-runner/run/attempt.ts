@@ -291,6 +291,11 @@ export async function runEmbeddedAttempt(
     // Catalog preparation registers global run state before tool projection and
     // diagnostics, so arm cleanup before either can fail and leak the catalog.
     toolSearchCatalogApplied = toolSearchCatalogRef !== undefined;
+    params.capabilityIntelligenceExperiment?.onCheckpoint?.({
+      stage: "attempt-tool-catalog-entered",
+      toolCount: clientTools?.length ?? 0,
+      representativeToolNames: (clientTools ?? []).slice(0, 8).map((tool) => tool.function.name),
+    });
     const preparedToolCatalog = measureEmbeddedAgentPreparationSync(
       "attempt.tool-catalog",
       () =>
@@ -315,6 +320,13 @@ export async function runEmbeddedAttempt(
         }),
       { config: params.config },
     );
+    params.capabilityIntelligenceExperiment?.onCheckpoint?.({
+      stage: "attempt-tool-catalog-completed",
+      toolCount: preparedToolCatalog.effectiveTools.length,
+      representativeToolNames: preparedToolCatalog.effectiveTools
+        .slice(0, 8)
+        .map((tool) => tool.name),
+    });
     const {
       catalogToolHookContext,
       deferredDirectoryToolsCallable,
@@ -323,6 +335,11 @@ export async function runEmbeddedAttempt(
       toolSearchRunPlan,
     } = preparedToolCatalog;
     toolSearchCatalogApplied = toolSearch.catalogRegistered;
+    params.capabilityIntelligenceExperiment?.onCheckpoint?.({
+      stage: "attempt-system-prompt-entered",
+      toolCount: effectiveTools.length,
+      representativeToolNames: effectiveTools.slice(0, 8).map((tool) => tool.name),
+    });
     const preparedSystemPrompt = await measureEmbeddedAgentPreparation(
       "attempt.system-prompt",
       () =>
@@ -352,7 +369,17 @@ export async function runEmbeddedAttempt(
         }),
       { config: params.config },
     );
+    params.capabilityIntelligenceExperiment?.onCheckpoint?.({
+      stage: "attempt-system-prompt-completed",
+      toolCount: effectiveTools.length,
+      representativeToolNames: effectiveTools.slice(0, 8).map((tool) => tool.name),
+    });
     let sessionManager: ReturnType<typeof guardSessionManager> | undefined;
+    params.capabilityIntelligenceExperiment?.onCheckpoint?.({
+      stage: "attempt-transcript-lifecycle-entered",
+      toolCount: effectiveTools.length,
+      representativeToolNames: effectiveTools.slice(0, 8).map((tool) => tool.name),
+    });
     const {
       compactionTimeoutMs,
       ownedTranscriptWriteContext,
@@ -367,6 +394,11 @@ export async function runEmbeddedAttempt(
         }),
       { config: params.config },
     );
+    params.capabilityIntelligenceExperiment?.onCheckpoint?.({
+      stage: "attempt-transcript-lifecycle-completed",
+      toolCount: effectiveTools.length,
+      representativeToolNames: effectiveTools.slice(0, 8).map((tool) => tool.name),
+    });
 
     let session: AgentSession | undefined;
     let removeToolResultContextGuard: (() => void) | undefined;
@@ -375,6 +407,11 @@ export async function runEmbeddedAttempt(
     >["trajectoryRecorder"] = null;
     let buildAbortSettlePromise: () => Promise<void> | null = () => null;
     try {
+      params.capabilityIntelligenceExperiment?.onCheckpoint?.({
+        stage: "attempt-session-runtime-entered",
+        toolCount: effectiveTools.length,
+        representativeToolNames: effectiveTools.slice(0, 8).map((tool) => tool.name),
+      });
       const preparedSessionRuntime = await measureEmbeddedAgentPreparation(
         "attempt.session-runtime",
         () =>
@@ -464,6 +501,11 @@ export async function runEmbeddedAttempt(
           stage: "attempt-session-runtime",
         });
         throw error;
+      });
+      params.capabilityIntelligenceExperiment?.onCheckpoint?.({
+        stage: "attempt-session-runtime-completed",
+        toolCount: effectiveTools.length,
+        representativeToolNames: effectiveTools.slice(0, 8).map((tool) => tool.name),
       });
       const executionResult = await runEmbeddedAttemptExecutionPhase({
         attempt: params,

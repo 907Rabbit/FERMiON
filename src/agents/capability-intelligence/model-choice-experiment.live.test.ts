@@ -387,6 +387,7 @@ function writeSmokeInvalidArtifact(input: {
 describe("v1I smoke timeout controls", () => {
   const stages = [
     "workspaceSessionPreparation",
+    "postBundleToPrompt",
     "requestPreparation",
     "providerFirstResponse",
     "toolExecution",
@@ -1073,6 +1074,76 @@ function buildOfflineRequestConfig(workspaceDir: string): OpenClawConfig {
 }
 
 describe("v1I offline request preparation", () => {
+  it("reaches prompt phase with the live config and 31 synthetic client tools offline", async () => {
+    const benchmarkCase = TOOL_RANKING_HELD_OUT_CASES[0];
+    if (!benchmarkCase) {
+      throw new Error("held-out corpus is empty");
+    }
+    const workspaceDir = fs.mkdtempSync(
+      path.join(os.tmpdir(), "openclaw-v1i-live-config-offline-"),
+    );
+    const captured: CapturedModelRequest[] = [];
+    const abortController = new AbortController();
+    let delegatedRequests = 0;
+    try {
+      await installOfflinePreparedRuntimeMock();
+      const observation = await runOne({
+        mode: "synthetic",
+        surfaceMode: "SYNTHETIC",
+        benchmarkCase,
+        mappingClass: "SYNTHETIC",
+        authorizedNames: benchmarkCase.tools.map((tool) => tool.name),
+        v1cTop8: rankTop8(benchmarkCase.tools, benchmarkCase.query),
+        arm: "A",
+        replicate: 1,
+        attempt: 1,
+        scheduleSeed: scheduleSeedFor(benchmarkCase.id, 1),
+        config: buildLiveConfig(workspaceDir),
+        workspaceDir,
+        directRunner: true,
+        provider: PROVIDER,
+        model: MODEL_ID,
+        abortSignal: abortController.signal,
+        requestCapture: {
+          stopAfterCapture: true,
+          onRequestCaptured: (request) => {
+            captured.push(request);
+            abortController.abort(new V1IProviderRequestCapturedError());
+          },
+          onDelegatedRequest: () => {
+            delegatedRequests += 1;
+          },
+        },
+      });
+      const checkpoints = observation.requestPreparationDiagnostics?.checkpoints ?? [];
+      const checkpoint = (stage: string) => checkpoints.find((entry) => entry.stage === stage);
+      const names = toolNamesFromBody(captured[0]?.body ?? {});
+      expect(observation.valid).toBe(false);
+      expect(observation.invalidReason).toBe("HARNESS_ERROR");
+      expect(captured).toHaveLength(1);
+      expect(names).toHaveLength(31);
+      expect(names).toEqual(expect.arrayContaining(["git_diff", "pytest", "calendar", "email"]));
+      expect(checkpoint("client-preparation-completed")?.toolCount).toBe(31);
+      expect(checkpoint("attempt-bundle-completed")?.toolCount).toBeGreaterThan(0);
+      expect(checkpoint("attempt-tool-catalog-entered")).toBeDefined();
+      expect(checkpoint("attempt-tool-catalog-completed")).toBeDefined();
+      expect(checkpoint("attempt-system-prompt-completed")).toBeDefined();
+      expect(checkpoint("attempt-transcript-lifecycle-completed")).toBeDefined();
+      expect(checkpoint("attempt-session-runtime-completed")).toBeDefined();
+      expect(checkpoint("attempt-history-preparation-completed")).toBeDefined();
+      expect(checkpoint("prompt-phase-entered")?.toolCount).toBe(31);
+      expect(checkpoint("provider-request-constructed")?.toolCount).toBe(31);
+      expect(delegatedRequests).toBe(0);
+    } finally {
+      abortController.abort(new Error("offline v1I provider boundary complete"));
+      try {
+        fs.rmSync(workspaceDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {
+        // Windows can retain the agent database lock until this test process exits.
+      }
+    }
+  }, 60_000);
+
   it("serializes the raw request-preparation failure and last checkpoint", async () => {
     const benchmarkCase = TOOL_RANKING_HELD_OUT_CASES[0];
     if (!benchmarkCase) {
@@ -1144,7 +1215,7 @@ describe("v1I offline request preparation", () => {
         normalizedRuntimeStatus: "runtime-error",
         highLevelClassification: "REQUEST_PREPARATION_ERROR",
         failureClass: "OTHER_REQUEST_PREPARATION_ERROR",
-        lastSuccessfulCheckpoint: "embedded-input-accepted",
+        lastSuccessfulCheckpoint: "runner-entry",
         failure: {
           errorName: "RunWorkspaceRosterRequiredError",
           failureFile: expect.stringContaining("src/agents/workspace-run.ts"),

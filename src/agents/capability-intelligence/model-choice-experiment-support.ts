@@ -34,6 +34,7 @@ export const CONTEXT_LENGTH = 262_144;
 export const V1I_SMOKE_STAGE_TIMEOUTS_MS = {
   modelDiscovery: 30_000,
   workspaceSessionPreparation: 30_000,
+  postBundleToPrompt: 30_000,
   requestPreparation: 30_000,
   providerFirstResponse: 120_000,
   toolExecution: 60_000,
@@ -163,8 +164,28 @@ export function smokeStageForCheckpoint(stage: string): V1ISmokeStage | undefine
     stage === "runtime-preparation-completed" ||
     stage === "attempt-dispatch-entered" ||
     stage === "client-preparation-entered" ||
-    stage === "client-preparation-completed" ||
+    stage === "client-preparation-completed"
+  ) {
+    return "requestPreparation";
+  }
+  if (
     stage === "attempt-bundle-completed" ||
+    stage === "attempt-tool-catalog-entered" ||
+    stage === "attempt-tool-catalog-completed" ||
+    stage === "attempt-system-prompt-entered" ||
+    stage === "attempt-system-prompt-completed" ||
+    stage === "attempt-transcript-lifecycle-entered" ||
+    stage === "attempt-transcript-lifecycle-completed" ||
+    stage === "attempt-session-runtime-entered" ||
+    stage === "attempt-session-runtime-completed" ||
+    stage === "attempt-execution-phase-entered" ||
+    stage === "attempt-history-preparation-entered" ||
+    stage === "attempt-history-preparation-completed" ||
+    stage === "prompt-dispatch-started"
+  ) {
+    return "postBundleToPrompt";
+  }
+  if (
     stage === "prompt-phase-entered" ||
     stage === "prompt-tool-surface-completed" ||
     stage === "provider-adapter-entered" ||

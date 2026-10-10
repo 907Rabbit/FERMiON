@@ -407,6 +407,7 @@ export async function dispatchEmbeddedRunAttempt(input: {
     imageOrder: promptMedia.imageOrder,
     media: promptMedia.media,
     clientTools: params.clientTools,
+    clientToolsOnly: params.clientToolsOnly,
     disableTools: params.disableTools,
     provider: runtime.provider,
     modelId: runtime.modelId,

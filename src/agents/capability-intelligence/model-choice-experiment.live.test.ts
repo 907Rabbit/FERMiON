@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -52,7 +53,7 @@ const MODEL_ID = "qwen/qwen3.5-9b";
 const PROVIDER = "lmstudio";
 const LM_STUDIO_BASE_URL = "http://127.0.0.1:1234/v1";
 const CONTEXT_LENGTH = 262_144;
-const HARNESS_COMMIT = process.env.OPENCLAW_V1I_HARNESS_COMMIT ?? "uncommitted-harness";
+const HARNESS_COMMIT = resolveRepositoryHarnessCommit();
 const ARM_B_INSTRUCTION = `## Tool choice
 When multiple tools can perform a task, prefer the most specific purpose-built authorized tool.
 Use generic tools such as exec or read as fallbacks when the purpose-built tool cannot perform the required operation.
@@ -99,8 +100,13 @@ describe("v1I model-choice experiment preparation", () => {
     );
     expect(buildSyntheticRunnerOverrides(harness)).toEqual({
       clientTools: harness.clientTools,
+      clientToolsOnly: true,
+      disableTools: true,
     });
-    expect(buildSyntheticRunnerOverrides(harness)).not.toHaveProperty("disableTools");
+    expect(buildSyntheticRunnerOverrides(harness).clientTools).toHaveLength(31);
+    expect(
+      buildSyntheticRunnerOverrides(harness).clientTools?.map((tool) => tool.function.name),
+    ).toEqual(expect.arrayContaining(["git_diff", "pytest", "calendar", "email"]));
     expect(syntheticTools.size).toBeGreaterThan(0);
     expect(JSON.stringify(harness.clientTools)).not.toMatch(
       /requiredTools|relevantTools|expectedOutcome|toolRoles|rank/i,
@@ -145,11 +151,23 @@ describe("v1I harness evidence repair", () => {
     }
   });
 
-  it("preserves model-error status instead of collapsing it into HARNESS_ERROR", () => {
-    expect(invalidReasonForExecutionStatus("model-error")).toBe("MODEL_ERROR");
-    expect(invalidReasonForExecutionStatus("runtime-error")).toBe("HARNESS_ERROR");
-    expect(invalidReasonForExecutionStatus("aborted")).toBe("HARNESS_ERROR");
-    expect(invalidReasonForExecutionStatus("completed")).toBeNull();
+  it("distinguishes model errors from uncaptured request preparation failures", () => {
+    expect(invalidReasonForExecutionStatus("model-error", 0)).toBe("MODEL_ERROR");
+    expect(invalidReasonForExecutionStatus("runtime-error", 0)).toBe("REQUEST_PREPARATION_ERROR");
+    expect(invalidReasonForExecutionStatus("runtime-error", 1)).toBe("HARNESS_ERROR");
+    expect(invalidReasonForExecutionStatus("aborted", 0)).toBe("HARNESS_ERROR");
+    expect(invalidReasonForExecutionStatus("completed", 0)).toBe("NOT_CAPTURED");
+    expect(invalidReasonForExecutionStatus("completed", 1)).toBeNull();
+  });
+
+  it("uses the source commit when only generated artifacts are dirty", () => {
+    expect(resolveHarnessCommit({ head: "ae4d9d1", sourceDirty: false })).toBe("ae4d9d1");
+    expect(resolveHarnessCommit({ head: "ae4d9d1", sourceDirty: true })).toBe(
+      "uncommitted-harness",
+    );
+    expect(resolveHarnessCommit({ explicit: "override", head: "ae4d9d1", sourceDirty: true })).toBe(
+      "override",
+    );
   });
 });
 
@@ -545,7 +563,12 @@ async function runOne(input: {
     firstExecutedTool,
     executedToolSequence,
     terminalSuccess,
-    terminalFailureReason: terminalSuccess ? null : observedFailure ? "TOOL_ERROR" : "MODEL_ERROR",
+    terminalFailureReason: terminalFailureReasonForExecution({
+      status: completedExecution.status,
+      requestCount: requestBodies.length,
+      terminalSuccess,
+      observedFailure,
+    }),
     preferredToolAuthorized,
     preferredToolInTop8,
     preferredToolAttempted,
@@ -706,15 +729,15 @@ function describeInvalidRun(input: {
   observedRanking?: { epoch: string };
   requestBodies: readonly Record<string, unknown>[];
 }): string {
-  const statusReason = invalidReasonForExecutionStatus(input.execution.status);
+  const statusReason = invalidReasonForExecutionStatus(
+    input.execution.status,
+    input.requestBodies.length,
+  );
   if (statusReason) {
     return statusReason;
   }
   if (!input.observedRanking?.epoch) {
     return "MISSING_RANKING_EPOCH";
-  }
-  if (Object.keys(input.firstBody).length === 0) {
-    return "MODEL_ERROR";
   }
   if (!sameSurfaceAsExpected(input.firstBody, input.expected)) {
     return "AUTHORIZED_SURFACE_DRIFT";
@@ -728,11 +751,32 @@ function describeInvalidRun(input: {
   return "INCOMPLETE_TERMINAL_EVIDENCE";
 }
 
-function invalidReasonForExecutionStatus(status: string): string | null {
+function invalidReasonForExecutionStatus(status: string, requestCount: number): string | null {
   if (status === "completed") {
+    return requestCount > 0 ? null : "NOT_CAPTURED";
+  }
+  if (status === "model-error") {
+    return "MODEL_ERROR";
+  }
+  if (status === "runtime-error") {
+    return requestCount > 0 ? "HARNESS_ERROR" : "REQUEST_PREPARATION_ERROR";
+  }
+  return "HARNESS_ERROR";
+}
+
+function terminalFailureReasonForExecution(input: {
+  status: string;
+  requestCount: number;
+  terminalSuccess: boolean;
+  observedFailure: boolean;
+}): string | null {
+  if (input.terminalSuccess) {
     return null;
   }
-  return status === "model-error" ? "MODEL_ERROR" : "HARNESS_ERROR";
+  if (input.observedFailure) {
+    return "TOOL_ERROR";
+  }
+  return invalidReasonForExecutionStatus(input.status, input.requestCount) ?? "HARNESS_ERROR";
 }
 
 function assertSyntheticSmokePassed(): void {
@@ -759,8 +803,42 @@ function assertSyntheticSmokePassed(): void {
 
 function buildSyntheticRunnerOverrides(
   harness: ReturnType<typeof createSyntheticBenchmarkToolHarness>,
-): Pick<RunEmbeddedAgentParams, "clientTools"> {
-  return { clientTools: [...harness.clientTools] };
+): Pick<RunEmbeddedAgentParams, "clientTools" | "clientToolsOnly" | "disableTools"> {
+  return { clientTools: [...harness.clientTools], clientToolsOnly: true, disableTools: true };
+}
+
+function resolveRepositoryHarnessCommit(): string {
+  const explicit = process.env.OPENCLAW_V1I_HARNESS_COMMIT;
+  try {
+    const head = execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: process.cwd(),
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    const sourceStatus = execFileSync(
+      "git",
+      ["status", "--porcelain=v1", "--untracked-files=all", "--", "src"],
+      {
+        cwd: process.cwd(),
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      },
+    );
+    return resolveHarnessCommit({ explicit, head, sourceDirty: sourceStatus.trim().length > 0 });
+  } catch {
+    return resolveHarnessCommit({ explicit, sourceDirty: true });
+  }
+}
+
+function resolveHarnessCommit(input: {
+  explicit?: string;
+  head?: string;
+  sourceDirty: boolean;
+}): string {
+  if (input.explicit?.trim()) {
+    return input.explicit.trim();
+  }
+  return !input.sourceDirty && input.head?.trim() ? input.head.trim() : "uncommitted-harness";
 }
 
 function buildManifest(sets: ReturnType<typeof splitV1IExperimentSets>): V1IManifest {

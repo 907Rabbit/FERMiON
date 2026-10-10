@@ -66,9 +66,11 @@ export async function prepareEmbeddedAttemptBundleTools(params: {
         sessionId: params.attempt.sessionId,
       }),
   });
+  const clientToolsOnly =
+    params.attempt.clientToolsOnly === true && params.attempt.disableTools === true;
   const providedClientTools =
     toolsEnabled &&
-    !params.attempt.disableTools &&
+    (clientToolsOnly || !params.attempt.disableTools) &&
     !params.isRawModelRun &&
     !params.attempt.forceRestartSafeTools
       ? params.attempt.clientTools

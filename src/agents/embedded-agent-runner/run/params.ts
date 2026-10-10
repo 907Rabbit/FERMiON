@@ -246,6 +246,8 @@ export type RunEmbeddedAgentParams = {
   media?: MediaFact[];
   /** Optional client-provided tools (OpenResponses hosted tools). */
   clientTools?: ClientToolDefinition[];
+  /** Internal synthetic experiment mode: expose client tools without built-ins. */
+  clientToolsOnly?: boolean;
   /** Disable built-in tools for this run (LLM-only mode). */
   disableTools?: boolean;
   provider?: string;

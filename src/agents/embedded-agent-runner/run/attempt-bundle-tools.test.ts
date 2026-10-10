@@ -184,6 +184,25 @@ describe("prepareEmbeddedAttemptBundleTools", () => {
     expect(mocks.createBundleLspToolRuntime).not.toHaveBeenCalled();
   });
 
+  it("preserves client functions for the isolated synthetic experiment surface", async () => {
+    const input = createInput([], []);
+    input.attempt.disableTools = true;
+    input.attempt.clientToolsOnly = true;
+    input.attempt.clientTools = ["read", "pytest", "calendar", "email"].map((name) => ({
+      type: "function" as const,
+      function: { name, parameters: { type: "object" } },
+    }));
+
+    const result = await prepareEmbeddedAttemptBundleTools(input);
+
+    expect(result.clientTools?.map((tool) => tool.function.name)).toEqual([
+      "read",
+      "pytest",
+      "calendar",
+      "email",
+    ]);
+  });
+
   it("refreshes spawned-child inheritance after authorized MCP tools materialize", async () => {
     const inheritedToolAllowlist = ["sessions_spawn"];
     mocks.getOrCreateSessionMcpRuntime.mockResolvedValue({});

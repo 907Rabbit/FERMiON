@@ -76,12 +76,16 @@ function prepare(input: {
   effectiveTools?: ReturnType<typeof createStubTool>[];
   uncompactedEffectiveTools?: ReturnType<typeof createStubTool>[];
   clientTools?: ReturnType<typeof clientTool>[];
+  clientToolsOnly?: boolean;
+  disableTools?: boolean;
 }) {
   return prepareEmbeddedAttemptClientTools({
     attempt: {
       config: input.attemptConfig,
       sessionId: "session",
       runId: "run",
+      clientToolsOnly: input.clientToolsOnly,
+      disableTools: input.disableTools,
     },
     catalogToolHookContext: undefined,
     codeModeControlsEnabledForRun: input.codeModeControlsEnabledForRun,
@@ -356,6 +360,26 @@ describe("prepareEmbeddedAttemptClientTools", () => {
     });
 
     expect(result.clientToolDefs.map((tool) => tool.name)).toEqual(["client_probe"]);
+  });
+
+  it("keeps reserved synthetic names in the client-only experiment surface", () => {
+    const result = prepare({
+      codeModeControlsEnabledForRun: false,
+      attemptConfig: CATALOGS_DISABLED_CONFIG,
+      toolSearchRuntimeConfig: CATALOGS_DISABLED_CONFIG,
+      catalogRef: createToolSearchCatalogRef(),
+      clientToolsOnly: true,
+      disableTools: true,
+      clientTools: ["read", "git_diff", "pytest", "calendar", "email"].map(clientTool),
+    });
+
+    expect(result.allCustomTools.map((tool) => tool.name)).toEqual([
+      "read",
+      "git_diff",
+      "pytest",
+      "calendar",
+      "email",
+    ]);
   });
 
   it("binds side-effect metadata to the concrete plugin tool owner", () => {

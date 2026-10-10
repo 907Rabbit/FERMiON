@@ -82,7 +82,12 @@ export function prepareEmbeddedAttemptClientTools(params: {
     tools: params.clientTools ?? [],
     existingToolNames: [...clientConflictToolNames, ...AGENT_RESERVED_TOOL_NAMES],
   });
-  if (clientToolNameConflicts.length > 0) {
+  const clientToolsOnly =
+    params.attempt.clientToolsOnly === true && params.attempt.disableTools === true;
+  // Synthetic v1I runs deliberately reuse ordinary tool names while built-ins
+  // are disabled, so only that client-only surface may bypass this collision
+  // guard. Normal client tools remain fail-closed on every other path.
+  if (!clientToolsOnly && clientToolNameConflicts.length > 0) {
     throw createClientToolNameConflictError(clientToolNameConflicts);
   }
 

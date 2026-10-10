@@ -533,27 +533,35 @@ export async function prepareEmbeddedAttemptTransport(input: {
       )
     : undefined;
   const observeProviderRequest = (streamFn: StreamFn | undefined): StreamFn | undefined => {
-    if (!streamFn || !attempt.capabilityIntelligenceExperiment?.onProviderRequest) {
+    const experiment = attempt.capabilityIntelligenceExperiment;
+    if (!streamFn || (!experiment?.onProviderRequest && !experiment?.onProviderResponse)) {
       return streamFn;
     }
     return (model, context, options) => {
       const existingOnPayload = options?.onPayload;
+      const existingOnResponse = options?.onResponse;
       return streamFn(model, context, {
         ...options,
         onPayload: async (payload, payloadModel) => {
           try {
-            await attempt.capabilityIntelligenceExperiment?.onProviderRequest?.({
-              payload,
-              model: payloadModel,
-            });
+            await experiment.onProviderRequest?.({ payload, model: payloadModel });
           } catch (error) {
-            attempt.capabilityIntelligenceExperiment?.onRequestPreparationError?.({
+            experiment.onRequestPreparationError?.({
               error,
               stage: "provider-request-constructed",
             });
             throw error;
           }
           return (await existingOnPayload?.(payload, payloadModel)) ?? payload;
+        },
+        onResponse: async (response, responseModel) => {
+          try {
+            await experiment.onProviderResponse?.({ response, model: responseModel });
+          } catch (error) {
+            experiment.onRequestPreparationError?.({ error, stage: "provider-response-received" });
+            throw error;
+          }
+          await existingOnResponse?.(response, responseModel);
         },
       });
     };

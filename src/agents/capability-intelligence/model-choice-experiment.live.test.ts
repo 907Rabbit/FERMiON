@@ -53,6 +53,8 @@ import {
   LM_STUDIO_BASE_URL,
   MODEL_ID,
   PROVIDER,
+  V1ISmokeTimeoutError,
+  appendV1ISmokeCheckpoint,
   assertSyntheticSmokePassed,
   buildManifest,
   buildSyntheticRunnerOverrides,
@@ -65,7 +67,10 @@ import {
   orderedArms,
   resolveHarnessCommit,
   runV1IAttempt,
+  createV1ISmokeDeadline,
+  runV1ISmokeStage,
   scheduleSeedFor,
+  smokeStageForCheckpoint,
   sha256,
   type Arm,
   type InvalidObservationInput,
@@ -231,16 +236,42 @@ describeSmokeLive("v1I model-choice experiment smoke", () => {
         path.join(smokeRoot, "smoke-manifest.json"),
         `${JSON.stringify(smokeManifest, null, 2)}\n`,
       );
-      await assertLiveModelAvailable();
-      const workspaceDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-v1i-smoke-"));
+      let lastSuccessfulCheckpoint = "manifest-written";
+      const recordCheckpoint = (stage: string, details: Record<string, unknown> = {}) => {
+        lastSuccessfulCheckpoint = stage;
+        appendV1ISmokeCheckpoint(smokeRoot, { stage, ...details });
+      };
+      recordCheckpoint("manifest-written", { harnessCommit: HARNESS_COMMIT });
       try {
-        const observation = await runV1IAttempt(
+        await runV1ISmokeStage({
+          stage: "modelDiscovery",
+          operation: (signal) => assertLiveModelAvailable(signal),
+          onTimeout: (error) => recordSmokeTimeout(smokeRoot, error),
+        });
+        const workspaceDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-v1i-smoke-"));
+        const config = buildLiveConfig(workspaceDir);
+        recordCheckpoint("live-config-built");
+        const smokeDeadline = createSmokeDeadlineForRun(smokeRoot);
+        smokeDeadline.enter("workspaceSessionPreparation", "live-config-built");
+        let observation: ExperimentRun;
+        const execution = runV1IAttempt(
           smokeInput,
           () =>
             runOne({
               ...smokeInput,
-              config: buildLiveConfig(workspaceDir),
+              config,
               workspaceDir,
+              abortSignal: smokeDeadline.signal,
+              onCheckpoint: (checkpoint) => {
+                recordCheckpoint(checkpoint.stage, {
+                  toolCount: checkpoint.toolCount,
+                  representativeToolNames: checkpoint.representativeToolNames,
+                });
+                const stage = smokeStageForCheckpoint(checkpoint.stage);
+                if (stage) {
+                  smokeDeadline.enter(stage, checkpoint.stage);
+                }
+              },
             }),
           (value) => {
             fs.writeFileSync(
@@ -249,6 +280,22 @@ describeSmokeLive("v1I model-choice experiment smoke", () => {
             );
           },
         );
+        try {
+          observation = await Promise.race([execution, smokeDeadline.timeoutPromise]);
+        } catch (error) {
+          if (error instanceof V1ISmokeTimeoutError) {
+            await Promise.race([
+              execution.catch(() => undefined),
+              new Promise((resolve) => {
+                setTimeout(resolve, 5_000);
+              }),
+            ]);
+          }
+          throw error;
+        } finally {
+          smokeDeadline.dispose();
+          fs.rmSync(workspaceDir, { recursive: true, force: true });
+        }
         const result = {
           status: observation.valid ? "PASS" : "FAIL",
           harnessCommit: HARNESS_COMMIT,
@@ -262,11 +309,165 @@ describeSmokeLive("v1I model-choice experiment smoke", () => {
           `${JSON.stringify(result, null, 2)}\n`,
         );
         expect(observation.valid).toBe(true);
-      } finally {
-        fs.rmSync(workspaceDir, { recursive: true, force: true });
+      } catch (error) {
+        writeSmokeInvalidArtifact({
+          smokeRoot,
+          error,
+          lastSuccessfulCheckpoint,
+          harnessCommit: HARNESS_COMMIT,
+          modelConfigHash: smokeManifest.modelConfigHash,
+        });
+        throw error;
       }
     },
   );
+});
+
+function createSmokeDeadlineForRun(smokeRoot: string) {
+  return createV1ISmokeDeadline({
+    onTimeout: (error) => recordSmokeTimeout(smokeRoot, error),
+  });
+}
+
+function recordSmokeTimeout(smokeRoot: string, error: V1ISmokeTimeoutError): void {
+  appendV1ISmokeCheckpoint(smokeRoot, {
+    stage: "timeout",
+    invalidReason: "INFRASTRUCTURE_TIMEOUT",
+    timeoutStage: error.timeoutStage,
+    timeoutMs: error.timeoutMs,
+    lastSuccessfulCheckpoint: error.lastSuccessfulCheckpoint,
+  });
+}
+
+function writeSmokeInvalidArtifact(input: {
+  smokeRoot: string;
+  error: unknown;
+  lastSuccessfulCheckpoint: string;
+  harnessCommit: string;
+  modelConfigHash: string;
+}): void {
+  const timeout = input.error instanceof V1ISmokeTimeoutError ? input.error : undefined;
+  const rawErrorName = input.error instanceof Error ? input.error.name : "NonErrorThrown";
+  const rawErrorMessage = input.error instanceof Error ? input.error.message : String(input.error);
+  const invalid = {
+    valid: false,
+    invalidReason: timeout ? "INFRASTRUCTURE_TIMEOUT" : "HARNESS_ERROR",
+    failureStage: timeout?.timeoutStage ?? "smoke-harness",
+    rawErrorName,
+    rawErrorMessage,
+    lastSuccessfulCheckpoint: timeout?.lastSuccessfulCheckpoint ?? input.lastSuccessfulCheckpoint,
+    timeoutMs: timeout?.timeoutMs ?? null,
+    harnessCommit: input.harnessCommit,
+    modelConfigHash: input.modelConfigHash,
+    recordedAt: new Date().toISOString(),
+  };
+  fs.writeFileSync(
+    path.join(input.smokeRoot, "smoke-invalid.json"),
+    `${JSON.stringify(invalid, null, 2)}\n`,
+  );
+  fs.writeFileSync(
+    path.join(input.smokeRoot, "smoke-result.json"),
+    `${JSON.stringify(
+      {
+        status: "FAIL",
+        harnessCommit: input.harnessCommit,
+        modelConfigHash: input.modelConfigHash,
+        activeFilteringEnabled: false,
+        observationValid: false,
+        invalidReason: invalid.invalidReason,
+        failureStage: invalid.failureStage,
+        lastSuccessfulCheckpoint: invalid.lastSuccessfulCheckpoint,
+      },
+      null,
+      2,
+    )}\n`,
+  );
+}
+
+describe("v1I smoke timeout controls", () => {
+  const stages = [
+    "workspaceSessionPreparation",
+    "requestPreparation",
+    "providerFirstResponse",
+    "toolExecution",
+    "terminalCompletion",
+  ] as const;
+
+  it.each(stages)("aborts and serializes a stalled %s stage", async (stage) => {
+    const smokeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "v1i-smoke-timeout-"));
+    let timeout: V1ISmokeTimeoutError | undefined;
+    const deadline = createV1ISmokeDeadline({
+      timeouts: { [stage]: 10 },
+      onTimeout: (error) => {
+        timeout = error;
+        recordSmokeTimeout(smokeRoot, error);
+      },
+    });
+    deadline.enter(stage, `${stage}-checkpoint`);
+    const stalled = new Promise<void>((_, reject) => {
+      deadline.signal.addEventListener("abort", () => reject(abortReason(deadline.signal)), {
+        once: true,
+      });
+    });
+    try {
+      await expect(Promise.race([stalled, deadline.timeoutPromise])).rejects.toBeInstanceOf(
+        V1ISmokeTimeoutError,
+      );
+      expect(deadline.signal.aborted).toBe(true);
+      expect(timeout?.timeoutStage).toBe(stage);
+      writeSmokeInvalidArtifact({
+        smokeRoot,
+        error: timeout,
+        lastSuccessfulCheckpoint: `${stage}-checkpoint`,
+        harnessCommit: HARNESS_COMMIT,
+        modelConfigHash: hashV1ICanonical(modelConfigIdentity()),
+      });
+      expect(fs.existsSync(path.join(smokeRoot, "smoke-invalid.json"))).toBe(true);
+      expect(
+        JSON.parse(fs.readFileSync(path.join(smokeRoot, "smoke-invalid.json"), "utf8")),
+      ).toMatchObject({
+        valid: false,
+        invalidReason: "INFRASTRUCTURE_TIMEOUT",
+        failureStage: stage,
+        lastSuccessfulCheckpoint: `${stage}-checkpoint`,
+      });
+    } finally {
+      deadline.dispose();
+      fs.rmSync(smokeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("flushes checkpoints before the next await", () => {
+    const smokeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "v1i-smoke-checkpoints-"));
+    try {
+      appendV1ISmokeCheckpoint(smokeRoot, { stage: "manifest-written" });
+      expect(fs.readFileSync(path.join(smokeRoot, "smoke-checkpoints.jsonl"), "utf8")).toContain(
+        '"stage":"manifest-written"',
+      );
+      appendV1ISmokeCheckpoint(smokeRoot, { stage: "live-config-built" });
+      expect(
+        fs.readFileSync(path.join(smokeRoot, "smoke-checkpoints.jsonl"), "utf8").trim().split("\n"),
+      ).toHaveLength(2);
+    } finally {
+      fs.rmSync(smokeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("uses its own timeout instead of the Vitest timeout for a stalled stage", async () => {
+    const startedAt = performance.now();
+    await expect(
+      runV1ISmokeStage({
+        stage: "providerFirstResponse",
+        timeoutMs: 10,
+        operation: () => new Promise<never>(() => {}),
+      }),
+    ).rejects.toMatchObject({
+      name: "V1ISmokeTimeoutError",
+      timeoutStage: "providerFirstResponse",
+      timeoutMs: 10,
+    });
+    expect(performance.now() - startedAt).toBeLessThan(1_000);
+  });
 });
 
 describeFullLive("v1I model-choice experiment live", () => {
@@ -525,6 +726,15 @@ async function runOne(input: {
       });
     }
   };
+  const diagnosticsProviderResponse = diagnostics.hooks.onProviderResponse;
+  diagnostics.hooks.onProviderResponse = async ({ response, model }) => {
+    diagnostics.hooks.onCheckpoint?.({
+      stage: "provider-response-received",
+      toolCount: input.authorizedNames.length,
+      representativeToolNames: input.authorizedNames.slice(0, 8),
+    });
+    await diagnosticsProviderResponse?.({ response, model });
+  };
   const startTime = new Date().toISOString();
   let observedRanking: Extract<EmbeddedReplayFact, { kind: "ranking" }> | undefined;
   let observedFailure = false;
@@ -560,6 +770,11 @@ async function runOne(input: {
           },
           onAgentToolResult: (event) => {
             observedFailure ||= event.isError;
+            diagnostics.hooks.onCheckpoint?.({
+              stage: "tool-execution-finished",
+              toolCount: 1,
+              representativeToolNames: [event.toolName],
+            });
             originalResultListener?.(event);
           },
         });
@@ -581,6 +796,13 @@ async function runOne(input: {
             outcome: "success",
           });
         }
+      }
+      if (!input.abortSignal?.aborted) {
+        diagnostics.hooks.onCheckpoint?.({
+          stage: "terminal-observed",
+          toolCount: result.meta.pendingToolCalls?.length ?? 0,
+          representativeToolNames: (result.meta.pendingToolCalls ?? []).map((call) => call.name),
+        });
       }
       return result;
     };
@@ -1129,8 +1351,8 @@ async function installOfflinePreparedRuntimeMock(): Promise<void> {
   });
 }
 
-async function assertLiveModelAvailable(): Promise<void> {
-  const response = await fetch("http://127.0.0.1:1234/api/v1/models");
+async function assertLiveModelAvailable(signal?: AbortSignal): Promise<void> {
+  const response = await fetch("http://127.0.0.1:1234/api/v1/models", { signal });
   if (!response.ok) {
     throw new Error(`PREPARED_NOT_STARTED: LM Studio discovery returned ${response.status}`);
   }

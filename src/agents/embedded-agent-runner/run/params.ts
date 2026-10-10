@@ -86,7 +86,10 @@ export type EmbeddedCapabilityIntelligenceCheckpointStage =
   | "model-loop-entered"
   | "model-loop-completed"
   | "prompt-submission-completed"
-  | "provider-request-constructed";
+  | "provider-request-constructed"
+  | "provider-response-received"
+  | "tool-execution-finished"
+  | "terminal-observed";
 
 export type EmbeddedCapabilityIntelligenceExperimentHooks = {
   onCheckpoint?: (checkpoint: {
@@ -96,6 +99,7 @@ export type EmbeddedCapabilityIntelligenceExperimentHooks = {
   }) => void;
   onRequestPreparationError?: (input: { error: unknown; stage: string }) => void;
   onProviderRequest?: (input: { payload: unknown; model: unknown }) => void | Promise<void>;
+  onProviderResponse?: (input: { response: unknown; model: unknown }) => void | Promise<void>;
 };
 
 export type ResolvedToolPromptFinalizer = (params: {

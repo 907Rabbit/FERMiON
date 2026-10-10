@@ -31,6 +31,15 @@ export const MODEL_ID = "qwen/qwen3.5-9b";
 export const PROVIDER = "lmstudio";
 export const LM_STUDIO_BASE_URL = "http://127.0.0.1:1234/v1";
 export const CONTEXT_LENGTH = 262_144;
+export const V1I_SMOKE_STAGE_TIMEOUTS_MS = {
+  modelDiscovery: 30_000,
+  workspaceSessionPreparation: 30_000,
+  requestPreparation: 30_000,
+  providerFirstResponse: 120_000,
+  toolExecution: 60_000,
+  terminalCompletion: 60_000,
+} as const;
+export type V1ISmokeStage = keyof typeof V1I_SMOKE_STAGE_TIMEOUTS_MS;
 export const ARM_B_INSTRUCTION = `## Tool choice
 When multiple tools can perform a task, prefer the most specific purpose-built authorized tool.
 Use generic tools such as exec or read as fallbacks when the purpose-built tool cannot perform the required operation.
@@ -40,6 +49,143 @@ export const HARNESS_COMMIT = resolveRepositoryHarnessCommit();
 
 export type Arm = "A" | "B";
 export type MappingClass = V1IMappingClassification;
+
+export class V1ISmokeTimeoutError extends Error {
+  readonly timeoutStage: V1ISmokeStage;
+  readonly timeoutMs: number;
+  readonly lastSuccessfulCheckpoint: string;
+
+  constructor(input: {
+    timeoutStage: V1ISmokeStage;
+    timeoutMs: number;
+    lastSuccessfulCheckpoint: string;
+  }) {
+    super(`v1I smoke timed out during ${input.timeoutStage} after ${input.timeoutMs}ms`);
+    this.name = "V1ISmokeTimeoutError";
+    this.timeoutStage = input.timeoutStage;
+    this.timeoutMs = input.timeoutMs;
+    this.lastSuccessfulCheckpoint = input.lastSuccessfulCheckpoint;
+  }
+}
+
+export function appendV1ISmokeCheckpoint(
+  smokeRoot: string,
+  checkpoint: { stage: string; [key: string]: unknown },
+): void {
+  fs.mkdirSync(smokeRoot, { recursive: true });
+  fs.appendFileSync(
+    path.join(smokeRoot, "smoke-checkpoints.jsonl"),
+    `${JSON.stringify({ ...checkpoint, observedAt: new Date().toISOString() })}\n`,
+  );
+}
+
+export function createV1ISmokeDeadline(input: {
+  onTimeout: (error: V1ISmokeTimeoutError) => void;
+  timeouts?: Partial<Record<V1ISmokeStage, number>>;
+}): {
+  signal: AbortSignal;
+  enter: (stage: V1ISmokeStage, checkpoint: string) => void;
+  timeoutPromise: Promise<never>;
+  readTimeout: () => V1ISmokeTimeoutError | undefined;
+  dispose: () => void;
+} {
+  const controller = new AbortController();
+  let activeTimer: ReturnType<typeof setTimeout> | undefined;
+  let lastSuccessfulCheckpoint = "none";
+  let timeoutError: V1ISmokeTimeoutError | undefined;
+  let rejectTimeout!: (error: V1ISmokeTimeoutError) => void;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    rejectTimeout = reject;
+  });
+  const enter = (stage: V1ISmokeStage, checkpoint: string) => {
+    if (timeoutError) {
+      return;
+    }
+    if (activeTimer) {
+      clearTimeout(activeTimer);
+    }
+    lastSuccessfulCheckpoint = checkpoint;
+    const timeoutMs = input.timeouts?.[stage] ?? V1I_SMOKE_STAGE_TIMEOUTS_MS[stage];
+    activeTimer = setTimeout(() => {
+      timeoutError = new V1ISmokeTimeoutError({
+        timeoutStage: stage,
+        timeoutMs,
+        lastSuccessfulCheckpoint,
+      });
+      input.onTimeout(timeoutError);
+      controller.abort(timeoutError);
+      rejectTimeout(timeoutError);
+    }, timeoutMs);
+  };
+  return {
+    signal: controller.signal,
+    enter,
+    timeoutPromise,
+    readTimeout: () => timeoutError,
+    dispose: () => {
+      if (activeTimer) {
+        clearTimeout(activeTimer);
+        activeTimer = undefined;
+      }
+    },
+  };
+}
+
+export async function runV1ISmokeStage<T>(input: {
+  stage: V1ISmokeStage;
+  operation: (signal: AbortSignal) => Promise<T>;
+  onTimeout?: (error: V1ISmokeTimeoutError) => void;
+  timeoutMs?: number;
+}): Promise<T> {
+  const deadline = createV1ISmokeDeadline({
+    onTimeout: input.onTimeout ?? (() => {}),
+    ...(input.timeoutMs === undefined ? {} : { timeouts: { [input.stage]: input.timeoutMs } }),
+  });
+  deadline.enter(input.stage, `${input.stage}-started`);
+  const operation = input.operation(deadline.signal);
+  try {
+    return await Promise.race([operation, deadline.timeoutPromise]);
+  } finally {
+    deadline.dispose();
+  }
+}
+
+export function smokeStageForCheckpoint(stage: string): V1ISmokeStage | undefined {
+  if (
+    stage === "runner-entry" ||
+    stage === "session-target-resolution-entered" ||
+    stage === "runtime-preparation-entered"
+  ) {
+    return "workspaceSessionPreparation";
+  }
+  if (
+    stage === "session-target-resolution-completed" ||
+    stage === "runtime-preparation-completed" ||
+    stage === "attempt-dispatch-entered" ||
+    stage === "client-preparation-entered" ||
+    stage === "client-preparation-completed" ||
+    stage === "attempt-bundle-completed" ||
+    stage === "prompt-phase-entered" ||
+    stage === "prompt-tool-surface-completed" ||
+    stage === "provider-adapter-entered" ||
+    stage === "prompt-preflight-entered" ||
+    stage === "prompt-preflight-completed" ||
+    stage === "model-loop-entered" ||
+    stage === "prompt-submission-completed"
+  ) {
+    return "requestPreparation";
+  }
+  if (stage === "provider-request-constructed") {
+    return "providerFirstResponse";
+  }
+  if (stage === "provider-response-received") {
+    return "terminalCompletion";
+  }
+  if (stage === "tool-execution-finished") {
+    return "terminalCompletion";
+  }
+  return undefined;
+}
 
 export type ExperimentDiagnostics = {
   checkpoints: V1IExperimentCheckpoint[];

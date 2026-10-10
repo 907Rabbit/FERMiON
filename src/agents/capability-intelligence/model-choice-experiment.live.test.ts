@@ -2,6 +2,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { configureAiTransportHost, getAiTransportHost } from "@openclaw/ai";
 import { describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { RunEmbeddedAgentParams } from "../embedded-agent-runner/run/params.js";
@@ -109,6 +110,8 @@ type ModelPayloadCapture = {
   requests: CapturedModelRequest[];
   delegatedRequests: number;
   responseSummaries: ProviderResponseSummary[];
+  originalFetch: typeof globalThis.fetch;
+  wrapFetch: (baseFetch: typeof globalThis.fetch) => typeof globalThis.fetch;
   recordProviderRequest: (request: CapturedModelRequest) => void;
   restore: () => void;
 };
@@ -117,6 +120,13 @@ class V1IProviderRequestCapturedError extends Error {
   constructor() {
     super("v1I provider request captured before network I/O");
     this.name = "V1IProviderRequestCapturedError";
+  }
+}
+
+class V1ISmokeValidityError extends Error {
+  constructor(readonly validityReason: string) {
+    super(`v1I smoke validity failed: ${validityReason}`);
+    this.name = "V1ISmokeValidityError";
   }
 }
 
@@ -241,6 +251,133 @@ describe("v1I harness evidence repair", () => {
     expect(toolCall.parserOutcome).toBe("tool-call-complete");
     expect(toolCall.toolCallCount).toBe(1);
     expect(toolCall.toolCallNames).toEqual(["git_diff"]);
+  });
+
+  it("compares authorized tool surfaces semantically while reporting real drift", () => {
+    const expected = ["git_diff", "pytest", "git_status"];
+    expect(compareToolSurfaces(expected, ["git_status", "git_diff", "pytest"])).toEqual({
+      canonicalEqual: true,
+      orderEqual: false,
+      added: [],
+      missing: [],
+    });
+    expect(compareToolSurfaces(expected, ["git_diff", "pytest", "calendar"])).toEqual({
+      canonicalEqual: false,
+      orderEqual: false,
+      added: ["calendar"],
+      missing: ["git_status"],
+    });
+    expect(
+      sameSurfaceAsExpected(
+        { tools: [{ function: { name: "git_status" } }, { function: { name: "git_diff" } }] },
+        ["git_diff", "git_status"],
+      ),
+    ).toBe(true);
+  });
+
+  it("canonicalizes tool schema key and array order but detects schema changes", () => {
+    const first = [
+      { type: "function", function: { name: "git_diff", parameters: { type: "object" } } },
+      { type: "function", function: { name: "pytest", parameters: { type: "object" } } },
+    ];
+    const reordered = [
+      { function: { parameters: { type: "object" }, name: "pytest" }, type: "function" },
+      { function: { parameters: { type: "object" }, name: "git_diff" }, type: "function" },
+    ];
+    const changed = [
+      ...reordered.slice(0, 1),
+      { function: { parameters: { type: "string" }, name: "git_diff" }, type: "function" },
+    ];
+    expect(canonicalizeToolDefinitions(first)).toBe(canonicalizeToolDefinitions(reordered));
+    expect(sameSchemaAcrossRequests([{ tools: first }, { tools: reordered }])).toBe(true);
+    expect(sameSchemaAcrossRequests([{ tools: first }, { tools: changed }])).toBe(false);
+  });
+
+  it("captures provider responses through the AI transport host fetch boundary", async () => {
+    const summaries: ProviderResponseSummary[] = [];
+    const capture = captureModelPayloads(undefined, {
+      onResponseSummary: (summary) => summaries.push(summary),
+    });
+    const previousHost = getAiTransportHost();
+    const fixture = [
+      'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"git_status"}}]},"finish_reason":null}]}',
+      'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}',
+      "data: [DONE]",
+    ].join("\n\n");
+    try {
+      configureAiTransportHost({
+        ...previousHost,
+        buildModelFetch: () =>
+          capture.wrapFetch(
+            async () => new Response(fixture, { headers: { "content-type": "text/event-stream" } }),
+          ),
+      });
+      const hostFetch = getAiTransportHost().buildModelFetch(undefined as never);
+      if (!hostFetch) {
+        throw new Error("AI transport host did not provide a fetch implementation");
+      }
+      const response = await hostFetch(`${LM_STUDIO_BASE_URL}/chat/completions`, {
+        method: "POST",
+        body: JSON.stringify({ tools: [{ function: { name: "git_status" } }] }),
+      });
+      await response.text();
+      expect(summaries.at(-1)).toMatchObject({
+        parserOutcome: "tool-call-complete",
+        toolCallNames: ["git_status"],
+      });
+    } finally {
+      configureAiTransportHost(previousHost);
+      capture.restore();
+    }
+  });
+
+  it("preserves provider evidence before recording an invalid smoke result", async () => {
+    const smokeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "v1i-invalid-evidence-"));
+    try {
+      const summary = await captureProviderSummaryForFixture(
+        [
+          'data: {"choices":[{"delta":{"content":"done"},"finish_reason":null}]}',
+          'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}',
+          "data: [DONE]",
+        ].join("\n\n"),
+      );
+      fs.writeFileSync(
+        path.join(smokeRoot, "smoke-provider-response.json"),
+        `${JSON.stringify({ summaries: [summary] }, null, 2)}\n`,
+      );
+      writeSmokeInvalidArtifact({
+        smokeRoot,
+        error: new V1ISmokeValidityError("AUTHORIZED_SURFACE_DRIFT"),
+        lastSuccessfulCheckpoint: "terminal-observed",
+        harnessCommit: HARNESS_COMMIT,
+        modelConfigHash: hashV1ICanonical(modelConfigIdentity()),
+      });
+      expect(fs.existsSync(path.join(smokeRoot, "smoke-provider-response.json"))).toBe(true);
+      expect(
+        JSON.parse(fs.readFileSync(path.join(smokeRoot, "smoke-invalid.json"), "utf8")),
+      ).toMatchObject({
+        invalidReason: "AUTHORIZED_SURFACE_DRIFT",
+        experimentLevelFailureClass: "VALIDITY_ERROR",
+        validityReason: "AUTHORIZED_SURFACE_DRIFT",
+      });
+      expect(
+        JSON.parse(fs.readFileSync(path.join(smokeRoot, "smoke-provider-response.json"), "utf8"))
+          .summaries[0].parserOutcome,
+      ).toBe("no-tool-complete");
+    } finally {
+      fs.rmSync(smokeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("retains duplicate tool executions for accounting instead of normalizing them away", () => {
+    const accounting = summarizeExecutedTools([
+      { name: "git_status", executionStarted: true },
+      { name: "git_status", executionStarted: true },
+      { name: "read", executionStarted: false },
+    ]);
+    expect(accounting.executedToolSequence).toEqual(["git_status", "git_status"]);
+    expect(accounting.duplicateToolNames).toEqual(["git_status"]);
+    expect(accounting.duplicateExecutionCount).toBe(1);
   });
 
   it("keeps a primary terminal timeout authoritative over cleanup errors", () => {
@@ -434,7 +571,9 @@ describeSmokeLive("v1I model-choice experiment smoke", () => {
           path.join(smokeRoot, "smoke-result.json"),
           `${JSON.stringify(result, null, 2)}\n`,
         );
-        expect(observation.valid).toBe(true);
+        if (!observation.valid) {
+          throw new V1ISmokeValidityError(observation.invalidReason ?? "UNKNOWN_VALIDITY_ERROR");
+        }
       } catch (error) {
         writeSmokeInvalidArtifact({
           smokeRoot,
@@ -475,12 +614,21 @@ function writeSmokeInvalidArtifact(input: {
   cleanupErrors?: readonly SerializedSmokeError[];
 }): void {
   const timeout = input.error instanceof V1ISmokeTimeoutError ? input.error : undefined;
+  const validity = input.error instanceof V1ISmokeValidityError ? input.error : undefined;
   const rawErrorName = input.error instanceof Error ? input.error.name : "NonErrorThrown";
   const rawErrorMessage = input.error instanceof Error ? input.error.message : String(input.error);
   const invalid = {
     valid: false,
-    invalidReason: timeout ? "INFRASTRUCTURE_TIMEOUT" : "HARNESS_ERROR",
-    failureStage: timeout?.timeoutStage ?? "smoke-harness",
+    invalidReason: timeout
+      ? "INFRASTRUCTURE_TIMEOUT"
+      : (validity?.validityReason ?? "HARNESS_ERROR"),
+    experimentLevelFailureClass: timeout
+      ? "INFRASTRUCTURE_TIMEOUT"
+      : validity
+        ? "VALIDITY_ERROR"
+        : "HARNESS_ERROR",
+    failureStage: timeout?.timeoutStage ?? (validity ? "validity" : "smoke-harness"),
+    validityReason: validity?.validityReason ?? null,
     rawErrorName,
     rawErrorMessage,
     lastSuccessfulCheckpoint: timeout?.lastSuccessfulCheckpoint ?? input.lastSuccessfulCheckpoint,
@@ -831,6 +979,14 @@ async function runOne(input: {
       .map((tool) => (typeof tool === "string" ? tool : tool.function.name)),
   });
   const capture = captureModelPayloads(diagnostics.hooks, input.requestCapture);
+  const originalAiTransportHost = getAiTransportHost();
+  configureAiTransportHost({
+    ...originalAiTransportHost,
+    buildModelFetch: (model, timeoutMs, options) => {
+      const baseFetch = originalAiTransportHost.buildModelFetch(model, timeoutMs, options);
+      return capture.wrapFetch(baseFetch ?? capture.originalFetch);
+    },
+  });
   const diagnosticsProviderRequest = diagnostics.hooks.onProviderRequest;
   diagnostics.hooks.onProviderRequest = async ({ payload, model }) => {
     const body =
@@ -1025,6 +1181,7 @@ async function runOne(input: {
       });
     }
   } finally {
+    configureAiTransportHost(originalAiTransportHost);
     capture.restore();
   }
   const completedExecution = execution;
@@ -1033,9 +1190,8 @@ async function runOne(input: {
   }
   const requestBodies = capture.requests.map((request) => request.body);
   const firstBody = requestBodies[0] ?? {};
-  const executedToolSequence = completedExecution.result.executedTools
-    .filter((tool) => tool.executionStarted)
-    .map((tool) => tool.name);
+  const executionAccounting = summarizeExecutedTools(completedExecution.result.executedTools);
+  const executedToolSequence = executionAccounting.executedToolSequence;
   const preferredBenchmarkTool = input.benchmarkCase.expectedTopTools[0] ?? "";
   const preferredMapping = getBenchmarkRealToolMapping(preferredBenchmarkTool);
   const mappedRealTool =
@@ -1081,8 +1237,10 @@ async function runOne(input: {
     systemPromptHash: sha256(extractSystemPrompt(firstBody)),
     userPromptHash: sha256(input.benchmarkCase.query),
     experimentalInstructionHash: sha256(input.arm === "B" ? ARM_B_INSTRUCTION : ""),
-    authorizedSurfaceHash: hashV1ICanonical(toolNamesFromBody(firstBody)),
-    schemaHash: hashV1ICanonical(requestBodies.map((body) => body.tools ?? null)),
+    authorizedSurfaceHash: hashV1ICanonical(toolNamesFromBody(firstBody).toSorted()),
+    schemaHash: hashV1ICanonical(
+      requestBodies.map((body) => sortToolDefinitions(body.tools ?? null)),
+    ),
     caseSetHash: frozenCaseSetHash(),
     rankerVersion: SHADOW_RANKER_VERSION,
     qualificationPolicyVersion: SHADOW_QUALIFICATION_POLICY_VERSION,
@@ -1641,86 +1799,92 @@ function captureModelPayloads(
   let providerRequestRecorded = false;
   let delegatedRequests = 0;
   const originalFetch = globalThis.fetch;
-  globalThis.fetch = async (input, init) => {
-    const url =
-      typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
-    const body = init?.body ?? (input instanceof Request ? await input.clone().text() : undefined);
-    const isProviderRequest =
-      (url.startsWith(LM_STUDIO_BASE_URL) ||
-        url.includes("/chat/completions") ||
-        url.includes("/responses")) &&
-      typeof body === "string" &&
-      body.trim().startsWith("{");
-    if (isProviderRequest) {
-      const parsed = JSON.parse(body) as Record<string, unknown>;
-      const request = { body: parsed, url };
-      if (!providerRequestRecorded) {
-        requests.push(request);
-        options?.onRequestCaptured?.(request);
-      }
-      const toolNames = toolNamesFromBody(parsed);
-      hooks?.onCheckpoint?.({
-        stage: "provider-request-constructed",
-        toolCount: toolNames.length,
-        representativeToolNames: toolNames,
-      });
-      if (options?.stopAfterCapture) {
-        throw new V1IProviderRequestCapturedError();
-      }
-      if (options?.holdAfterCapture) {
-        const signal = init?.signal;
-        return await new Promise<Response>((_, reject) => {
-          if (signal?.aborted) {
-            reject(abortReason(signal));
-            return;
-          }
-          signal?.addEventListener("abort", () => reject(abortReason(signal)), { once: true });
+  const wrapFetch = (baseFetch: typeof globalThis.fetch): typeof globalThis.fetch => {
+    return async (input, init) => {
+      const url =
+        typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      const body =
+        init?.body ?? (input instanceof Request ? await input.clone().text() : undefined);
+      const isProviderRequest =
+        (url.startsWith(LM_STUDIO_BASE_URL) ||
+          url.includes("/chat/completions") ||
+          url.includes("/responses")) &&
+        typeof body === "string" &&
+        body.trim().startsWith("{");
+      if (isProviderRequest) {
+        const parsed = JSON.parse(body) as Record<string, unknown>;
+        const request = { body: parsed, url };
+        if (!providerRequestRecorded) {
+          requests.push(request);
+          options?.onRequestCaptured?.(request);
+        }
+        const toolNames = toolNamesFromBody(parsed);
+        hooks?.onCheckpoint?.({
+          stage: "provider-request-constructed",
+          toolCount: toolNames.length,
+          representativeToolNames: toolNames,
         });
+        if (options?.stopAfterCapture) {
+          throw new V1IProviderRequestCapturedError();
+        }
+        if (options?.holdAfterCapture) {
+          const signal = init?.signal;
+          return await new Promise<Response>((_, reject) => {
+            if (signal?.aborted) {
+              reject(abortReason(signal));
+              return;
+            }
+            signal?.addEventListener("abort", () => reject(abortReason(signal)), { once: true });
+          });
+        }
       }
-    }
-    options?.onDelegatedRequest?.();
-    delegatedRequests += 1;
-    const response = await originalFetch(input, init);
-    if (!isProviderRequest) {
-      return response;
-    }
-    const initialSummary = createPendingProviderResponseSummary(response);
-    responseSummaries.push(initialSummary);
-    options?.onResponseSummary?.(initialSummary);
-    if (!response.body) {
-      const emptySummary = {
-        ...initialSummary,
-        parserOutcome: "empty-body",
-      } satisfies ProviderResponseSummary;
-      responseSummaries.push(emptySummary);
-      options?.onResponseSummary?.(emptySummary);
-      return response;
-    }
-    const state = createResponseSummaryState(response.headers.get("content-type"));
-    const observedBody = response.body.pipeThrough(
-      new TransformStream<Uint8Array, Uint8Array>({
-        transform(chunk, controller) {
-          consumeProviderResponseChunk(state, chunk);
-          controller.enqueue(chunk);
-        },
-        flush() {
-          finishProviderResponseState(state);
-          const summary = finishProviderResponseSummary(initialSummary, state);
-          responseSummaries.push(summary);
-          options?.onResponseSummary?.(summary);
-        },
-      }),
-    );
-    return new Response(observedBody, {
-      status: response.status,
-      statusText: response.statusText,
-      headers: response.headers,
-    });
+      options?.onDelegatedRequest?.();
+      delegatedRequests += 1;
+      const response = await baseFetch(input, init);
+      if (!isProviderRequest) {
+        return response;
+      }
+      const initialSummary = createPendingProviderResponseSummary(response);
+      responseSummaries.push(initialSummary);
+      options?.onResponseSummary?.(initialSummary);
+      if (!response.body) {
+        const emptySummary = {
+          ...initialSummary,
+          parserOutcome: "empty-body",
+        } satisfies ProviderResponseSummary;
+        responseSummaries.push(emptySummary);
+        options?.onResponseSummary?.(emptySummary);
+        return response;
+      }
+      const state = createResponseSummaryState(response.headers.get("content-type"));
+      const observedBody = response.body.pipeThrough(
+        new TransformStream<Uint8Array, Uint8Array>({
+          transform(chunk, controller) {
+            consumeProviderResponseChunk(state, chunk);
+            controller.enqueue(chunk);
+          },
+          flush() {
+            finishProviderResponseState(state);
+            const summary = finishProviderResponseSummary(initialSummary, state);
+            responseSummaries.push(summary);
+            options?.onResponseSummary?.(summary);
+          },
+        }),
+      );
+      return new Response(observedBody, {
+        status: response.status,
+        statusText: response.statusText,
+        headers: response.headers,
+      });
+    };
   };
+  globalThis.fetch = wrapFetch(originalFetch);
   return {
     requests,
     delegatedRequests,
     responseSummaries,
+    originalFetch,
+    wrapFetch,
     recordProviderRequest: (request) => {
       providerRequestRecorded = true;
       requests.push(request);
@@ -2006,20 +2170,92 @@ function serializeSmokeError(error: unknown): SerializedSmokeError {
 }
 
 function sameSurfaceAcrossRequests(bodies: readonly Record<string, unknown>[]): boolean {
-  const first = canonicalizeV1IValue(toolNamesFromBody(bodies[0] ?? {}));
-  return bodies.every((body) => canonicalizeV1IValue(toolNamesFromBody(body)) === first);
+  const first = canonicalizeToolNames(toolNamesFromBody(bodies[0] ?? {}));
+  return bodies.every((body) => canonicalizeToolNames(toolNamesFromBody(body)) === first);
 }
 
 function sameSchemaAcrossRequests(bodies: readonly Record<string, unknown>[]): boolean {
-  const first = canonicalizeV1IValue(bodies[0]?.tools ?? null);
-  return bodies.every((body) => canonicalizeV1IValue(body.tools ?? null) === first);
+  const first = canonicalizeToolDefinitions(bodies[0]?.tools ?? null);
+  return bodies.every((body) => canonicalizeToolDefinitions(body.tools ?? null) === first);
 }
 
 function sameSurfaceAsExpected(
   body: Record<string, unknown>,
   expected: readonly string[],
 ): boolean {
-  return canonicalizeV1IValue(toolNamesFromBody(body)) === canonicalizeV1IValue([...expected]);
+  return canonicalizeToolNames(toolNamesFromBody(body)) === canonicalizeToolNames(expected);
+}
+
+type ToolSurfaceComparison = {
+  canonicalEqual: boolean;
+  orderEqual: boolean;
+  added: string[];
+  missing: string[];
+};
+
+function compareToolSurfaces(
+  expected: readonly string[],
+  actual: readonly string[],
+): ToolSurfaceComparison {
+  const expectedCanonical = expected.toSorted();
+  const actualCanonical = actual.toSorted();
+  const expectedSet = new Set(expectedCanonical);
+  const actualSet = new Set(actualCanonical);
+  return {
+    canonicalEqual:
+      canonicalizeV1IValue(actualCanonical) === canonicalizeV1IValue(expectedCanonical),
+    orderEqual: canonicalizeV1IValue(actual) === canonicalizeV1IValue(expected),
+    added: actualCanonical.filter((name) => !expectedSet.has(name)),
+    missing: expectedCanonical.filter((name) => !actualSet.has(name)),
+  };
+}
+
+function canonicalizeToolNames(names: readonly string[]): string {
+  return canonicalizeV1IValue(names.toSorted());
+}
+
+function canonicalizeToolDefinitions(value: unknown): string {
+  return canonicalizeV1IValue(sortToolDefinitions(value));
+}
+
+function sortToolDefinitions(value: unknown): unknown {
+  if (!Array.isArray(value)) {
+    return value;
+  }
+  return value.toSorted((left, right) => {
+    const leftName = toolNameFromDefinition(left);
+    const rightName = toolNameFromDefinition(right);
+    return leftName < rightName ? -1 : leftName > rightName ? 1 : 0;
+  });
+}
+
+function toolNameFromDefinition(value: unknown): string {
+  const record = asRecord(value);
+  const nested = record ? asRecord(record.function) : undefined;
+  const name = nested?.name ?? record?.name;
+  return typeof name === "string" ? name : canonicalizeV1IValue(value);
+}
+
+function summarizeExecutedTools(tools: readonly { name: string; executionStarted: boolean }[]): {
+  executedToolSequence: string[];
+  duplicateToolNames: string[];
+  duplicateExecutionCount: number;
+} {
+  const executedToolSequence = tools
+    .filter((tool) => tool.executionStarted)
+    .map((tool) => tool.name);
+  const counts = new Map<string, number>();
+  for (const name of executedToolSequence) {
+    counts.set(name, (counts.get(name) ?? 0) + 1);
+  }
+  const duplicateToolNames = [...counts.entries()]
+    .filter(([, count]) => count > 1)
+    .map(([name]) => name);
+  return {
+    executedToolSequence,
+    duplicateToolNames,
+    duplicateExecutionCount: executedToolSequence.length - new Set(executedToolSequence).size,
+  };
 }
 
 function toolNamesFromBody(body: Record<string, unknown>): string[] {

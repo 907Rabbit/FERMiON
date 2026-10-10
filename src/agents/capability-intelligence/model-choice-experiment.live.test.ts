@@ -6,6 +6,8 @@ import { describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { RunEmbeddedAgentParams } from "../embedded-agent-runner/run/params.js";
 import type { EmbeddedAgentRunResult } from "../embedded-agent-runner/types.js";
+import { resolveAgentRunSessionTarget } from "../run-session-target.js";
+import { resolveRunWorkspaceDir } from "../workspace-run.js";
 import {
   getBenchmarkRealToolMapping,
   summarizeBenchmarkRealToolMappings,
@@ -386,6 +388,7 @@ function writeSmokeInvalidArtifact(input: {
 
 describe("v1I smoke timeout controls", () => {
   const stages = [
+    "runnerModuleImport",
     "workspaceSessionPreparation",
     "postBundleToPrompt",
     "requestPreparation",
@@ -743,7 +746,21 @@ async function runOne(input: {
     | Awaited<ReturnType<typeof import("./embedded-replay-runtime.js").runEmbeddedReplay>>
     | undefined;
   try {
+    diagnostics.hooks.onCheckpoint?.({
+      stage: "runner-module-import-started",
+      toolCount: harness?.clientTools.length ?? input.authorizedNames.length,
+      representativeToolNames: (harness?.clientTools ?? input.authorizedNames)
+        .slice(0, 8)
+        .map((tool) => (typeof tool === "string" ? tool : tool.function.name)),
+    });
     const { runEmbeddedAgent } = await import("../embedded-agent-runner/run-orchestrator.js");
+    diagnostics.hooks.onCheckpoint?.({
+      stage: "runner-module-import-completed",
+      toolCount: harness?.clientTools.length ?? input.authorizedNames.length,
+      representativeToolNames: (harness?.clientTools ?? input.authorizedNames)
+        .slice(0, 8)
+        .map((tool) => (typeof tool === "string" ? tool : tool.function.name)),
+    });
     const runner = async (params: RunEmbeddedAgentParams): Promise<EmbeddedAgentRunResult> => {
       const originalFactListener = params.onEmbeddedReplayFact;
       const originalResultListener = params.onAgentToolResult;
@@ -1074,6 +1091,46 @@ function buildOfflineRequestConfig(workspaceDir: string): OpenClawConfig {
 }
 
 describe("v1I offline request preparation", () => {
+  it("completes workspace and session preparation with a fresh roster offline", async () => {
+    const workspaceDir = fs.mkdtempSync(
+      path.join(os.tmpdir(), "openclaw-v1i-workspace-prep-offline-"),
+    );
+    try {
+      const config = buildLiveConfig(workspaceDir);
+      const sessionId = "v1i-workspace-prep-offline";
+      const sessionKey = "agent:main:v1i-workspace-prep-offline";
+      const workspaceResolution = resolveRunWorkspaceDir({
+        workspaceDir,
+        sessionKey,
+        agentId: "main",
+        config,
+      });
+      const sessionTarget = await resolveAgentRunSessionTarget({
+        agentId: "main",
+        config,
+        missingSessionKey: "create",
+        sessionId,
+        sessionKey,
+      });
+      expect(config.agents?.list).toHaveLength(1);
+      expect(workspaceResolution.agentId).toBe("main");
+      expect(workspaceResolution.workspaceDir).toBe(workspaceDir);
+      expect(sessionTarget).toMatchObject({
+        agentId: "main",
+        sessionId,
+        sessionKey,
+      });
+      expect(fs.existsSync(workspaceDir)).toBe(true);
+      expect(fs.existsSync(path.join(workspaceDir, "agent"))).toBe(true);
+    } finally {
+      try {
+        fs.rmSync(workspaceDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {
+        // Windows can retain the agent database lock until this test process exits.
+      }
+    }
+  }, 60_000);
+
   it("reaches prompt phase with the live config and 31 synthetic client tools offline", async () => {
     const benchmarkCase = TOOL_RANKING_HELD_OUT_CASES[0];
     if (!benchmarkCase) {

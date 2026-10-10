@@ -33,6 +33,7 @@ export const LM_STUDIO_BASE_URL = "http://127.0.0.1:1234/v1";
 export const CONTEXT_LENGTH = 262_144;
 export const V1I_SMOKE_STAGE_TIMEOUTS_MS = {
   modelDiscovery: 30_000,
+  runnerModuleImport: 60_000,
   workspaceSessionPreparation: 30_000,
   postBundleToPrompt: 30_000,
   requestPreparation: 30_000,
@@ -152,6 +153,12 @@ export async function runV1ISmokeStage<T>(input: {
 }
 
 export function smokeStageForCheckpoint(stage: string): V1ISmokeStage | undefined {
+  if (stage === "runner-module-import-started") {
+    return "runnerModuleImport";
+  }
+  if (stage === "runner-module-import-completed") {
+    return "workspaceSessionPreparation";
+  }
   if (
     stage === "runner-entry" ||
     stage === "session-target-resolution-entered" ||

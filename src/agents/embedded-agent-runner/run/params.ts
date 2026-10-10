@@ -68,6 +68,8 @@ export type EmbeddedRunTrigger = "cron" | "heartbeat" | "manual" | "memory" | "o
 
 export type EmbeddedCapabilityIntelligenceCheckpointStage =
   | "synthetic-constructed"
+  | "runner-module-import-started"
+  | "runner-module-import-completed"
   | "embedded-input-accepted"
   | "session-target-resolution-entered"
   | "session-target-resolution-completed"

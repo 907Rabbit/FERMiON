@@ -20,6 +20,8 @@ import {
   type V1IObservation,
 } from "./model-choice-experiment-evidence.js";
 import {
+  isV1IProvenanceAmendment,
+  V1I_HARNESS_CONTROL_AMENDMENT_TYPE,
   V1I_MIXED_PROVENANCE_AMENDMENT_TYPE,
   V1I_PROVENANCE_AMENDMENT_FILENAME,
 } from "./model-choice-experiment-provenance.js";
@@ -169,6 +171,26 @@ describe("v1I evidence protocol", () => {
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  it("accepts a later harness-control continuation with preserved lineage", () => {
+    expect(
+      isV1IProvenanceAmendment(
+        {
+          provenanceAmendment: true,
+          amendmentType: V1I_HARNESS_CONTROL_AMENDMENT_TYPE,
+          baseHarnessCommit: "base",
+          continuationHarnessCommit: "current",
+          approvedContinuationLineage: ["prior"],
+          scientificProtocolChanged: false,
+          modelFacingBehaviorChanged: false,
+          runtimeBehaviorChanged: false,
+          runtimeExecutionSemanticsChanged: false,
+        },
+        "base",
+        "current",
+      ),
+    ).toBe(true);
   });
 
   it("rejects mixed provenance without an exact no-behavior-change amendment", () => {

@@ -33,7 +33,6 @@ import {
   expectedCellsForV1IMode,
   finalizeV1IArtifact,
   hashV1ICanonical,
-  missingV1ICells,
   resolveV1IMode,
   requiredV1ICells,
   splitV1IExperimentSets,
@@ -45,8 +44,13 @@ import {
   V1I_BOOTSTRAP_SEED,
   type V1IMode,
   type V1IObservation,
+  type V1IRequiredCell,
   type V1ISurfaceMode,
 } from "./model-choice-experiment-evidence.js";
+import {
+  buildV1IResumeSelectionReport,
+  resolveV1IResumeSelection,
+} from "./model-choice-experiment-selection.js";
 import { rankAgentTools } from "./rank-agent-tools.js";
 import {
   ACTIVE_FILTERING_ENABLED,
@@ -1351,7 +1355,24 @@ describeFullLive("v1I model-choice experiment live", () => {
           observation.attempt + 1,
         ]),
       );
-      const firstMissingCell = missingV1ICells(mode, cases, completedCells)[0];
+      const selection = resolveV1IResumeSelection({
+        mode,
+        cases,
+        completedCells,
+        rawCellAllowlist: process.env.OPENCLAW_V1I_CELL_ALLOWLIST,
+        rawMaxCells: process.env.OPENCLAW_V1I_MAX_CELLS,
+      });
+      const selectionReportPath = path.join(artifactRoot, "resume-selection.json");
+      const persistSelectionReport = (
+        extra: Parameters<typeof buildV1IResumeSelectionReport>[1] = {},
+      ) => {
+        fs.writeFileSync(
+          selectionReportPath,
+          `${JSON.stringify(buildV1IResumeSelectionReport(selection, extra), null, 2)}\n`,
+        );
+      };
+      persistSelectionReport();
+      const firstMissingCell = selection.selectedCells[0];
       const firstMissingKey = firstMissingCell ? v1ICellKey(firstMissingCell) : undefined;
       const firstAttemptIndex = firstMissingKey
         ? (nextAttemptByCell.get(firstMissingKey) ?? 1)
@@ -1390,6 +1411,8 @@ describeFullLive("v1I model-choice experiment live", () => {
           config,
           workspaceDir,
           checkpointArtifactRoot: artifactRoot,
+          selectedCells: selection.selectedCells,
+          hasExplicitControl: selection.hasExplicitControl,
           initialCheckpointJournal:
             firstMissingKey && firstCheckpointJournal
               ? { cellKey: firstMissingKey, journal: firstCheckpointJournal }
@@ -1404,6 +1427,13 @@ describeFullLive("v1I model-choice experiment live", () => {
               state.invalidAttempts.push(observation);
             }
           },
+        });
+        persistSelectionReport({
+          selectedAttemptCount: newRuns.length,
+          completedValidCount: newRuns.filter((observation) => observation.valid).length,
+          remainingInvalidCount: state.invalidAttempts.filter((observation) =>
+            selection.selectedCells.some((cell) => v1ICellKey(cell) === v1ICellKey(observation)),
+          ).length,
         });
         const summary = summarizeV1IObservations(
           state.observations,
@@ -1443,13 +1473,32 @@ async function runStratum(input: {
   config: OpenClawConfig;
   workspaceDir: string;
   checkpointArtifactRoot: string;
+  selectedCells: readonly V1IRequiredCell[];
+  hasExplicitControl: boolean;
   initialCheckpointJournal?: { cellKey: string; journal: V1IAttemptCheckpointJournal };
   completedCells: ReadonlySet<string>;
   nextAttemptByCell: ReadonlyMap<string, number>;
   onObservation: (observation: ExperimentRun) => void;
 }): Promise<ExperimentRun[]> {
   const runs: ExperimentRun[] = [];
-  for (const benchmarkCase of input.cases) {
+  const caseById = new Map(input.cases.map((benchmarkCase) => [benchmarkCase.id, benchmarkCase]));
+  const executionCells = input.hasExplicitControl
+    ? input.selectedCells
+    : input.cases.flatMap((benchmarkCase) =>
+        Array.from({ length: 3 }, (_, index) => index + 1).flatMap((replicate) =>
+          orderedArms(scheduleSeedFor(benchmarkCase.id, replicate)).map((arm) => ({
+            surfaceMode: input.surfaceMode,
+            caseId: benchmarkCase.id,
+            arm,
+            replicate,
+          })),
+        ),
+      );
+  for (const cell of executionCells) {
+    const benchmarkCase = caseById.get(cell.caseId);
+    if (!benchmarkCase) {
+      throw new Error(`missing selected benchmark case: ${cell.caseId}`);
+    }
     const eligibility = input.mappingByCase.get(benchmarkCase.id);
     const mappingClass: MappingClass =
       input.mode === "synthetic"
@@ -1476,68 +1525,57 @@ async function runStratum(input: {
             const mapped = getBenchmarkRealToolMapping(tool).realTool;
             return mapped ? [mapped] : [];
           });
-    for (let replicate = 1; replicate <= 3; replicate += 1) {
-      const scheduleSeed = scheduleSeedFor(benchmarkCase.id, replicate);
-      for (const arm of orderedArms(scheduleSeed)) {
-        const cell = {
-          surfaceMode: input.surfaceMode,
-          caseId: benchmarkCase.id,
-          arm,
-          replicate,
-        } as const;
-        const cellKey = v1ICellKey(cell);
-        if (input.completedCells.has(cellKey)) {
-          continue;
-        }
-        const attempt = input.nextAttemptByCell.get(cellKey) ?? 1;
-        const checkpointJournal =
-          input.initialCheckpointJournal?.cellKey === cellKey
-            ? input.initialCheckpointJournal.journal
-            : createV1IAttemptCheckpointJournal({
-                root: input.checkpointArtifactRoot,
-                attemptId: v1IAttemptId(
-                  cell.surfaceMode,
-                  cell.caseId,
-                  cell.arm,
-                  cell.replicate,
-                  attempt,
-                ),
-                caseId: cell.caseId,
-                arm: cell.arm,
-                replicate: cell.replicate,
-                attemptIndex: attempt,
-              });
-        if (input.initialCheckpointJournal?.cellKey !== cellKey) {
-          checkpointJournal.record("attempt-initialized");
-        }
-        const attemptInput = {
-          mode: input.mode,
-          surfaceMode: input.surfaceMode,
-          benchmarkCase,
-          mappingClass,
-          authorizedNames,
-          v1cTop8,
-          requiredMappedTools,
-          arm,
-          replicate,
-          attempt,
-          scheduleSeed,
-        } satisfies Omit<InvalidObservationInput, "reason">;
-        const observation = await runV1IAttempt(
-          attemptInput,
-          () =>
-            runOne({
-              ...attemptInput,
-              eligibility,
-              config: input.config,
-              workspaceDir: input.workspaceDir,
-              attemptCheckpointJournal: checkpointJournal,
-            }),
-          input.onObservation,
-        );
-        runs.push(observation);
-      }
+    const cellKey = v1ICellKey(cell);
+    if (input.completedCells.has(cellKey)) {
+      continue;
     }
+    const attempt = input.nextAttemptByCell.get(cellKey) ?? 1;
+    const checkpointJournal =
+      input.initialCheckpointJournal?.cellKey === cellKey
+        ? input.initialCheckpointJournal.journal
+        : createV1IAttemptCheckpointJournal({
+            root: input.checkpointArtifactRoot,
+            attemptId: v1IAttemptId(
+              cell.surfaceMode,
+              cell.caseId,
+              cell.arm,
+              cell.replicate,
+              attempt,
+            ),
+            caseId: cell.caseId,
+            arm: cell.arm,
+            replicate: cell.replicate,
+            attemptIndex: attempt,
+          });
+    if (input.initialCheckpointJournal?.cellKey !== cellKey) {
+      checkpointJournal.record("attempt-initialized");
+    }
+    const attemptInput = {
+      mode: input.mode,
+      surfaceMode: input.surfaceMode,
+      benchmarkCase,
+      mappingClass,
+      authorizedNames,
+      v1cTop8,
+      requiredMappedTools,
+      arm: cell.arm,
+      replicate: cell.replicate,
+      attempt,
+      scheduleSeed: scheduleSeedFor(benchmarkCase.id, cell.replicate),
+    } satisfies Omit<InvalidObservationInput, "reason">;
+    const observation = await runV1IAttempt(
+      attemptInput,
+      () =>
+        runOne({
+          ...attemptInput,
+          eligibility,
+          config: input.config,
+          workspaceDir: input.workspaceDir,
+          attemptCheckpointJournal: checkpointJournal,
+        }),
+      input.onObservation,
+    );
+    runs.push(observation);
   }
   return runs;
 }

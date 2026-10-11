@@ -30,6 +30,7 @@ import {
   expectedCellsForV1IMode,
   finalizeV1IArtifact,
   hashV1ICanonical,
+  missingV1ICells,
   resolveV1IMode,
   requiredV1ICells,
   splitV1IExperimentSets,
@@ -70,6 +71,7 @@ import {
   buildSyntheticRunnerOverrides,
   classifyRequestPreparationFailure,
   createExperimentDiagnostics,
+  createV1IAttemptCheckpointJournal,
   frozenCaseSetHash,
   makeInvalidObservation,
   makeTestInvalidObservationInput,
@@ -86,6 +88,7 @@ import {
   type Arm,
   type InvalidObservationInput,
   type MappingClass,
+  type V1IAttemptCheckpointJournal,
 } from "./model-choice-experiment-support.js";
 
 type CapturedModelRequest = {
@@ -1135,9 +1138,36 @@ describeFullLive("v1I model-choice experiment live", () => {
           observation.attempt + 1,
         ]),
       );
+      const firstMissingCell = missingV1ICells(mode, cases, completedCells)[0];
+      const firstMissingKey = firstMissingCell ? v1ICellKey(firstMissingCell) : undefined;
+      const firstAttemptIndex = firstMissingKey
+        ? (nextAttemptByCell.get(firstMissingKey) ?? 1)
+        : undefined;
+      const firstCheckpointJournal =
+        firstMissingCell && firstAttemptIndex !== undefined
+          ? createV1IAttemptCheckpointJournal({
+              root: artifactRoot,
+              attemptId: v1IAttemptId(
+                surfaceModeForV1IMode(mode),
+                firstMissingCell.caseId,
+                firstMissingCell.arm,
+                firstMissingCell.replicate,
+                firstAttemptIndex,
+              ),
+              caseId: firstMissingCell.caseId,
+              arm: firstMissingCell.arm,
+              replicate: firstMissingCell.replicate,
+              attemptIndex: firstAttemptIndex,
+            })
+          : undefined;
+      firstCheckpointJournal?.record("attempt-initialized");
+      firstCheckpointJournal?.record("model-discovery-start");
       await assertLiveModelAvailable();
+      firstCheckpointJournal?.record("model-discovery-complete");
+      firstCheckpointJournal?.record("workspace-session-prep-start");
       const workspaceDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-v1i-"));
       const config = buildLiveConfig(workspaceDir);
+      firstCheckpointJournal?.record("workspace-session-prep-complete");
       try {
         const newRuns = await runStratum({
           mode,
@@ -1146,6 +1176,11 @@ describeFullLive("v1I model-choice experiment live", () => {
           mappingByCase,
           config,
           workspaceDir,
+          checkpointArtifactRoot: artifactRoot,
+          initialCheckpointJournal:
+            firstMissingKey && firstCheckpointJournal
+              ? { cellKey: firstMissingKey, journal: firstCheckpointJournal }
+              : undefined,
           completedCells,
           nextAttemptByCell,
           onObservation: (observation) => {
@@ -1194,6 +1229,8 @@ async function runStratum(input: {
   mappingByCase: ReadonlyMap<string, BenchmarkCaseEligibility>;
   config: OpenClawConfig;
   workspaceDir: string;
+  checkpointArtifactRoot: string;
+  initialCheckpointJournal?: { cellKey: string; journal: V1IAttemptCheckpointJournal };
   completedCells: ReadonlySet<string>;
   nextAttemptByCell: ReadonlyMap<string, number>;
   onObservation: (observation: ExperimentRun) => void;
@@ -1235,12 +1272,30 @@ async function runStratum(input: {
           arm,
           replicate,
         } as const;
-        if (
-          input.completedCells.has(
-            `${cell.surfaceMode}:${cell.caseId}:${cell.arm}:${cell.replicate}`,
-          )
-        ) {
+        const cellKey = v1ICellKey(cell);
+        if (input.completedCells.has(cellKey)) {
           continue;
+        }
+        const attempt = input.nextAttemptByCell.get(cellKey) ?? 1;
+        const checkpointJournal =
+          input.initialCheckpointJournal?.cellKey === cellKey
+            ? input.initialCheckpointJournal.journal
+            : createV1IAttemptCheckpointJournal({
+                root: input.checkpointArtifactRoot,
+                attemptId: v1IAttemptId(
+                  cell.surfaceMode,
+                  cell.caseId,
+                  cell.arm,
+                  cell.replicate,
+                  attempt,
+                ),
+                caseId: cell.caseId,
+                arm: cell.arm,
+                replicate: cell.replicate,
+                attemptIndex: attempt,
+              });
+        if (input.initialCheckpointJournal?.cellKey !== cellKey) {
+          checkpointJournal.record("attempt-initialized");
         }
         const attemptInput = {
           mode: input.mode,
@@ -1252,10 +1307,7 @@ async function runStratum(input: {
           requiredMappedTools,
           arm,
           replicate,
-          attempt:
-            input.nextAttemptByCell.get(
-              `${cell.surfaceMode}:${cell.caseId}:${cell.arm}:${cell.replicate}`,
-            ) ?? 1,
+          attempt,
           scheduleSeed,
         } satisfies Omit<InvalidObservationInput, "reason">;
         const observation = await runV1IAttempt(
@@ -1266,6 +1318,7 @@ async function runStratum(input: {
               eligibility,
               config: input.config,
               workspaceDir: input.workspaceDir,
+              attemptCheckpointJournal: checkpointJournal,
             }),
           input.onObservation,
         );
@@ -1274,6 +1327,16 @@ async function runStratum(input: {
     }
   }
   return runs;
+}
+
+function v1IAttemptId(
+  surfaceMode: V1ISurfaceMode,
+  caseId: string,
+  arm: Arm,
+  replicate: number,
+  attempt: number,
+): string {
+  return `v1i-${surfaceMode.toLowerCase()}-${caseId}-${arm}-${replicate}-attempt-${attempt}`;
 }
 
 async function runOne(input: {
@@ -1311,6 +1374,7 @@ async function runOne(input: {
       ? T
       : never,
   ) => void;
+  attemptCheckpointJournal?: V1IAttemptCheckpointJournal;
 }): Promise<ExperimentRun> {
   if (input.mode === "synthetic" && process.env.OPENCLAW_DISABLE_BUNDLED_PLUGINS !== "1") {
     return await withSyntheticModelChoiceEnvironment(() => runOne(input));
@@ -1326,8 +1390,21 @@ async function runOne(input: {
   const rawExecutionRecords: CorrelationExecution[] = [];
   const diagnosticsCheckpoint = diagnostics.hooks.onCheckpoint;
   diagnostics.hooks.onCheckpoint = (checkpoint) => {
+    input.attemptCheckpointJournal?.record(checkpoint.stage);
     diagnosticsCheckpoint?.(checkpoint);
     input.onCheckpoint?.(checkpoint);
+  };
+  diagnostics.hooks.onTimeoutArmed = () => {
+    input.attemptCheckpointJournal?.record("timeout-armed");
+  };
+  diagnostics.hooks.onTimeoutFired = () => {
+    input.attemptCheckpointJournal?.record("timeout-fired");
+  };
+  diagnostics.hooks.onAbortRequested = () => {
+    input.attemptCheckpointJournal?.record("abort-requested");
+  };
+  diagnostics.hooks.onAbortObserved = () => {
+    input.attemptCheckpointJournal?.record("abort-observed");
   };
   diagnostics.hooks.onCheckpoint?.({
     stage: "synthetic-constructed",

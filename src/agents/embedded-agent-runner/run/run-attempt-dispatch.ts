@@ -484,11 +484,30 @@ export async function dispatchEmbeddedRunAttempt(input: {
     runId: params.runId,
     lifecycleGeneration: control.lifecycleGeneration,
     abortSignal: attemptAbortController.signal,
-    onAttemptTimeoutArmed: control.pluginHarnessOwnsTransport
-      ? undefined
-      : startLaneProgressHeartbeat,
-    onAttemptTimeout: control.pluginHarnessOwnsTransport ? undefined : armAttemptTimeoutRelease,
+    onAttemptTimeoutArmed:
+      !control.pluginHarnessOwnsTransport ||
+      params.capabilityIntelligenceExperiment?.onTimeoutArmed !== undefined
+        ? () => {
+            params.capabilityIntelligenceExperiment?.onTimeoutArmed?.();
+            if (!control.pluginHarnessOwnsTransport) {
+              startLaneProgressHeartbeat();
+            }
+          }
+        : undefined,
+    onAttemptTimeout:
+      !control.pluginHarnessOwnsTransport ||
+      params.capabilityIntelligenceExperiment?.onTimeoutFired !== undefined ||
+      params.capabilityIntelligenceExperiment?.onAbortRequested !== undefined
+        ? (reason) => {
+            params.capabilityIntelligenceExperiment?.onTimeoutFired?.();
+            params.capabilityIntelligenceExperiment?.onAbortRequested?.();
+            if (!control.pluginHarnessOwnsTransport) {
+              armAttemptTimeoutRelease(reason);
+            }
+          }
+        : undefined,
     onAttemptAbort: () => {
+      params.capabilityIntelligenceExperiment?.onAbortObserved?.();
       cancellationRequested = true;
       if (!params.abortSignal?.aborted) {
         params.replyOperation?.abortByUser();

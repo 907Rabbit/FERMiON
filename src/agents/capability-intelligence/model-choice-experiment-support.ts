@@ -82,6 +82,84 @@ export function appendV1ISmokeCheckpoint(
   );
 }
 
+export type V1IAttemptCheckpointJournal = {
+  record: (
+    stage: string,
+    details?: {
+      modelTurnIndex?: number;
+      providerAttempt?: number;
+      lastKnownToolCallId?: string;
+    },
+  ) => void;
+};
+
+export class V1IAttemptCheckpointJournalError extends Error {
+  readonly stage: string;
+
+  constructor(stage: string, cause: unknown) {
+    super(`v1I attempt checkpoint journal write failed at ${stage}`, { cause });
+    this.name = "V1IAttemptCheckpointJournalError";
+    this.stage = stage;
+  }
+}
+
+export function createV1IAttemptCheckpointJournal(input: {
+  root: string;
+  attemptId: string;
+  caseId: string;
+  arm: Arm;
+  replicate: number;
+  attemptIndex: number;
+}): V1IAttemptCheckpointJournal {
+  fs.mkdirSync(input.root, { recursive: true });
+  const journalPath = path.join(input.root, "attempt-checkpoints.jsonl");
+  let sequenceNumber = 0;
+  if (fs.existsSync(journalPath)) {
+    try {
+      const existing = fs.readFileSync(journalPath, "utf8").trim();
+      for (const line of existing ? existing.split("\n") : []) {
+        const record = JSON.parse(line) as { attemptId?: string; sequenceNumber?: number };
+        if (record.attemptId === input.attemptId && typeof record.sequenceNumber === "number") {
+          sequenceNumber = Math.max(sequenceNumber, record.sequenceNumber);
+        }
+      }
+    } catch (error) {
+      throw new V1IAttemptCheckpointJournalError("journal-read", error);
+    }
+  }
+  return {
+    record: (stage, details) => {
+      const nextSequenceNumber = sequenceNumber + 1;
+      const boundedStage = stage.slice(0, 96);
+      const checkpoint = {
+        attemptId: input.attemptId,
+        caseId: input.caseId,
+        arm: input.arm,
+        replicate: input.replicate,
+        attemptIndex: input.attemptIndex,
+        timestamp: new Date().toISOString(),
+        stage: boundedStage,
+        sequenceNumber: nextSequenceNumber,
+        ...(details?.modelTurnIndex === undefined
+          ? {}
+          : { modelTurnIndex: details.modelTurnIndex }),
+        ...(details?.providerAttempt === undefined
+          ? {}
+          : { providerAttempt: details.providerAttempt }),
+        ...(details?.lastKnownToolCallId === undefined
+          ? {}
+          : { lastKnownToolCallId: details.lastKnownToolCallId.slice(0, 128) }),
+      };
+      try {
+        fs.appendFileSync(journalPath, `${JSON.stringify(checkpoint)}\n`);
+      } catch (error) {
+        throw new V1IAttemptCheckpointJournalError(boundedStage, error);
+      }
+      sequenceNumber = nextSequenceNumber;
+    },
+  };
+}
+
 export function createV1ISmokeDeadline(input: {
   onTimeout: (error: V1ISmokeTimeoutError) => void;
   timeouts?: Partial<Record<V1ISmokeStage, number>>;
@@ -454,6 +532,9 @@ export async function runV1IAttempt(
   try {
     observation = await execute();
   } catch (error) {
+    if (error instanceof V1IAttemptCheckpointJournalError) {
+      throw error;
+    }
     observation = makeInvalidObservationForError(input, error);
   }
   onObservation(observation);

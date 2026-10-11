@@ -118,6 +118,10 @@ export type EmbeddedCapabilityIntelligenceExperimentHooks = {
   onProviderResponse?: (input: { response: unknown; model: unknown }) => void | Promise<void>;
   /** Observes the normalized assistant response before any tool execution. */
   onAssistantMessage?: (message: AssistantMessage) => void;
+  onTimeoutArmed?: () => void;
+  onTimeoutFired?: () => void;
+  onAbortRequested?: () => void;
+  onAbortObserved?: () => void;
 };
 
 export type ResolvedToolPromptFinalizer = (params: {

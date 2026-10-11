@@ -57,6 +57,10 @@ export type ShadowReplayTerminal = {
   executed: boolean;
   succeeded: boolean;
   degraded?: boolean;
+  toolCallId?: string;
+  executionId?: string;
+  startedAt?: number;
+  completedAt?: number;
 };
 
 export type ShadowReplayRuntimeEpoch = {

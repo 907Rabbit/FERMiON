@@ -1127,6 +1127,32 @@ describe("handleToolExecutionEnd cron mutation tracking", () => {
     expect(ctx.state.lastToolError?.mutatingAction).toBe(false);
   });
 
+  it("propagates one execution identity from start into terminal observation", async () => {
+    const { ctx } = createTestContext();
+    const observeToolTerminal = vi.fn(() => ({
+      executionStarted: true,
+      sideEffectEvidence: false,
+    }));
+    ctx.params.observeToolTerminal = observeToolTerminal;
+
+    await executeTool(ctx, {
+      toolName: "git_status",
+      toolCallId: "provider-call-1",
+      args: {},
+      isError: false,
+      result: { details: { status: "completed" } },
+    });
+
+    expect(observeToolTerminal).toHaveBeenCalledOnce();
+    expect(observeToolTerminal.mock.calls[0]?.[0]).toMatchObject({
+      toolCallId: "provider-call-1",
+      toolName: "git_status",
+      executionId: expect.any(String),
+      startedAt: expect.any(Number),
+      completedAt: expect.any(Number),
+    });
+  });
+
   it("keeps a policy-blocked cron mutation replay-safe", async () => {
     const { ctx } = createTestContext();
     const toolCallId = "tool-cron-blocked";

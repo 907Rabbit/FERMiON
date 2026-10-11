@@ -17,6 +17,11 @@ import {
 } from "./benchmark-real-tool-mapping.js";
 import type { EmbeddedReplayFact } from "./embedded-replay-observation.js";
 import {
+  correlateToolCallsAndExecutions,
+  type CorrelationExecution,
+  type CorrelationToolCall,
+} from "./model-choice-experiment-correlation.js";
+import {
   appendV1IObservation,
   assertNoDuplicateValidCells,
   canonicalizeV1IValue,
@@ -1193,6 +1198,8 @@ async function runOne(input: {
   const runProvider = input.provider ?? PROVIDER;
   const runModel = input.model ?? MODEL_ID;
   const diagnostics = createExperimentDiagnostics();
+  const semanticToolCalls: CorrelationToolCall[] = [];
+  const rawExecutionRecords: CorrelationExecution[] = [];
   const diagnosticsCheckpoint = diagnostics.hooks.onCheckpoint;
   diagnostics.hooks.onCheckpoint = (checkpoint) => {
     diagnosticsCheckpoint?.(checkpoint);
@@ -1253,9 +1260,22 @@ async function runOne(input: {
     });
     await diagnosticsProviderResponse?.({ response, model });
   };
-  const restoreAssistantMessageObserver = input.requestCapture?.onAssistantMessage
-    ? installAssistantMessageObserver(diagnostics.hooks, input.requestCapture.onAssistantMessage)
-    : undefined;
+  const restoreAssistantMessageObserver = installAssistantMessageObserver(
+    diagnostics.hooks,
+    (message, modelTurnIndex) => {
+      for (const block of message.content) {
+        if (block.type !== "toolCall") {
+          continue;
+        }
+        semanticToolCalls.push({
+          toolCallId: block.id,
+          toolName: block.name,
+          modelTurnIndex,
+        });
+      }
+      input.requestCapture?.onAssistantMessage?.(message, modelTurnIndex);
+    },
+  );
   const startTime = new Date().toISOString();
   let observedRanking: Extract<EmbeddedReplayFact, { kind: "ranking" }> | undefined;
   let observedFailure = false;
@@ -1300,6 +1320,18 @@ async function runOne(input: {
           onEmbeddedReplayFact: (fact) => {
             if (fact.kind === "ranking") {
               observedRanking = fact;
+            } else {
+              rawExecutionRecords.push({
+                ...(fact.executionId ? { executionId: fact.executionId } : {}),
+                ...(fact.toolCallId ? { toolCallId: fact.toolCallId } : {}),
+                toolName: fact.toolName,
+                modelTurnIndex: semanticToolCalls.find(
+                  (call) => call.toolCallId === fact.toolCallId,
+                )?.modelTurnIndex,
+                ...(fact.startedAt === undefined ? {} : { startedAt: fact.startedAt }),
+                ...(fact.completedAt === undefined ? {} : { completedAt: fact.completedAt }),
+                success: fact.outcome === "success",
+              });
             }
             originalFactListener?.(fact);
           },
@@ -1319,18 +1351,6 @@ async function runOne(input: {
           stage: "run-embedded-agent",
         });
         throw error;
-      }
-      if (harness && observedRanking) {
-        for (const call of result.meta.pendingToolCalls ?? []) {
-          originalFactListener?.({
-            kind: "terminal",
-            epoch: observedRanking.epoch,
-            turnId: observedRanking.turnId,
-            toolName: call.name,
-            executionStarted: true,
-            outcome: "success",
-          });
-        }
       }
       if (!input.abortSignal?.aborted) {
         diagnostics.hooks.onCheckpoint?.({
@@ -1423,6 +1443,10 @@ async function runOne(input: {
   const firstBody = requestBodies[0] ?? {};
   const executionAccounting = summarizeExecutedTools(completedExecution.result.executedTools);
   const executedToolSequence = executionAccounting.executedToolSequence;
+  const correlation = correlateToolCallsAndExecutions({
+    toolCalls: semanticToolCalls,
+    executions: rawExecutionRecords,
+  });
   const preferredBenchmarkTool = input.benchmarkCase.expectedTopTools[0] ?? "";
   const preferredMapping = getBenchmarkRealToolMapping(preferredBenchmarkTool);
   const mappedRealTool =
@@ -1434,7 +1458,8 @@ async function runOne(input: {
     requestBodies.length > 0 &&
     sameSurfaceAcrossRequests(requestBodies) &&
     sameSurfaceAsExpected(firstBody, input.authorizedNames) &&
-    sameSchemaAcrossRequests(requestBodies);
+    sameSchemaAcrossRequests(requestBodies) &&
+    correlation.status === "PROVABLE";
   const terminalSuccess = completedExecution.result.terminal === "success";
   const preferredToolAuthorized =
     mappedRealTool !== null && input.authorizedNames.includes(mappedRealTool);
@@ -1492,6 +1517,10 @@ async function runOne(input: {
     mappingClassification: input.mappingClass,
     substitutionWithoutPreferredAttempt,
     fallbackAfterPreferredFailure: observedFailure && firstExecutedTool !== mappedRealTool,
+    toolCalls: semanticToolCalls,
+    executions: correlation.executions,
+    correlationStatus: correlation.status,
+    duplicateExecutionClass: correlation.duplicateExecutionClass,
     valid,
     invalidReason: valid
       ? null
@@ -1501,6 +1530,7 @@ async function runOne(input: {
           expected: input.authorizedNames,
           observedRanking,
           requestBodies,
+          correlationStatus: correlation.status,
         }),
     requestPreparationDiagnostics: {
       normalizedRuntimeStatus: completedExecution.status,
@@ -2722,6 +2752,7 @@ function describeInvalidRun(input: {
   expected: readonly string[];
   observedRanking?: { epoch: string };
   requestBodies: readonly Record<string, unknown>[];
+  correlationStatus?: "PROVABLE" | "UNPROVABLE";
 }): string {
   const statusReason = invalidReasonForExecutionStatus(
     input.execution.status,
@@ -2729,6 +2760,9 @@ function describeInvalidRun(input: {
   );
   if (statusReason) {
     return statusReason;
+  }
+  if (input.correlationStatus === "UNPROVABLE") {
+    return "CORRELATION_UNPROVABLE";
   }
   if (!input.observedRanking?.epoch) {
     return "MISSING_RANKING_EPOCH";

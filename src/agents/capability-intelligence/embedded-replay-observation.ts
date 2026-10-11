@@ -17,6 +17,10 @@ export type EmbeddedReplayTerminalFact = {
   kind: "terminal";
   epoch: RankingEpoch;
   turnId: string;
+  toolCallId?: string;
+  executionId?: string;
+  startedAt?: number;
+  completedAt?: number;
   toolName: string;
   executionStarted: boolean;
   outcome: "success" | "failure";

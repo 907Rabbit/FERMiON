@@ -55,6 +55,10 @@ export type EmbeddedReplayExecutedTool = {
   name: string;
   executionStarted: boolean;
   success?: boolean;
+  toolCallId?: string;
+  executionId?: string;
+  startedAt?: number;
+  completedAt?: number;
 };
 
 export type EmbeddedReplayResult = {
@@ -297,6 +301,10 @@ export function annotateObservedExecutions(
     } = {
       name: tool.name,
       executionStarted: tool.executionStarted,
+      ...(tool.toolCallId ? { toolCallId: tool.toolCallId } : {}),
+      ...(tool.executionId ? { executionId: tool.executionId } : {}),
+      ...(tool.startedAt === undefined ? {} : { startedAt: tool.startedAt }),
+      ...(tool.completedAt === undefined ? {} : { completedAt: tool.completedAt }),
       role: annotation.role,
       roleSource: annotation.roleSource,
     };
@@ -419,6 +427,7 @@ function createFactCollector(): {
       terminals: EmbeddedReplayExecutedTool[];
     }
   >();
+  const seenExecutions = new Map<string, string>();
   let invalid = false;
   return {
     listener(fact) {
@@ -447,10 +456,32 @@ function createFactCollector(): {
         invalid = true;
         return;
       }
+      if (fact.executionId) {
+        const executionShape = JSON.stringify({
+          epoch: fact.epoch,
+          turnId: fact.turnId,
+          toolCallId: fact.toolCallId ?? null,
+          toolName: fact.toolName,
+          executionStarted: fact.executionStarted,
+          outcome: fact.outcome,
+        });
+        const priorShape = seenExecutions.get(fact.executionId);
+        if (priorShape !== undefined) {
+          if (priorShape !== executionShape) {
+            invalid = true;
+          }
+          return;
+        }
+        seenExecutions.set(fact.executionId, executionShape);
+      }
       bucket.terminals.push({
         name: fact.toolName,
         executionStarted: fact.executionStarted,
         success: fact.outcome === "success",
+        ...(fact.toolCallId ? { toolCallId: fact.toolCallId } : {}),
+        ...(fact.executionId ? { executionId: fact.executionId } : {}),
+        ...(fact.startedAt === undefined ? {} : { startedAt: fact.startedAt }),
+        ...(fact.completedAt === undefined ? {} : { completedAt: fact.completedAt }),
       });
     },
     epochs: () =>
@@ -520,6 +551,10 @@ function runtimeResultFromFacts(
         toolName: tool.name,
         executed: tool.executionStarted,
         succeeded: tool.success === true,
+        ...(tool.toolCallId ? { toolCallId: tool.toolCallId } : {}),
+        ...(tool.executionId ? { executionId: tool.executionId } : {}),
+        ...(tool.startedAt === undefined ? {} : { startedAt: tool.startedAt }),
+        ...(tool.completedAt === undefined ? {} : { completedAt: tool.completedAt }),
       })),
     })),
   };

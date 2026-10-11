@@ -483,6 +483,42 @@ describe("embedded replay runtime", () => {
     );
   });
 
+  it("deduplicates repeated observations of one execution identity", async () => {
+    const execution = await runEmbeddedReplay({
+      request: replayRequest(),
+      options: options(
+        scriptedRunner({
+          seen: [],
+          onRun: (params) => {
+            rankingFact(params);
+            const terminal = {
+              kind: "terminal" as const,
+              epoch: "epoch-1",
+              turnId: "turn-1",
+              toolCallId: "call-1",
+              executionId: "exec-1",
+              toolName: "read",
+              executionStarted: true,
+              outcome: "success" as const,
+            };
+            params.onEmbeddedReplayFact?.(terminal);
+            params.onEmbeddedReplayFact?.(terminal);
+            return runResult();
+          },
+        }),
+      ),
+    });
+
+    expect(execution.status).toBe("completed");
+    expect(execution.result.executedTools).toEqual([
+      expect.objectContaining({
+        name: "read",
+        toolCallId: "call-1",
+        executionId: "exec-1",
+      }),
+    ]);
+  });
+
   it("rejects a terminal fact whose ranking epoch is unknown", async () => {
     const execution = await runEmbeddedReplay({
       request: replayRequest(),

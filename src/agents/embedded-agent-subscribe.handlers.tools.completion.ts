@@ -108,7 +108,7 @@ import { isAutomationsToolName } from "./tools/automations-tool-name.js";
 /** Handles a tool-execution result and commits replay, media, hook, and error state. */
 export async function handleToolExecutionEnd(
   ctx: ToolHandlerContext,
-  evt: Extract<AgentEvent, { type: "tool_execution_end" }>,
+  evt: Extract<AgentEvent, { type: "tool_execution_end" }> & { executionId?: string },
 ) {
   const rawToolName = evt.toolName;
   const toolName = normalizeToolPolicyName(rawToolName);
@@ -220,8 +220,14 @@ export async function handleToolExecutionEnd(
     isToolError && evt.executionStarted === false && evt.errorKind === "argument-validation"
       ? createToolValidationErrorSummary(toolName)
       : undefined;
+  const endedAt = Date.now();
   const terminal = (ctx.params.observeToolTerminal ?? resolveFallbackToolTerminalObserver(ctx))({
     toolCallId,
+    ...((evt.executionId ?? startData?.executionId)
+      ? { executionId: evt.executionId ?? startData?.executionId }
+      : {}),
+    ...(startData?.startTime === undefined ? {} : { startedAt: startData.startTime }),
+    completedAt: endedAt,
     toolName,
     arguments: startArgs,
     ...(meta ? { meta } : {}),
@@ -426,7 +432,6 @@ export async function handleToolExecutionEnd(
       ...(hideFromChannelProgress ? { hideFromChannelProgress: true } : {}),
     },
   });
-  const endedAt = Date.now();
   const itemId = buildToolItemId(toolCallId);
   const itemData: AgentItemEventData = {
     itemId,

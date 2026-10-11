@@ -172,6 +172,10 @@ export async function dispatchEmbeddedRunAttempt(input: {
       emitEmbeddedReplayFact(params.onEmbeddedReplayFact, {
         kind: "terminal",
         ...rankingCorrelation,
+        ...(observation.toolCallId ? { toolCallId: observation.toolCallId } : {}),
+        ...(observation.executionId ? { executionId: observation.executionId } : {}),
+        ...(observation.startedAt === undefined ? {} : { startedAt: observation.startedAt }),
+        ...(observation.completedAt === undefined ? {} : { completedAt: observation.completedAt }),
         toolName: observation.toolName,
         executionStarted: terminal.executionStarted,
         outcome: observation.outcome,

@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { isPromiseLike } from "@openclaw/normalization-core/promise-like";
 import {
   normalizeOptionalLowercaseString,
@@ -163,6 +164,7 @@ function buildToolStartWarningArgsPreview(rawArgsPreview: string | undefined): s
 }
 
 type ToolStartRecord = {
+  executionId: string;
   startTime: number;
   args: unknown;
   hasRepliedRef?: { value: boolean };
@@ -317,6 +319,7 @@ export function handleToolExecutionStart(
   evt: AgentEvent & {
     toolName: string;
     toolCallId: string;
+    executionId?: string;
     args: unknown;
     replaySafe?: boolean;
     hideFromChannelProgress?: boolean;
@@ -384,6 +387,7 @@ export function handleToolExecutionStart(
 
     const startedAt = Date.now();
     toolStartData.set(buildToolStartKey(runId, toolCallId), {
+      executionId: evt.executionId ?? randomUUID(),
       startTime: startedAt,
       args,
       ...(ctx.params.hasRepliedRef

@@ -64,6 +64,10 @@ type EmbeddedRunAttemptOperation = "attempt" | "settled-tool-finalization";
 
 type EmbeddedRunAttemptToolTerminalObservation = {
   toolCallId?: string;
+  /** Host-issued identity for one concrete execution lifecycle. */
+  executionId?: string;
+  startedAt?: number;
+  completedAt?: number;
   toolName: string;
   arguments?: unknown;
   meta?: string;

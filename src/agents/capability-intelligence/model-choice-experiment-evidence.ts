@@ -95,6 +95,29 @@ export type V1IObservation = {
   substituteTool: string | null;
   substitutionWithoutPreferredAttempt: boolean;
   fallbackAfterPreferredFailure: boolean;
+  toolCalls?: readonly {
+    toolCallId: string;
+    toolName: string;
+    modelTurnIndex: number;
+  }[];
+  executions?: readonly {
+    executionId?: string;
+    toolCallId?: string;
+    toolName: string;
+    modelTurnIndex?: number;
+    startedAt?: number;
+    completedAt?: number;
+    success: boolean;
+  }[];
+  correlationStatus?: "PROVABLE" | "UNPROVABLE";
+  duplicateExecutionClass?:
+    | "NONE"
+    | "DISTINCT_PROVIDER_TOOL_CALLS"
+    | "MULTI_TURN_REPEAT"
+    | "RETRY_REDISPATCH"
+    | "DUPLICATE_OBSERVATION"
+    | "UNMATCHED_EXECUTION"
+    | "UNKNOWN";
   valid: boolean;
   invalidReason: string | null;
   requestPreparationDiagnostics?: V1IRequestPreparationDiagnostics;

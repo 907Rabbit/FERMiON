@@ -122,6 +122,20 @@ describe("agent runtime plugin registries", () => {
     );
   });
 
+  it("forwards the optional plugin-preparation startup trace without changing load policy", () => {
+    const detail = vi.fn();
+
+    loadAgentRuntimePluginRegistryHandle({
+      config: {} as never,
+      workspaceDir: "/tmp/workspace",
+      startupTrace: { detail },
+    });
+
+    expect(hoisted.loadPluginRegistryHandle).toHaveBeenCalledWith(
+      expect.objectContaining({ startupTrace: { detail } }),
+    );
+  });
+
   it("reuses the current Gateway generation and loads only the imported-plugin delta", () => {
     const config = {} as never;
     const workspaceDir = "/tmp/default-workspace";

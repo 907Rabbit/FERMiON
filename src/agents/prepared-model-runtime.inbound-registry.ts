@@ -4,6 +4,7 @@ import {
   registryMatchesManifestPluginIds,
 } from "../plugins/active-runtime-registry.js";
 import { getCurrentPluginMetadataSnapshot } from "../plugins/current-plugin-metadata-snapshot.js";
+import type { PluginLoadOptions } from "../plugins/loader.js";
 import type { PluginMetadataSnapshot } from "../plugins/plugin-metadata-snapshot.types.js";
 import type { PluginRegistry } from "../plugins/registry-types.js";
 import {
@@ -12,11 +13,13 @@ import {
   getActivePluginRuntimeSubagentMode,
 } from "../plugins/runtime.js";
 import type { PreparedModelRuntimeInput } from "./prepared-model-runtime.types.js";
+import type { PreparedRuntimeAcquisitionObserver } from "./prepared-runtime-acquisition-liveness.js";
 import { loadAgentRuntimePluginRegistryHandle } from "./runtime-plugins.js";
 
 export type PreparedInboundRegistryLoader = (
   input: PreparedModelRuntimeInput,
   metadataSnapshot: PluginMetadataSnapshot,
+  startupTrace?: PluginLoadOptions["startupTrace"],
 ) => PluginRegistry;
 
 function inboundRegistryIdentity(input: PreparedModelRuntimeInput): string {
@@ -49,7 +52,7 @@ export function preparedModelRuntimeWorkspaceFactsKey(input: PreparedModelRuntim
 /** Creates one lifecycle-batch loader that shares exact generic registry identities. */
 export function createPreparedInboundRegistryLoader(): PreparedInboundRegistryLoader {
   const registries = new Map<string, PluginRegistry>();
-  return (input, metadataSnapshot) => {
+  return (input, metadataSnapshot, startupTrace) => {
     const key = inboundRegistryIdentity(input);
     const existing = registries.get(key);
     if (existing) {
@@ -85,9 +88,30 @@ export function createPreparedInboundRegistryLoader(): PreparedInboundRegistryLo
         ...(input.allowGatewaySubagentBinding ? { allowGatewaySubagentBinding: true } : {}),
         metadataSnapshot,
         preferBuiltPluginArtifacts: true,
+        ...(startupTrace ? { startupTrace } : {}),
       });
     registries.set(key, registry);
     return registry;
+  };
+}
+
+function createPluginPreparationStartupTrace(
+  observer: PreparedRuntimeAcquisitionObserver | undefined,
+): PluginLoadOptions["startupTrace"] | undefined {
+  if (!observer?.onPluginPrepPluginTiming) {
+    return undefined;
+  }
+  return {
+    detail: (name, metrics) => {
+      const prefix = "plugins.gateway-load.plugin.";
+      if (!name.startsWith(prefix)) {
+        return;
+      }
+      observer.onPluginPrepPluginTiming?.({
+        pluginId: name.slice(prefix.length),
+        metrics,
+      });
+    },
   };
 }
 
@@ -97,6 +121,7 @@ export function prepareWorkspacePluginRegistries(
   metadataSnapshot: PluginMetadataSnapshot,
   loadInboundRegistry?: PreparedInboundRegistryLoader,
   preferBuiltPluginArtifacts = false,
+  observer?: PreparedRuntimeAcquisitionObserver,
 ): {
   runtimePluginRegistry?: PluginRegistry;
   inboundPluginRegistry?: PluginRegistry;
@@ -106,9 +131,13 @@ export function prepareWorkspacePluginRegistries(
   if (input.readOnly && !input.loadRuntimePlugins && !input.runtimePluginSelections) {
     return {};
   }
+  observer?.onPluginPrepCheckpoint?.("plugin-prep-inbound-registry-entered");
   const inboundPluginRegistry = input.readOnly
     ? undefined
-    : loadInboundRegistry?.(input, metadataSnapshot);
+    : loadInboundRegistry?.(input, metadataSnapshot, createPluginPreparationStartupTrace(observer));
+  observer?.onPluginPrepCheckpoint?.("plugin-prep-inbound-registry-complete");
+  observer?.onPluginPrepCheckpoint?.("plugin-prep-runtime-registry-entered");
+  const startupTrace = createPluginPreparationStartupTrace(observer);
   const runtimePluginRegistry =
     input.runtimePluginSelections || !inboundPluginRegistry
       ? loadAgentRuntimePluginRegistryHandle({
@@ -124,8 +153,10 @@ export function prepareWorkspacePluginRegistries(
           metadataSnapshot,
           ...(preferBuiltPluginArtifacts ? { preferBuiltPluginArtifacts: true } : {}),
           selections: input.runtimePluginSelections,
+          ...(startupTrace ? { startupTrace } : {}),
         })
       : inboundPluginRegistry;
+  observer?.onPluginPrepCheckpoint?.("plugin-prep-runtime-registry-complete");
   return {
     runtimePluginRegistry,
     ...(inboundPluginRegistry ? { inboundPluginRegistry } : {}),

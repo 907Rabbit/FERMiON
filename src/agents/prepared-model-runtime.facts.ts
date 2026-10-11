@@ -8,6 +8,8 @@ import {
 import { stableStringify } from "@openclaw/normalization-core";
 import { sha256Base64Url } from "../infra/crypto-digest.js";
 import { prepareMediaCapabilityProviders } from "../plugins/capability-provider-runtime.js";
+import { normalizePluginsConfig, resolveEffectiveEnableState } from "../plugins/config-state.js";
+import { isPluginEnabledByDefaultForPlatform } from "../plugins/default-enablement.js";
 import {
   getPreparedMessageToolCatalog,
   getPreparedMessageToolCatalogForRegistry,
@@ -78,6 +80,10 @@ import type {
   PreparedModelRuntimeInput,
   PreparedModelRuntimePluginGeneration,
 } from "./prepared-model-runtime.types.js";
+import type {
+  PreparedRuntimeAcquisitionObserver,
+  PreparedRuntimePluginDiscoveryInputs,
+} from "./prepared-runtime-acquisition-liveness.js";
 import { AuthStorage } from "./sessions/auth-storage.js";
 
 const MODEL_RUNTIME_PROVIDER_DISCOVERY_TIMEOUT_MS = 5_000;
@@ -137,6 +143,45 @@ function prepareAgentFacts(
   };
 }
 
+function snapshotPreparedRuntimePluginDiscoveryInputs(
+  input: PreparedModelRuntimeInput,
+  metadataSnapshot: PreparedModelRuntimePluginGeneration["pluginMetadataSnapshot"],
+): PreparedRuntimePluginDiscoveryInputs {
+  const candidates = metadataSnapshot.discovery?.candidates ?? [];
+  const roots = [...new Set(candidates.map((candidate) => candidate.rootDir))].toSorted();
+  const configuredPluginIds = [
+    ...new Set(
+      candidates
+        .filter((candidate) => candidate.origin === "config")
+        .map((candidate) => candidate.effectivePluginId ?? candidate.idHint),
+    ),
+  ].toSorted();
+  const normalizedPlugins = normalizePluginsConfig(input.config.plugins);
+  const enabledPluginIds: string[] = [];
+  const disabledPluginIds: string[] = [];
+  for (const plugin of metadataSnapshot.plugins) {
+    const enabled = resolveEffectiveEnableState({
+      id: plugin.id,
+      origin: plugin.origin,
+      config: normalizedPlugins,
+      rootConfig: input.config,
+      enabledByDefault: isPluginEnabledByDefaultForPlatform(plugin),
+    }).enabled;
+    (enabled ? enabledPluginIds : disabledPluginIds).push(plugin.id);
+  }
+  return Object.freeze({
+    roots,
+    configuredPluginIds,
+    enabledPluginIds: enabledPluginIds.toSorted(),
+    disabledPluginIds: disabledPluginIds.toSorted(),
+    candidateCount: candidates.length,
+    manifestCount: metadataSnapshot.plugins.length,
+    diagnosticCount:
+      (metadataSnapshot.diagnostics?.length ?? 0) +
+      (metadataSnapshot.registryDiagnostics?.length ?? 0),
+  });
+}
+
 export async function prepareWorkspaceBuildGroup(
   inputs: readonly PreparedModelRuntimeInput[],
   catalogMode: PreparedModelRuntimeCatalogMode,
@@ -147,6 +192,7 @@ export async function prepareWorkspaceBuildGroup(
   loadInboundPluginRegistry?: PreparedInboundRegistryLoader,
   reusablePluginGeneration?: PreparedModelRuntimePluginGeneration,
   preparedPluginMetadataSnapshot?: PreparedModelRuntimePluginGeneration["pluginMetadataSnapshot"],
+  acquisitionObserver?: PreparedRuntimeAcquisitionObserver,
 ): Promise<{
   agentFacts: PreparedModelRuntimeAgentFacts[];
   pluginGeneration: PreparedModelRuntimePluginGeneration;
@@ -170,6 +216,11 @@ export async function prepareWorkspaceBuildGroup(
     preparedPluginMetadataSnapshot ??
     reusablePluginGeneration?.pluginMetadataSnapshot ??
     prepareOwnedPluginLoadContext(input, env, undefined);
+  acquisitionObserver?.onPluginPrepCheckpoint?.("plugin-prep-metadata-snapshot-ready");
+  acquisitionObserver?.onPluginPrepDiscoveryInputs?.(
+    snapshotPreparedRuntimePluginDiscoveryInputs(input, pluginMetadataSnapshot),
+  );
+  acquisitionObserver?.onPluginPrepCheckpoint?.("plugin-prep-discovery-inputs-snapshotted");
   const pluginMetadataMs = reusablePluginGeneration
     ? 0
     : performance.now() - pluginMetadataStartedAt;
@@ -184,6 +235,7 @@ export async function prepareWorkspaceBuildGroup(
         pluginMetadataSnapshot,
         loadInboundPluginRegistry,
         options.preferBuiltPluginArtifacts === true,
+        acquisitionObserver,
       );
   const runtimePluginMs = reusablePluginGeneration ? 0 : performance.now() - runtimePluginStartedAt;
   const preferBuiltPluginArtifacts =

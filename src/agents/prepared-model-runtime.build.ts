@@ -356,6 +356,7 @@ async function buildSnapshotBatch(
           prepareInboundPluginRegistry ? loadInboundPluginRegistry : undefined,
           pluginGeneration,
           pluginMetadataSnapshot,
+          acquisitionObserver,
         );
       } finally {
         acquisitionObserver?.onCheckpoint?.("prepared-runtime-plugin-prep-complete");

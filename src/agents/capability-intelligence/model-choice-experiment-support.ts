@@ -12,7 +12,11 @@ import type {
   PostResponseHeartbeat,
   PostResponseSnapshot,
 } from "../post-response-liveness.js";
-import type { PreparedRuntimeAcquisitionHeartbeat } from "../prepared-runtime-acquisition-liveness.js";
+import type {
+  PreparedRuntimeAcquisitionHeartbeat,
+  PreparedRuntimePluginDiscoveryInputs,
+  PreparedRuntimePluginTiming,
+} from "../prepared-runtime-acquisition-liveness.js";
 import { getBenchmarkRealToolMapping } from "./benchmark-real-tool-mapping.js";
 import {
   hashV1ICanonical,
@@ -101,6 +105,7 @@ export type V1IAttemptCheckpointJournal = {
       expectedElapsedMs?: number;
       eventLoopDelayMs?: number;
       eventLoopDelayDetected?: boolean;
+      lastSuccessfulCheckpoint?: string | null;
     },
   ) => void;
 };
@@ -171,6 +176,9 @@ export function createV1IAttemptCheckpointJournal(input: {
         ...(details?.eventLoopDelayDetected === undefined
           ? {}
           : { eventLoopDelayDetected: details.eventLoopDelayDetected }),
+        ...(details?.lastSuccessfulCheckpoint === undefined
+          ? {}
+          : { lastSuccessfulCheckpoint: details.lastSuccessfulCheckpoint }),
       };
       try {
         fs.appendFileSync(journalPath, `${JSON.stringify(checkpoint)}\n`);
@@ -334,6 +342,8 @@ export function withSyntheticModelChoiceEnvironment<T>(fn: () => Promise<T>): Pr
 export type ExperimentDiagnostics = {
   checkpoints: V1IExperimentCheckpoint[];
   preparedRuntimeAcquisitionHeartbeats: PreparedRuntimeAcquisitionHeartbeat[];
+  preparedRuntimePluginDiscoveryInputs: PreparedRuntimePluginDiscoveryInputs[];
+  preparedRuntimePluginTimings: PreparedRuntimePluginTiming[];
   postResponseCheckpoints: PostResponseCheckpoint[];
   postResponseHeartbeats: PostResponseHeartbeat[];
   postResponseSnapshots: PostResponseSnapshot[];
@@ -345,6 +355,8 @@ export type ExperimentDiagnostics = {
 export function createExperimentDiagnostics(): ExperimentDiagnostics {
   const checkpoints: V1IExperimentCheckpoint[] = [];
   const preparedRuntimeAcquisitionHeartbeats: PreparedRuntimeAcquisitionHeartbeat[] = [];
+  const preparedRuntimePluginDiscoveryInputs: PreparedRuntimePluginDiscoveryInputs[] = [];
+  const preparedRuntimePluginTimings: PreparedRuntimePluginTiming[] = [];
   const postResponseCheckpoints: PostResponseCheckpoint[] = [];
   const postResponseHeartbeats: PostResponseHeartbeat[] = [];
   const postResponseSnapshots: PostResponseSnapshot[] = [];
@@ -367,6 +379,12 @@ export function createExperimentDiagnostics(): ExperimentDiagnostics {
     onPreparedRuntimeAcquisitionHeartbeat: (heartbeat) => {
       preparedRuntimeAcquisitionHeartbeats.push(heartbeat);
     },
+    onPreparedRuntimePluginDiscoveryInputs: (inputs) => {
+      preparedRuntimePluginDiscoveryInputs.push(inputs);
+    },
+    onPreparedRuntimePluginTiming: (timing) => {
+      preparedRuntimePluginTimings.push(timing);
+    },
     onPostResponseCheckpoint: (checkpoint) => {
       postResponseCheckpoints.push({
         ...checkpoint,
@@ -387,6 +405,8 @@ export function createExperimentDiagnostics(): ExperimentDiagnostics {
   return {
     checkpoints,
     preparedRuntimeAcquisitionHeartbeats,
+    preparedRuntimePluginDiscoveryInputs,
+    preparedRuntimePluginTimings,
     postResponseCheckpoints,
     postResponseHeartbeats,
     postResponseSnapshots,
@@ -688,11 +708,8 @@ export function makeTestInvalidObservationInput(): Omit<InvalidObservationInput,
 }
 
 function classifyAttemptError(error: unknown): string {
-  const message =
-    error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
-  return message.includes("fetch") || message.includes("provider")
-    ? "PROVIDER_ERROR"
-    : "HARNESS_ERROR";
+  const message = (error instanceof Error ? error.message : String(error)).toLowerCase();
+  return /fetch|provider/.test(message) ? "PROVIDER_ERROR" : "HARNESS_ERROR";
 }
 
 export function orderedArms(seed: number): readonly Arm[] {

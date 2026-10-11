@@ -21,7 +21,11 @@ import {
   type PostResponseLiveness,
   type PostResponseSnapshot,
 } from "../post-response-liveness.js";
-import type { PreparedRuntimeAcquisitionHeartbeat } from "../prepared-runtime-acquisition-liveness.js";
+import type {
+  PreparedRuntimeAcquisitionHeartbeat,
+  PreparedRuntimePluginDiscoveryInputs,
+  PreparedRuntimePluginTiming,
+} from "../prepared-runtime-acquisition-liveness.js";
 import { resolveAgentRunSessionTarget } from "../run-session-target.js";
 import { resolveRunWorkspaceDir } from "../workspace-run.js";
 import {
@@ -1319,17 +1323,23 @@ describeDiagnosticLive("v1I model-choice diagnostic", () => {
       const requestBodies: Record<string, unknown>[] = [];
       const assistantToolCalls: Array<{ name: string; id: string }> = [];
       const acquisitionHeartbeats: PreparedRuntimeAcquisitionHeartbeat[] = [];
+      const pluginPrep = {
+        // SAFETY: these arrays collect the typed observer payloads emitted by the prepared-runtime owner.
+        discoveryInputs: [] as PreparedRuntimePluginDiscoveryInputs[],
+        // SAFETY: these arrays collect the typed observer payloads emitted by the prepared-runtime owner.
+        timings: [] as PreparedRuntimePluginTiming[],
+      };
       const responseSummaries: ProviderResponseSummary[] = [];
       const postResponseCheckpoints: PostResponseCheckpoint[] = [];
       const postResponseHeartbeats: PostResponseHeartbeat[] = [];
       const postResponseSnapshots: PostResponseSnapshot[] = [];
       const postResponseCounters: PostResponseCounter[] = [];
+      const preparationAbortController = new AbortController();
+      let preparedRuntimeAcquisitionCompleted = false;
       let observation: ExperimentRun | undefined;
       let failure: unknown;
       try {
-        journal.record("model-discovery-start");
-        await assertLiveModelAvailable();
-        journal.record("model-discovery-complete");
+        journal.record("model-discovery-skipped-for-preparation-diagnostic");
         journal.record("workspace-session-prep-start");
         journal.record("workspace-session-prep-complete");
         observation = await runOne({
@@ -1346,8 +1356,19 @@ describeDiagnosticLive("v1I model-choice diagnostic", () => {
           config,
           workspaceDir,
           timeoutMs: 120_000,
+          abortSignal: preparationAbortController.signal,
           attemptCheckpointJournal: journal,
           onAcquisitionHeartbeat: (heartbeat) => acquisitionHeartbeats.push(heartbeat),
+          onPluginPrepDiscoveryInputs: (inputs) => pluginPrep.discoveryInputs.push(inputs),
+          onPluginPrepTiming: (timing) => pluginPrep.timings.push(timing),
+          onCheckpoint: (checkpoint) => {
+            if (checkpoint.stage === "prepared-runtime-acquisition-completed") {
+              preparedRuntimeAcquisitionCompleted = true;
+              preparationAbortController.abort(
+                new Error("v1I preparation diagnostic completed before model request"),
+              );
+            }
+          },
           postResponseDiagnostics: true,
           onPostResponseCheckpoint: (checkpoint) => postResponseCheckpoints.push(checkpoint),
           onPostResponseHeartbeat: (heartbeat) => postResponseHeartbeats.push(heartbeat),
@@ -1366,7 +1387,9 @@ describeDiagnosticLive("v1I model-choice diagnostic", () => {
           },
         });
       } catch (error) {
-        failure = error;
+        if (!preparedRuntimeAcquisitionCompleted) {
+          failure = error;
+        }
       }
       const checkpointPath = path.join(diagnosticRoot, "attempt-checkpoints.jsonl");
       const checkpoints = fs
@@ -1391,7 +1414,13 @@ describeDiagnosticLive("v1I model-choice diagnostic", () => {
         contextLength: CONTEXT_LENGTH,
         modelConfigHash: hashV1ICanonical(modelConfigIdentity()),
         activeFilteringEnabled: false,
-        status: failure ? "FAILED" : observation?.valid ? "COMPLETED" : "COMPLETED_INVALID",
+        status: failure
+          ? "FAILED"
+          : preparedRuntimeAcquisitionCompleted
+            ? "PREPARED_RUNTIME_COMPLETED"
+            : observation?.valid
+              ? "COMPLETED"
+              : "COMPLETED_INVALID",
         checkpointSequence: checkpoints.map((checkpoint) => checkpoint.stage),
         lastDurableCheckpoint: checkpoints.at(-1)?.stage ?? null,
         timeoutArmed: checkpoints.some((checkpoint) => checkpoint.stage === "timeout-armed"),
@@ -1412,6 +1441,9 @@ describeDiagnosticLive("v1I model-choice diagnostic", () => {
         preparedRuntimeAcquisitionEventLoopDelayDetected: acquisitionHeartbeats.some(
           (heartbeat) => heartbeat.eventLoopDelayDetected,
         ),
+        preparedRuntimeAcquisitionCompleted,
+        pluginDiscoveryInputs: pluginPrep.discoveryInputs,
+        pluginTimings: pluginPrep.timings,
         postResponseCheckpoints,
         postResponseHeartbeats,
         postResponseSnapshots,
@@ -1441,9 +1473,10 @@ describeDiagnosticLive("v1I model-choice diagnostic", () => {
             (snapshot) => snapshot.kind === "normalized-assistant-message",
           ));
       const evidenceComplete =
-        normalizedResponseComplete &&
-        terminalObserved &&
-        diagnosticResult.correlationStatus === "PROVABLE";
+        (preparedRuntimeAcquisitionCompleted && requestBodies.length === 0) ||
+        (normalizedResponseComplete &&
+          terminalObserved &&
+          diagnosticResult.correlationStatus === "PROVABLE");
       const finalization = await persistV1IEvidenceBeforeCleanup({
         record: diagnosticResult,
         evidenceComplete,
@@ -1494,6 +1527,9 @@ describeDiagnosticLive("v1I model-choice diagnostic", () => {
         throw new Error(
           `v1I diagnostic evidence serialization failed: ${finalization.serializationErrorMessage ?? "unknown error"}`,
         );
+      }
+      if (requestBodies.length > 0) {
+        throw new Error("v1I preparation diagnostic sent a model request");
       }
       if (failure) {
         throw failure instanceof Error ? failure : new Error("v1I diagnostic failure");
@@ -1839,6 +1875,8 @@ async function runOne(input: {
       : never,
   ) => void;
   onAcquisitionHeartbeat?: (heartbeat: PreparedRuntimeAcquisitionHeartbeat) => void;
+  onPluginPrepDiscoveryInputs?: (inputs: PreparedRuntimePluginDiscoveryInputs) => void;
+  onPluginPrepTiming?: (timing: PreparedRuntimePluginTiming) => void;
   postResponseDiagnostics?: boolean;
   onPostResponseCheckpoint?: (checkpoint: PostResponseCheckpoint) => void;
   onPostResponseHeartbeat?: (heartbeat: PostResponseHeartbeat) => void;
@@ -1885,9 +1923,20 @@ async function runOne(input: {
       expectedElapsedMs: heartbeat.expectedElapsedMs,
       eventLoopDelayMs: heartbeat.eventLoopDelayMs,
       eventLoopDelayDetected: heartbeat.eventLoopDelayDetected,
+      lastSuccessfulCheckpoint: heartbeat.lastSuccessfulCheckpoint,
     });
     diagnosticsHeartbeat?.(heartbeat);
     input.onAcquisitionHeartbeat?.(heartbeat);
+  };
+  const diagnosticsPluginDiscoveryInputs = diagnostics.hooks.onPreparedRuntimePluginDiscoveryInputs;
+  diagnostics.hooks.onPreparedRuntimePluginDiscoveryInputs = (inputs) => {
+    diagnosticsPluginDiscoveryInputs?.(inputs);
+    input.onPluginPrepDiscoveryInputs?.(inputs);
+  };
+  const diagnosticsPluginTiming = diagnostics.hooks.onPreparedRuntimePluginTiming;
+  diagnostics.hooks.onPreparedRuntimePluginTiming = (timing) => {
+    diagnosticsPluginTiming?.(timing);
+    input.onPluginPrepTiming?.(timing);
   };
   const diagnosticsPostResponseCheckpoint = diagnostics.hooks.onPostResponseCheckpoint;
   diagnostics.hooks.onPostResponseCheckpoint = (checkpoint) => {

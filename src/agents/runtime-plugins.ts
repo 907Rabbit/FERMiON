@@ -3,7 +3,7 @@ import { adoptRuntimeContextEngineRegistrations } from "../context-engine/regist
 import { listRuntimePluginIdsFromRegistry } from "../plugins/active-runtime-registry.js";
 import { normalizePluginsConfig } from "../plugins/config-state.js";
 import { extractPluginInstallRecordsFromInstalledPluginIndex } from "../plugins/installed-plugin-index-install-records.js";
-import { loadPluginRegistryHandle } from "../plugins/loader.js";
+import { loadPluginRegistryHandle, type PluginLoadOptions } from "../plugins/loader.js";
 import { loadPluginMetadataSnapshot } from "../plugins/plugin-metadata-snapshot.js";
 import type { PluginMetadataSnapshot } from "../plugins/plugin-metadata-snapshot.types.js";
 import type { PluginRegistry } from "../plugins/registry-types.js";
@@ -31,6 +31,7 @@ type AgentRuntimePluginRegistryParams = {
   /** Lifecycle-owned selection; standalone/direct generations stay source-default. */
   preferBuiltPluginArtifacts?: boolean;
   metadataSnapshot?: PluginMetadataSnapshot;
+  startupTrace?: PluginLoadOptions["startupTrace"];
 };
 
 function resolveAgentRuntimePluginRegistryLoad(params: AgentRuntimePluginRegistryParams) {
@@ -97,6 +98,7 @@ function resolveAgentRuntimePluginRegistryLoad(params: AgentRuntimePluginRegistr
       runtimeOptions: params.allowGatewaySubagentBinding
         ? { allowGatewaySubagentBinding: true }
         : undefined,
+      ...(params.startupTrace ? { startupTrace: params.startupTrace } : {}),
     },
   };
 }

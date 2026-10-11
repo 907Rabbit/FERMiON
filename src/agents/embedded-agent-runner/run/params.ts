@@ -62,6 +62,9 @@ import type {
 import type {
   PreparedRuntimeAcquisitionCheckpoint,
   PreparedRuntimeAcquisitionHeartbeat,
+  PreparedRuntimePluginDiscoveryInputs,
+  PreparedRuntimePluginPrepCheckpoint,
+  PreparedRuntimePluginTiming,
 } from "../../prepared-runtime-acquisition-liveness.js";
 import type { AgentRunSessionTarget } from "../../run-session-target.js";
 import type { AgentMessage } from "../../runtime/index.js";
@@ -78,6 +81,7 @@ export type EmbeddedRunTrigger = "cron" | "heartbeat" | "manual" | "memory" | "o
 
 export type EmbeddedCapabilityIntelligenceCheckpointStage =
   | PreparedRuntimeAcquisitionCheckpoint
+  | PreparedRuntimePluginPrepCheckpoint
   | "synthetic-constructed"
   | "runner-module-import-started"
   | "runner-module-import-completed"
@@ -125,6 +129,8 @@ export type EmbeddedCapabilityIntelligenceExperimentHooks = {
     representativeToolNames: readonly string[];
   }) => void;
   onPreparedRuntimeAcquisitionHeartbeat?: (heartbeat: PreparedRuntimeAcquisitionHeartbeat) => void;
+  onPreparedRuntimePluginDiscoveryInputs?: (inputs: PreparedRuntimePluginDiscoveryInputs) => void;
+  onPreparedRuntimePluginTiming?: (timing: PreparedRuntimePluginTiming) => void;
   onPostResponseCheckpoint?: (checkpoint: PostResponseCheckpoint) => void;
   onPostResponseHeartbeat?: (heartbeat: PostResponseHeartbeat) => void;
   onPostResponseSnapshot?: (snapshot: PostResponseSnapshot) => void;

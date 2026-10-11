@@ -374,6 +374,22 @@ async function runEmbeddedAgentInternal(
                     []
                   ).slice(0, 8),
                 }),
+              onPluginPrepCheckpoint: (stage) =>
+                params.capabilityIntelligenceExperiment?.onCheckpoint?.({
+                  stage,
+                  toolCount: params.clientTools?.length ?? params.toolsAllow?.length ?? 0,
+                  representativeToolNames: (
+                    params.clientTools?.map((tool) => tool.function.name) ??
+                    params.toolsAllow ??
+                    []
+                  ).slice(0, 8),
+                }),
+              onPluginPrepDiscoveryInputs: (inputs) =>
+                params.capabilityIntelligenceExperiment?.onPreparedRuntimePluginDiscoveryInputs?.(
+                  inputs,
+                ),
+              onPluginPrepPluginTiming: (timing) =>
+                params.capabilityIntelligenceExperiment?.onPreparedRuntimePluginTiming?.(timing),
               onHeartbeat: (heartbeat) => {
                 emitPreparedRuntimeAcquisitionHeartbeat(heartbeat);
                 params.capabilityIntelligenceExperiment?.onPreparedRuntimeAcquisitionHeartbeat?.(

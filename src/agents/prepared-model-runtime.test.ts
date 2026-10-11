@@ -218,6 +218,41 @@ describe("prepared model runtime snapshots", () => {
     );
   });
 
+  it("emits plugin-preparation checkpoints and per-plugin startup timings", () => {
+    const pluginRegistry = createEmptyPluginRegistry();
+    const checkpoints: string[] = [];
+    const timings: unknown[] = [];
+    mocks.loadAgentRuntimePluginRegistryHandle.mockImplementationOnce((params) => {
+      params.startupTrace?.detail("plugins.gateway-load.plugin.example", [["loadMs", 7]]);
+      return pluginRegistry;
+    });
+
+    const prepared = prepareWorkspacePluginRegistries(
+      {
+        config: {},
+        agentDir: "/tmp/plugin-prep-observer",
+        readOnly: true,
+        loadRuntimePlugins: true,
+      },
+      mocks.pluginMetadataSnapshot as never,
+      undefined,
+      false,
+      {
+        onPluginPrepCheckpoint: (stage) => checkpoints.push(stage),
+        onPluginPrepPluginTiming: (timing) => timings.push(timing),
+      },
+    );
+
+    expect(prepared.runtimePluginRegistry).toBe(pluginRegistry);
+    expect(checkpoints).toEqual([
+      "plugin-prep-inbound-registry-entered",
+      "plugin-prep-inbound-registry-complete",
+      "plugin-prep-runtime-registry-entered",
+      "plugin-prep-runtime-registry-complete",
+    ]);
+    expect(timings).toEqual([{ pluginId: "example", metrics: [["loadMs", 7]] }]);
+  });
+
   it("reactivates a standalone read-only owner after a publication boundary", async () => {
     const input = {
       agentDir: "/tmp/prepared-model-runtime-read-only-reactivation",

@@ -14,8 +14,35 @@ export const PREPARED_RUNTIME_ACQUISITION_CHECKPOINTS = [
   "prepared-runtime-plugin-prep-complete",
 ] as const;
 
+export const PREPARED_RUNTIME_PLUGIN_PREP_CHECKPOINTS = [
+  "plugin-prep-metadata-snapshot-ready",
+  "plugin-prep-discovery-inputs-snapshotted",
+  "plugin-prep-inbound-registry-entered",
+  "plugin-prep-inbound-registry-complete",
+  "plugin-prep-runtime-registry-entered",
+  "plugin-prep-runtime-registry-complete",
+] as const;
+
 export type PreparedRuntimeAcquisitionCheckpoint =
   (typeof PREPARED_RUNTIME_ACQUISITION_CHECKPOINTS)[number];
+
+export type PreparedRuntimePluginPrepCheckpoint =
+  (typeof PREPARED_RUNTIME_PLUGIN_PREP_CHECKPOINTS)[number];
+
+export type PreparedRuntimePluginDiscoveryInputs = Readonly<{
+  roots: readonly string[];
+  configuredPluginIds: readonly string[];
+  enabledPluginIds: readonly string[];
+  disabledPluginIds: readonly string[];
+  candidateCount: number;
+  manifestCount: number;
+  diagnosticCount: number;
+}>;
+
+export type PreparedRuntimePluginTiming = Readonly<{
+  pluginId: string;
+  metrics: ReadonlyArray<readonly [string, number | string]>;
+}>;
 
 export type PreparedRuntimeAcquisitionHeartbeat = {
   stage: "prepared-runtime-acquisition";
@@ -23,10 +50,14 @@ export type PreparedRuntimeAcquisitionHeartbeat = {
   expectedElapsedMs: number;
   eventLoopDelayMs: number;
   eventLoopDelayDetected: boolean;
+  lastSuccessfulCheckpoint: string | null;
 };
 
 export type PreparedRuntimeAcquisitionObserver = {
   onCheckpoint?: (stage: PreparedRuntimeAcquisitionCheckpoint) => void;
+  onPluginPrepCheckpoint?: (stage: PreparedRuntimePluginPrepCheckpoint) => void;
+  onPluginPrepDiscoveryInputs?: (inputs: PreparedRuntimePluginDiscoveryInputs) => void;
+  onPluginPrepPluginTiming?: (timing: PreparedRuntimePluginTiming) => void;
 };
 
 export class PreparedRuntimeAcquisitionTimeoutError extends Error {
@@ -50,6 +81,9 @@ export type PreparedRuntimeAcquisitionLivenessOptions = {
   heartbeatMs?: number;
   hardTimeoutMs?: number;
   onCheckpoint?: (stage: PreparedRuntimeAcquisitionCheckpoint) => void;
+  onPluginPrepCheckpoint?: (stage: PreparedRuntimePluginPrepCheckpoint) => void;
+  onPluginPrepDiscoveryInputs?: (inputs: PreparedRuntimePluginDiscoveryInputs) => void;
+  onPluginPrepPluginTiming?: (timing: PreparedRuntimePluginTiming) => void;
   onHeartbeat?: (heartbeat: PreparedRuntimeAcquisitionHeartbeat) => void;
   now?: () => number;
   setInterval?: typeof globalThis.setInterval;
@@ -84,6 +118,16 @@ export async function withPreparedRuntimeAcquisitionLiveness<T>(
       lastSuccessfulCheckpoint = stage;
       options.onCheckpoint?.(stage);
     },
+    onPluginPrepCheckpoint: (stage) => {
+      lastSuccessfulCheckpoint = stage;
+      options.onPluginPrepCheckpoint?.(stage);
+    },
+    onPluginPrepDiscoveryInputs: (inputs) => {
+      options.onPluginPrepDiscoveryInputs?.(inputs);
+    },
+    onPluginPrepPluginTiming: (timing) => {
+      options.onPluginPrepPluginTiming?.(timing);
+    },
   };
   const heartbeat = () => {
     heartbeatNumber += 1;
@@ -97,6 +141,7 @@ export async function withPreparedRuntimeAcquisitionLiveness<T>(
       eventLoopDelayMs,
       eventLoopDelayDetected:
         eventLoopDelayMs >= PREPARED_RUNTIME_ACQUISITION_EVENT_LOOP_DELAY_THRESHOLD_MS,
+      lastSuccessfulCheckpoint,
     });
   };
   const interval = setIntervalFn(heartbeat, heartbeatMs);

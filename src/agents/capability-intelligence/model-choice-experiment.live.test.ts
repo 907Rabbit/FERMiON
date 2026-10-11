@@ -12,6 +12,7 @@ import type { AssistantMessage } from "../../llm/types.js";
 import { applyTestPluginDefaults } from "../../plugins/config-state.js";
 import type { RunEmbeddedAgentParams } from "../embedded-agent-runner/run/params.js";
 import type { EmbeddedAgentRunResult } from "../embedded-agent-runner/types.js";
+import type { PreparedRuntimeAcquisitionHeartbeat } from "../prepared-runtime-acquisition-liveness.js";
 import { resolveAgentRunSessionTarget } from "../run-session-target.js";
 import { resolveRunWorkspaceDir } from "../workspace-run.js";
 import {
@@ -1205,6 +1206,7 @@ describeDiagnosticLive("v1I model-choice diagnostic", () => {
       const config = buildLiveConfig(workspaceDir);
       const requestBodies: Record<string, unknown>[] = [];
       const assistantToolCalls: Array<{ name: string; id: string }> = [];
+      const acquisitionHeartbeats: PreparedRuntimeAcquisitionHeartbeat[] = [];
       let observation: ExperimentRun | undefined;
       let failure: unknown;
       try {
@@ -1228,6 +1230,7 @@ describeDiagnosticLive("v1I model-choice diagnostic", () => {
           workspaceDir,
           timeoutMs: 120_000,
           attemptCheckpointJournal: journal,
+          onAcquisitionHeartbeat: (heartbeat) => acquisitionHeartbeats.push(heartbeat),
           requestCapture: {
             onRequestCaptured: (request) => requestBodies.push(request.body),
             onAssistantMessage: (message) => {
@@ -1290,6 +1293,14 @@ describeDiagnosticLive("v1I model-choice diagnostic", () => {
         ),
         toolCallNames: assistantToolCalls.map((call) => call.name),
         toolCallIds: assistantToolCalls.map((call) => call.id),
+        preparedRuntimeAcquisitionHeartbeatCount: acquisitionHeartbeats.length,
+        preparedRuntimeAcquisitionMaxEventLoopDelayMs: Math.max(
+          0,
+          ...acquisitionHeartbeats.map((heartbeat) => heartbeat.eventLoopDelayMs),
+        ),
+        preparedRuntimeAcquisitionEventLoopDelayDetected: acquisitionHeartbeats.some(
+          (heartbeat) => heartbeat.eventLoopDelayDetected,
+        ),
         executedToolSequence: observation?.executedToolSequence ?? [],
         rankingEpoch: observation?.rankingEpoch ?? null,
         correlationStatus: observation?.correlationStatus ?? null,
@@ -1625,6 +1636,7 @@ async function runOne(input: {
       ? T
       : never,
   ) => void;
+  onAcquisitionHeartbeat?: (heartbeat: PreparedRuntimeAcquisitionHeartbeat) => void;
   attemptCheckpointJournal?: V1IAttemptCheckpointJournal;
 }): Promise<ExperimentRun> {
   if (input.mode === "synthetic" && process.env.OPENCLAW_DISABLE_BUNDLED_PLUGINS !== "1") {
@@ -1641,9 +1653,26 @@ async function runOne(input: {
   const rawExecutionRecords: CorrelationExecution[] = [];
   const diagnosticsCheckpoint = diagnostics.hooks.onCheckpoint;
   diagnostics.hooks.onCheckpoint = (checkpoint) => {
-    input.attemptCheckpointJournal?.record(checkpoint.stage);
     diagnosticsCheckpoint?.(checkpoint);
+    const recordedCheckpoint = diagnostics.checkpoints.at(-1);
+    input.attemptCheckpointJournal?.record(
+      checkpoint.stage,
+      recordedCheckpoint?.elapsedMs === undefined
+        ? undefined
+        : { elapsedMs: recordedCheckpoint.elapsedMs },
+    );
     input.onCheckpoint?.(checkpoint);
+  };
+  const diagnosticsHeartbeat = diagnostics.hooks.onPreparedRuntimeAcquisitionHeartbeat;
+  diagnostics.hooks.onPreparedRuntimeAcquisitionHeartbeat = (heartbeat) => {
+    input.attemptCheckpointJournal?.record("prepared-runtime-acquisition-heartbeat", {
+      elapsedMs: heartbeat.elapsedMs,
+      expectedElapsedMs: heartbeat.expectedElapsedMs,
+      eventLoopDelayMs: heartbeat.eventLoopDelayMs,
+      eventLoopDelayDetected: heartbeat.eventLoopDelayDetected,
+    });
+    diagnosticsHeartbeat?.(heartbeat);
+    input.onAcquisitionHeartbeat?.(heartbeat);
   };
   diagnostics.hooks.onTimeoutArmed = () => {
     input.attemptCheckpointJournal?.record("timeout-armed");

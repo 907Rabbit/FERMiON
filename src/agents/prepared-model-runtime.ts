@@ -38,6 +38,7 @@ import {
 } from "./prepared-model-runtime.publication-events.js";
 import type { PreparedModelRuntimeCatalogMode } from "./prepared-model-runtime.types.js";
 import { PreparedReplyDispatchPublicationOwner } from "./prepared-reply-dispatch-runtime.js";
+import type { PreparedRuntimeAcquisitionObserver } from "./prepared-runtime-acquisition-liveness.js";
 export {
   PreparedModelRuntimeOwnerNotPublishedError,
   preparedModelRuntimeConfigsMatch,
@@ -288,6 +289,7 @@ export async function acquireAgentRunPreparedModelRuntime(
     catalogMode?: PreparedModelRuntimeCatalogMode;
     pluginGeneration?: PreparedModelRuntimeOwner["pluginGeneration"];
     pluginMetadataSnapshot?: PluginMetadataSnapshot;
+    acquisitionObserver?: PreparedRuntimeAcquisitionObserver;
   } = {},
 ): Promise<PreparedModelRuntimeLease> {
   return await acquirePreparedModelRuntimeLeaseFromOwners(
@@ -301,11 +303,13 @@ export async function acquireAgentRunPreparedModelRuntime(
 /** Acquires an exact read-only generation scoped to the returned lease. */
 export async function acquireReadOnlyPreparedModelRuntime(
   rawInput: PreparedModelRuntimeInput,
+  options: { acquisitionObserver?: PreparedRuntimeAcquisitionObserver } = {},
 ): Promise<PreparedModelRuntimeLease> {
   return await acquirePreparedModelRuntimeLeaseFromOwners(
     { ...rawInput, readOnly: true },
     "ephemeral",
     preparedModelRuntimeLeaseContext,
+    options,
   );
 }
 

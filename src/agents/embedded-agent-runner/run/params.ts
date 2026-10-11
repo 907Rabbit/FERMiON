@@ -53,6 +53,10 @@ import type { ContextEngineTurnAttemptFacts } from "../../harness/context-engine
 import type { ExpectedAgentHarnessRuntimeArtifact } from "../../harness/runtime-artifact.types.js";
 import type { AgentInternalEvent } from "../../internal-events.js";
 import type { PreparedModelThinkingCapability } from "../../model-catalog-lookup.js";
+import type {
+  PreparedRuntimeAcquisitionCheckpoint,
+  PreparedRuntimeAcquisitionHeartbeat,
+} from "../../prepared-runtime-acquisition-liveness.js";
 import type { AgentRunSessionTarget } from "../../run-session-target.js";
 import type { AgentMessage } from "../../runtime/index.js";
 import type { ScheduledToolPolicyContext } from "../../scheduled-tool-policy.js";
@@ -67,6 +71,7 @@ export type { ClientToolDefinition } from "../../command/shared-types.js";
 export type EmbeddedRunTrigger = "cron" | "heartbeat" | "manual" | "memory" | "overflow" | "user";
 
 export type EmbeddedCapabilityIntelligenceCheckpointStage =
+  | PreparedRuntimeAcquisitionCheckpoint
   | "synthetic-constructed"
   | "runner-module-import-started"
   | "runner-module-import-completed"
@@ -113,6 +118,7 @@ export type EmbeddedCapabilityIntelligenceExperimentHooks = {
     toolCount: number;
     representativeToolNames: readonly string[];
   }) => void;
+  onPreparedRuntimeAcquisitionHeartbeat?: (heartbeat: PreparedRuntimeAcquisitionHeartbeat) => void;
   onRequestPreparationError?: (input: { error: unknown; stage: string }) => void;
   onProviderRequest?: (input: { payload: unknown; model: unknown }) => void | Promise<void>;
   onProviderResponse?: (input: { response: unknown; model: unknown }) => void | Promise<void>;

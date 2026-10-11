@@ -33,6 +33,7 @@ import type {
   PreparedModelRuntimeReplacement,
   PreparedModelRuntimeSnapshot,
 } from "./prepared-model-runtime.types.js";
+import type { PreparedRuntimeAcquisitionObserver } from "./prepared-runtime-acquisition-liveness.js";
 
 export type {
   PreparedModelRuntimeInput,
@@ -589,6 +590,7 @@ export async function publishModelRuntimeSnapshot(
   catalogMode: PreparedModelRuntimeCatalogMode = existing?.catalogMode ?? "live",
   reusablePluginGeneration?: PreparedModelRuntimePluginGeneration,
   pluginMetadataSnapshot?: PreparedModelRuntimePluginGeneration["pluginMetadataSnapshot"],
+  acquisitionObserver?: PreparedRuntimeAcquisitionObserver,
 ): Promise<PreparedModelRuntimeSnapshot> {
   const key = ownerKey(input);
   const owner = existing ?? createPreparedModelRuntimeOwner(input, provenance, catalogMode);
@@ -611,6 +613,7 @@ export async function publishModelRuntimeSnapshot(
     provenance === "configured",
     reusablePluginGeneration,
     pluginMetadataSnapshot,
+    acquisitionObserver,
   );
   owner.buildCompletion = build.completion;
   void build.completion.then(() => {

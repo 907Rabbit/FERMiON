@@ -17,6 +17,7 @@ import {
   type PreparedModelRuntimeSnapshot,
 } from "./prepared-model-runtime.owner.js";
 import type { PreparedModelRuntimeCatalogMode } from "./prepared-model-runtime.types.js";
+import type { PreparedRuntimeAcquisitionObserver } from "./prepared-runtime-acquisition-liveness.js";
 
 type PreparedModelRuntimeLeaseContext = {
   owners: Map<string, PreparedModelRuntimeOwner>;
@@ -26,7 +27,10 @@ type PreparedModelRuntimeLeaseContext = {
   getBuildTimeoutMs(): number;
   getGatewayLifecycleActive(): boolean;
   getPendingReplacement(): PreparedModelRuntimeReplacement | undefined;
-  prepareSnapshot(input: PreparedModelRuntimeInput): Promise<PreparedModelRuntimeSnapshot>;
+  prepareSnapshot(
+    input: PreparedModelRuntimeInput,
+    acquisitionObserver?: PreparedRuntimeAcquisitionObserver,
+  ): Promise<PreparedModelRuntimeSnapshot>;
 };
 
 export async function acquirePreparedModelRuntimeLeaseFromOwners(
@@ -38,8 +42,10 @@ export async function acquirePreparedModelRuntimeLeaseFromOwners(
     catalogMode?: PreparedModelRuntimeCatalogMode;
     pluginGeneration?: PreparedModelRuntimeOwner["pluginGeneration"];
     pluginMetadataSnapshot?: PluginMetadataSnapshot;
+    acquisitionObserver?: PreparedRuntimeAcquisitionObserver;
   } = {},
 ): Promise<PreparedModelRuntimeLease> {
+  options.acquisitionObserver?.onCheckpoint?.("prepared-runtime-acquisition-requested");
   let normalizedInput = normalizePreparedModelRuntimeInput({
     ...rawInput,
     preserveWorkspaceDirOnRefresh:
@@ -78,7 +84,9 @@ export async function acquirePreparedModelRuntimeLeaseFromOwners(
       }
       continue;
     }
+    options.acquisitionObserver?.onCheckpoint?.("prepared-runtime-cache-check-entered");
     let existing = context.owners.get(key);
+    options.acquisitionObserver?.onCheckpoint?.("prepared-runtime-cache-check-complete");
     let staleDynamicOwner =
       existing?.needsRefresh &&
       !existing.pending &&
@@ -127,7 +135,12 @@ export async function acquirePreparedModelRuntimeLeaseFromOwners(
       if (existing?.pending && !pluginGenerationChanged) {
         // Matching callers lease the immutable generation they joined even if a queued
         // mismatched caller publishes the next owner immediately after this one settles.
-        snapshot = await existing.pending;
+        options.acquisitionObserver?.onCheckpoint?.("prepared-runtime-build-entered");
+        try {
+          snapshot = await existing.pending;
+        } finally {
+          options.acquisitionObserver?.onCheckpoint?.("prepared-runtime-build-complete");
+        }
         if (existing.snapshot !== snapshot || existing.needsRefresh) {
           continue;
         }
@@ -135,22 +148,33 @@ export async function acquirePreparedModelRuntimeLeaseFromOwners(
         break;
       }
       if (existing && !staleDynamicOwner && !pluginGenerationChanged) {
-        snapshot = await context.prepareSnapshot(input);
+        options.acquisitionObserver?.onCheckpoint?.("prepared-runtime-build-entered");
+        try {
+          snapshot = await context.prepareSnapshot(input, options.acquisitionObserver);
+        } finally {
+          options.acquisitionObserver?.onCheckpoint?.("prepared-runtime-build-complete");
+        }
       } else {
         // Fresh keys publish a first generation; stale dynamic owners publish a distinct
         // replacement owner because existing leases retain their immutable snapshot, so
         // their release cannot delete the generation admitted for new work at this key.
-        snapshot = await publishModelRuntimeSnapshot(
-          input,
-          context.owners,
-          context.agentBuildCompletions,
-          context.getBuildTimeoutMs(),
-          undefined,
-          provenance,
-          options.catalogMode,
-          options.pluginGeneration,
-          options.pluginMetadataSnapshot,
-        );
+        options.acquisitionObserver?.onCheckpoint?.("prepared-runtime-build-entered");
+        try {
+          snapshot = await publishModelRuntimeSnapshot(
+            input,
+            context.owners,
+            context.agentBuildCompletions,
+            context.getBuildTimeoutMs(),
+            undefined,
+            provenance,
+            options.catalogMode,
+            options.pluginGeneration,
+            options.pluginMetadataSnapshot,
+            options.acquisitionObserver,
+          );
+        } finally {
+          options.acquisitionObserver?.onCheckpoint?.("prepared-runtime-build-complete");
+        }
       }
     } catch (error) {
       if (error instanceof PreparedModelRuntimePublicationSupersededError) {

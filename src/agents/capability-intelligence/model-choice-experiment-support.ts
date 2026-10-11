@@ -5,6 +5,7 @@ import path from "node:path";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { withEnvAsync } from "../../test-utils/env.js";
 import type { RunEmbeddedAgentParams } from "../embedded-agent-runner/run/params.js";
+import type { PreparedRuntimeAcquisitionHeartbeat } from "../prepared-runtime-acquisition-liveness.js";
 import { getBenchmarkRealToolMapping } from "./benchmark-real-tool-mapping.js";
 import {
   hashV1ICanonical,
@@ -89,6 +90,10 @@ export type V1IAttemptCheckpointJournal = {
       modelTurnIndex?: number;
       providerAttempt?: number;
       lastKnownToolCallId?: string;
+      elapsedMs?: number;
+      expectedElapsedMs?: number;
+      eventLoopDelayMs?: number;
+      eventLoopDelayDetected?: boolean;
     },
   ) => void;
 };
@@ -149,6 +154,16 @@ export function createV1IAttemptCheckpointJournal(input: {
         ...(details?.lastKnownToolCallId === undefined
           ? {}
           : { lastKnownToolCallId: details.lastKnownToolCallId.slice(0, 128) }),
+        ...(details?.elapsedMs === undefined ? {} : { elapsedMs: details.elapsedMs }),
+        ...(details?.expectedElapsedMs === undefined
+          ? {}
+          : { expectedElapsedMs: details.expectedElapsedMs }),
+        ...(details?.eventLoopDelayMs === undefined
+          ? {}
+          : { eventLoopDelayMs: details.eventLoopDelayMs }),
+        ...(details?.eventLoopDelayDetected === undefined
+          ? {}
+          : { eventLoopDelayDetected: details.eventLoopDelayDetected }),
       };
       try {
         fs.appendFileSync(journalPath, `${JSON.stringify(checkpoint)}\n`);
@@ -242,7 +257,14 @@ export function smokeStageForCheckpoint(stage: string): V1ISmokeStage | undefine
     stage === "runner-entry" ||
     stage === "session-target-resolution-entered" ||
     stage === "runtime-preparation-entered" ||
-    stage === "prepared-runtime-acquisition-entered"
+    stage === "prepared-runtime-acquisition-entered" ||
+    stage === "prepared-runtime-acquisition-requested" ||
+    stage === "prepared-runtime-cache-check-entered" ||
+    stage === "prepared-runtime-cache-check-complete" ||
+    stage === "prepared-runtime-build-entered" ||
+    stage === "prepared-runtime-build-complete" ||
+    stage === "prepared-runtime-plugin-prep-entered" ||
+    stage === "prepared-runtime-plugin-prep-complete"
   ) {
     return "workspaceSessionPreparation";
   }
@@ -304,12 +326,14 @@ export function withSyntheticModelChoiceEnvironment<T>(fn: () => Promise<T>): Pr
 
 export type ExperimentDiagnostics = {
   checkpoints: V1IExperimentCheckpoint[];
+  preparedRuntimeAcquisitionHeartbeats: PreparedRuntimeAcquisitionHeartbeat[];
   readFailure: () => V1IRequestPreparationDiagnostics["failure"];
   hooks: NonNullable<RunEmbeddedAgentParams["capabilityIntelligenceExperiment"]>;
 };
 
 export function createExperimentDiagnostics(): ExperimentDiagnostics {
   const checkpoints: V1IExperimentCheckpoint[] = [];
+  const preparedRuntimeAcquisitionHeartbeats: PreparedRuntimeAcquisitionHeartbeat[] = [];
   const startedAt = performance.now();
   let failure: V1IRequestPreparationDiagnostics["failure"];
   const hooks: NonNullable<RunEmbeddedAgentParams["capabilityIntelligenceExperiment"]> = {
@@ -325,8 +349,16 @@ export function createExperimentDiagnostics(): ExperimentDiagnostics {
     onRequestPreparationError: ({ error, stage }) => {
       failure ??= serializeRequestPreparationFailure(error, stage);
     },
+    onPreparedRuntimeAcquisitionHeartbeat: (heartbeat) => {
+      preparedRuntimeAcquisitionHeartbeats.push(heartbeat);
+    },
   };
-  return { checkpoints, readFailure: () => failure, hooks };
+  return {
+    checkpoints,
+    preparedRuntimeAcquisitionHeartbeats,
+    readFailure: () => failure,
+    hooks,
+  };
 }
 
 function serializeRequestPreparationFailure(

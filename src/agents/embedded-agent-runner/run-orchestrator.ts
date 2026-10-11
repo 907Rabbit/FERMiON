@@ -39,6 +39,10 @@ import {
   acquireAgentRunPreparedModelRuntime,
   acquireReadOnlyPreparedModelRuntime,
 } from "../prepared-model-runtime.js";
+import {
+  emitPreparedRuntimeAcquisitionHeartbeat,
+  withPreparedRuntimeAcquisitionLiveness,
+} from "../prepared-runtime-acquisition-liveness.js";
 import { resolveProjectKey } from "../project-memory-scope.js";
 import {
   applyAgentRunSessionTargetIdentity,
@@ -344,18 +348,40 @@ async function runEmbeddedAgentInternal(
           []
         ).slice(0, 8),
       });
-      const preparedModelRuntimeLease = await withEmbeddedRunLaneProgressHeartbeat(
-        noteLaneTaskProgress,
-        () =>
-          params.preparedModelRuntimeMode === "isolated-read-only"
-            ? acquireReadOnlyPreparedModelRuntime(preparedInput)
-            : acquireAgentRunPreparedModelRuntime(preparedInput, {
-                retainIdleRunOwner,
-                // Turns need only configured admission facts. Full live model inventory remains
-                // available through the snapshot's lazy control-plane loader.
-                catalogMode: "static",
-                ...(params.pluginGeneration ? { pluginGeneration: params.pluginGeneration } : {}),
-              }),
+      const preparedModelRuntimeLease = await withPreparedRuntimeAcquisitionLiveness(
+        (acquisitionObserver) =>
+          withEmbeddedRunLaneProgressHeartbeat(noteLaneTaskProgress, () =>
+            params.preparedModelRuntimeMode === "isolated-read-only"
+              ? acquireReadOnlyPreparedModelRuntime(preparedInput, { acquisitionObserver })
+              : acquireAgentRunPreparedModelRuntime(preparedInput, {
+                  retainIdleRunOwner,
+                  // Turns need only configured admission facts. Full live model inventory remains
+                  // available through the snapshot's lazy control-plane loader.
+                  catalogMode: "static",
+                  ...(params.pluginGeneration ? { pluginGeneration: params.pluginGeneration } : {}),
+                  acquisitionObserver,
+                }),
+          ),
+        params.capabilityIntelligenceExperiment
+          ? {
+              onCheckpoint: (stage) =>
+                params.capabilityIntelligenceExperiment?.onCheckpoint?.({
+                  stage,
+                  toolCount: params.clientTools?.length ?? params.toolsAllow?.length ?? 0,
+                  representativeToolNames: (
+                    params.clientTools?.map((tool) => tool.function.name) ??
+                    params.toolsAllow ??
+                    []
+                  ).slice(0, 8),
+                }),
+              onHeartbeat: (heartbeat) => {
+                emitPreparedRuntimeAcquisitionHeartbeat(heartbeat);
+                params.capabilityIntelligenceExperiment?.onPreparedRuntimeAcquisitionHeartbeat?.(
+                  heartbeat,
+                );
+              },
+            }
+          : undefined,
       );
       params.capabilityIntelligenceExperiment?.onCheckpoint?.({
         stage: "prepared-runtime-acquisition-completed",

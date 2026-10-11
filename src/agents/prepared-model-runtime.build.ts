@@ -44,6 +44,7 @@ import type {
   PreparedModelRuntimeSnapshot,
   PreparedModelRuntimeStores,
 } from "./prepared-model-runtime.types.js";
+import type { PreparedRuntimeAcquisitionObserver } from "./prepared-runtime-acquisition-liveness.js";
 import { AuthStorage } from "./sessions/auth-storage.js";
 
 const MAX_CONCURRENT_MODEL_RUNTIME_AGENT_SOURCE_BUILDS = 2;
@@ -284,6 +285,7 @@ async function buildSnapshotBatch(
   >,
   pluginMetadataSnapshot?: PreparedModelRuntimePluginGeneration["pluginMetadataSnapshot"],
   onBuildStats?: (stats: PreparedModelRuntimeBuildStats) => void,
+  acquisitionObserver?: PreparedRuntimeAcquisitionObserver,
 ): Promise<PreparedModelRuntimeBuildResult[]> {
   const freshGroups = new Map<string, PreparedModelRuntimeInput[]>();
   const reusableGroups = new Map<
@@ -344,14 +346,21 @@ async function buildSnapshotBatch(
     );
     const preferBuiltPluginArtifacts =
       pluginGeneration?.preferBuiltPluginArtifacts ?? prepareInboundPluginRegistry;
-    const prepared = await prepareWorkspaceBuildGroup(
-      groupInputs,
-      catalogMode,
-      { preferBuiltPluginArtifacts },
-      prepareInboundPluginRegistry ? loadInboundPluginRegistry : undefined,
-      pluginGeneration,
-      pluginMetadataSnapshot,
-    );
+    acquisitionObserver?.onCheckpoint?.("prepared-runtime-plugin-prep-entered");
+    const prepared = await (async () => {
+      try {
+        return await prepareWorkspaceBuildGroup(
+          groupInputs,
+          catalogMode,
+          { preferBuiltPluginArtifacts },
+          prepareInboundPluginRegistry ? loadInboundPluginRegistry : undefined,
+          pluginGeneration,
+          pluginMetadataSnapshot,
+        );
+      } finally {
+        acquisitionObserver?.onCheckpoint?.("prepared-runtime-plugin-prep-complete");
+      }
+    })();
     assertPreparedModelRuntimeInputsCurrent(groupInputs, buildGuards);
     runtimePluginMs += prepared.buildStats.runtimePluginMs;
     pluginMetadataMs += prepared.buildStats.pluginMetadataMs;
@@ -552,6 +561,7 @@ export function startSerializedSnapshotBuildBatch(
     PreparedModelRuntimePluginGeneration
   > = new Map(),
   pluginMetadataSnapshot?: PreparedModelRuntimePluginGeneration["pluginMetadataSnapshot"],
+  acquisitionObserver?: PreparedRuntimeAcquisitionObserver,
 ): {
   pending: Promise<PreparedModelRuntimeBuildResult[]>;
   completion: Promise<void>;
@@ -581,6 +591,7 @@ export function startSerializedSnapshotBuildBatch(
         reusablePluginGenerations,
         pluginMetadataSnapshot,
         onBuildStats,
+        acquisitionObserver,
       ),
     };
   })();
@@ -620,6 +631,7 @@ export function startSerializedSnapshotBuild(
   prepareInboundPluginRegistry = false,
   reusablePluginGeneration?: PreparedModelRuntimePluginGeneration,
   pluginMetadataSnapshot?: PreparedModelRuntimePluginGeneration["pluginMetadataSnapshot"],
+  acquisitionObserver?: PreparedRuntimeAcquisitionObserver,
 ): {
   pending: Promise<PreparedModelRuntimeBuildResult>;
   completion: Promise<void>;
@@ -635,6 +647,7 @@ export function startSerializedSnapshotBuild(
     prepareInboundPluginRegistry ? new Set([input]) : undefined,
     reusablePluginGeneration ? new Map([[input, reusablePluginGeneration]]) : undefined,
     pluginMetadataSnapshot,
+    acquisitionObserver,
   );
   return {
     pending: build.pending.then((results) => results[0]!),

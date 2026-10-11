@@ -111,8 +111,29 @@ export function createEmbeddedAgentSessionEventHandler(ctx: EmbeddedAgentSubscri
         });
         return;
       case "tool_execution_start":
+        ctx.params.onPostResponseCounter?.({ name: "execution-dispatch" });
+        ctx.params.onPostResponseSnapshot?.({
+          kind: "before-execution",
+          contentTypes: ["toolCall"],
+          toolCallCount: 1,
+          toolCallIds: [evt.toolCallId],
+          toolNames: [evt.toolName],
+        });
+        ctx.params.onPostResponseCheckpoint?.({
+          stage: "tool-execution-dispatch-entered",
+          toolCallId: evt.toolCallId,
+          toolName: evt.toolName,
+        });
         void scheduleEvent(evt, () => {
-          return handleToolExecutionStart(ctx, evt as never);
+          try {
+            return handleToolExecutionStart(ctx, evt as never);
+          } finally {
+            ctx.params.onPostResponseCheckpoint?.({
+              stage: "tool-execution-dispatch-complete",
+              toolCallId: evt.toolCallId,
+              toolName: evt.toolName,
+            });
+          }
         });
         return;
       case "tool_execution_update":
@@ -121,10 +142,24 @@ export function createEmbeddedAgentSessionEventHandler(ctx: EmbeddedAgentSubscri
         });
         return;
       case "tool_execution_end":
+        ctx.params.onPostResponseCheckpoint?.({
+          stage: "tool-result-processing-entered",
+          toolCallId: evt.toolCallId,
+          toolName: evt.toolName,
+        });
         void scheduleEvent(
           evt,
           async () => {
-            await handleToolExecutionEnd(ctx, evt as never);
+            try {
+              await handleToolExecutionEnd(ctx, evt as never);
+            } finally {
+              ctx.params.onPostResponseCheckpoint?.({
+                stage: "tool-result-processing-complete",
+                toolCallId: evt.toolCallId,
+                toolName: evt.toolName,
+              });
+              ctx.params.onPostResponseCounter?.({ name: "execution-completion" });
+            }
           },
           { detach: true },
         );

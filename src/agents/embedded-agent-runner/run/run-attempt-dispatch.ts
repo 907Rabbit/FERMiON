@@ -142,7 +142,16 @@ export async function dispatchEmbeddedRunAttempt(input: {
   const observeToolTerminalWithShadowRanking: NonNullable<
     EmbeddedRunAttemptParams["observeToolTerminal"]
   > = (observation) => {
+    params.capabilityIntelligenceExperiment?.onPostResponseCheckpoint?.({
+      stage: "tool-call-correlation-entered",
+      ...(observation.executionId ? { executionId: observation.executionId } : {}),
+      ...(observation.toolCallId ? { toolCallId: observation.toolCallId } : {}),
+      toolName: observation.toolName,
+    });
     const terminal = observeToolTerminal(observation);
+    params.capabilityIntelligenceExperiment?.onPostResponseCounter?.({
+      name: "tool-call-observation",
+    });
     const rankingCorrelation = attemptRankingCorrelation;
     runtime.toolRankingShadowTracker.recordOutcome(
       observation.toolName,
@@ -169,6 +178,17 @@ export async function dispatchEmbeddedRunAttempt(input: {
       },
     );
     if (rankingCorrelation) {
+      if (observation.executionId && observation.toolCallId) {
+        params.capabilityIntelligenceExperiment?.onPostResponseSnapshot?.({
+          kind: "execution-correlation",
+          contentTypes: [],
+          toolCallCount: 1,
+          toolCallIds: [observation.toolCallId],
+          toolNames: [observation.toolName],
+          executionIds: [observation.executionId],
+          correlationPairs: [`${observation.toolCallId}:${observation.executionId}`],
+        });
+      }
       emitEmbeddedReplayFact(params.onEmbeddedReplayFact, {
         kind: "terminal",
         ...rankingCorrelation,
@@ -181,6 +201,12 @@ export async function dispatchEmbeddedRunAttempt(input: {
         outcome: observation.outcome,
       });
     }
+    params.capabilityIntelligenceExperiment?.onPostResponseCheckpoint?.({
+      stage: "tool-call-correlation-complete",
+      ...(observation.executionId ? { executionId: observation.executionId } : {}),
+      ...(observation.toolCallId ? { toolCallId: observation.toolCallId } : {}),
+      toolName: observation.toolName,
+    });
     return terminal;
   };
   const attemptAbortController = new AbortController();

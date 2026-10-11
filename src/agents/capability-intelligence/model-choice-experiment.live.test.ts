@@ -12,6 +12,15 @@ import type { AssistantMessage } from "../../llm/types.js";
 import { applyTestPluginDefaults } from "../../plugins/config-state.js";
 import type { RunEmbeddedAgentParams } from "../embedded-agent-runner/run/params.js";
 import type { EmbeddedAgentRunResult } from "../embedded-agent-runner/types.js";
+import {
+  createPostResponseLiveness,
+  emitPostResponseHeartbeat,
+  type PostResponseCheckpoint,
+  type PostResponseCounter,
+  type PostResponseHeartbeat,
+  type PostResponseLiveness,
+  type PostResponseSnapshot,
+} from "../post-response-liveness.js";
 import type { PreparedRuntimeAcquisitionHeartbeat } from "../prepared-runtime-acquisition-liveness.js";
 import { resolveAgentRunSessionTarget } from "../run-session-target.js";
 import { resolveRunWorkspaceDir } from "../workspace-run.js";
@@ -378,9 +387,7 @@ describe("v1I harness evidence repair", () => {
     });
 
     expect(diagnostics.hooks.onAssistantMessage).toBeTypeOf("function");
-    await diagnostics.hooks.onAssistantMessage?.(
-      makeAssistantMessage([{ type: "text", text: "ok" }]),
-    );
+    diagnostics.hooks.onAssistantMessage?.(makeAssistantMessage([{ type: "text", text: "ok" }]));
     expect(observations).toEqual(["turn-0:active"]);
 
     restore();
@@ -1207,6 +1214,11 @@ describeDiagnosticLive("v1I model-choice diagnostic", () => {
       const requestBodies: Record<string, unknown>[] = [];
       const assistantToolCalls: Array<{ name: string; id: string }> = [];
       const acquisitionHeartbeats: PreparedRuntimeAcquisitionHeartbeat[] = [];
+      const responseSummaries: ProviderResponseSummary[] = [];
+      const postResponseCheckpoints: PostResponseCheckpoint[] = [];
+      const postResponseHeartbeats: PostResponseHeartbeat[] = [];
+      const postResponseSnapshots: PostResponseSnapshot[] = [];
+      const postResponseCounters: PostResponseCounter[] = [];
       let observation: ExperimentRun | undefined;
       let failure: unknown;
       try {
@@ -1231,8 +1243,14 @@ describeDiagnosticLive("v1I model-choice diagnostic", () => {
           timeoutMs: 120_000,
           attemptCheckpointJournal: journal,
           onAcquisitionHeartbeat: (heartbeat) => acquisitionHeartbeats.push(heartbeat),
+          postResponseDiagnostics: true,
+          onPostResponseCheckpoint: (checkpoint) => postResponseCheckpoints.push(checkpoint),
+          onPostResponseHeartbeat: (heartbeat) => postResponseHeartbeats.push(heartbeat),
+          onPostResponseSnapshot: (snapshot) => postResponseSnapshots.push(snapshot),
+          onPostResponseCounter: (counter) => postResponseCounters.push(counter),
           requestCapture: {
             onRequestCaptured: (request) => requestBodies.push(request.body),
+            onResponseSummary: (summary) => responseSummaries.push(summary),
             onAssistantMessage: (message) => {
               for (const block of message.content) {
                 if (block.type === "toolCall") {
@@ -1301,6 +1319,13 @@ describeDiagnosticLive("v1I model-choice diagnostic", () => {
         preparedRuntimeAcquisitionEventLoopDelayDetected: acquisitionHeartbeats.some(
           (heartbeat) => heartbeat.eventLoopDelayDetected,
         ),
+        postResponseCheckpoints,
+        postResponseHeartbeats,
+        postResponseSnapshots,
+        postResponseCounters,
+        responseSummaries,
+        postResponseTimeout:
+          failure instanceof Error && failure.name === "PostResponseTimeoutError",
         executedToolSequence: observation?.executedToolSequence ?? [],
         rankingEpoch: observation?.rankingEpoch ?? null,
         correlationStatus: observation?.correlationStatus ?? null,
@@ -1320,7 +1345,7 @@ describeDiagnosticLive("v1I model-choice diagnostic", () => {
         `${JSON.stringify(diagnosticResult, null, 2)}\n`,
       );
       if (failure) {
-        throw failure;
+        throw failure instanceof Error ? failure : new Error("v1I diagnostic failure");
       }
     },
   );
@@ -1591,6 +1616,32 @@ async function runStratum(input: {
   return runs;
 }
 
+function mergeV1IAbortSignals(
+  signals: readonly (AbortSignal | undefined)[],
+): AbortSignal | undefined {
+  const activeSignals = signals.filter((signal): signal is AbortSignal => signal !== undefined);
+  if (activeSignals.length === 0) {
+    return undefined;
+  }
+  if (activeSignals.length === 1) {
+    return activeSignals[0];
+  }
+  const controller = new AbortController();
+  const abortFrom = (signal: AbortSignal) => {
+    if (!controller.signal.aborted) {
+      controller.abort(signal.reason);
+    }
+  };
+  for (const signal of activeSignals) {
+    if (signal.aborted) {
+      abortFrom(signal);
+      continue;
+    }
+    signal.addEventListener("abort", () => abortFrom(signal), { once: true });
+  }
+  return controller.signal;
+}
+
 function v1IAttemptId(
   surfaceMode: V1ISurfaceMode,
   caseId: string,
@@ -1637,6 +1688,11 @@ async function runOne(input: {
       : never,
   ) => void;
   onAcquisitionHeartbeat?: (heartbeat: PreparedRuntimeAcquisitionHeartbeat) => void;
+  postResponseDiagnostics?: boolean;
+  onPostResponseCheckpoint?: (checkpoint: PostResponseCheckpoint) => void;
+  onPostResponseHeartbeat?: (heartbeat: PostResponseHeartbeat) => void;
+  onPostResponseSnapshot?: (snapshot: PostResponseSnapshot) => void;
+  onPostResponseCounter?: (counter: PostResponseCounter) => void;
   attemptCheckpointJournal?: V1IAttemptCheckpointJournal;
 }): Promise<ExperimentRun> {
   if (input.mode === "synthetic" && process.env.OPENCLAW_DISABLE_BUNDLED_PLUGINS !== "1") {
@@ -1649,6 +1705,14 @@ async function runOne(input: {
   const runProvider = input.provider ?? PROVIDER;
   const runModel = input.model ?? MODEL_ID;
   const diagnostics = createExperimentDiagnostics();
+  const postResponseLiveness: PostResponseLiveness | undefined = input.postResponseDiagnostics
+    ? createPostResponseLiveness({
+        onHeartbeat: (heartbeat) => {
+          emitPostResponseHeartbeat(heartbeat);
+          diagnostics.hooks.onPostResponseHeartbeat?.(heartbeat);
+        },
+      })
+    : undefined;
   const semanticToolCalls: CorrelationToolCall[] = [];
   const rawExecutionRecords: CorrelationExecution[] = [];
   const diagnosticsCheckpoint = diagnostics.hooks.onCheckpoint;
@@ -1673,6 +1737,38 @@ async function runOne(input: {
     });
     diagnosticsHeartbeat?.(heartbeat);
     input.onAcquisitionHeartbeat?.(heartbeat);
+  };
+  const diagnosticsPostResponseCheckpoint = diagnostics.hooks.onPostResponseCheckpoint;
+  diagnostics.hooks.onPostResponseCheckpoint = (checkpoint) => {
+    diagnosticsPostResponseCheckpoint?.(checkpoint);
+    const recordedCheckpoint = diagnostics.postResponseCheckpoints.at(-1) ?? checkpoint;
+    input.attemptCheckpointJournal?.record(checkpoint.stage, {
+      elapsedMs: recordedCheckpoint.elapsedMs,
+      lastKnownToolCallId: checkpoint.toolCallId,
+    });
+    postResponseLiveness?.checkpoint(checkpoint);
+    input.onPostResponseCheckpoint?.(recordedCheckpoint);
+  };
+  const diagnosticsPostResponseHeartbeat = diagnostics.hooks.onPostResponseHeartbeat;
+  diagnostics.hooks.onPostResponseHeartbeat = (heartbeat) => {
+    diagnosticsPostResponseHeartbeat?.(heartbeat);
+    input.attemptCheckpointJournal?.record("post-response-heartbeat", {
+      elapsedMs: heartbeat.elapsedMs,
+      expectedElapsedMs: heartbeat.expectedElapsedMs,
+      eventLoopDelayMs: heartbeat.eventLoopDelayMs,
+      eventLoopDelayDetected: heartbeat.eventLoopDelayDetected,
+    });
+    input.onPostResponseHeartbeat?.(heartbeat);
+  };
+  const diagnosticsPostResponseSnapshot = diagnostics.hooks.onPostResponseSnapshot;
+  diagnostics.hooks.onPostResponseSnapshot = (snapshot) => {
+    diagnosticsPostResponseSnapshot?.(snapshot);
+    input.onPostResponseSnapshot?.(snapshot);
+  };
+  const diagnosticsPostResponseCounter = diagnostics.hooks.onPostResponseCounter;
+  diagnostics.hooks.onPostResponseCounter = (counter) => {
+    diagnosticsPostResponseCounter?.(counter);
+    input.onPostResponseCounter?.(counter);
   };
   diagnostics.hooks.onTimeoutArmed = () => {
     input.attemptCheckpointJournal?.record("timeout-armed");
@@ -1739,11 +1835,32 @@ async function runOne(input: {
       toolCount: input.authorizedNames.length,
       representativeToolNames: input.authorizedNames.slice(0, 8),
     });
+    diagnostics.hooks.onPostResponseCheckpoint?.({
+      stage: "provider-response-normalization-entered",
+    });
+    postResponseLiveness?.arm();
     await diagnosticsProviderResponse?.({ response, model });
   };
   const restoreAssistantMessageObserver = installAssistantMessageObserver(
     diagnostics.hooks,
     (message, modelTurnIndex) => {
+      diagnostics.hooks.onPostResponseCheckpoint?.({
+        stage: "provider-response-normalization-complete",
+      });
+      const normalizedToolCalls = message.content.filter(
+        (block): block is Extract<AssistantMessage["content"][number], { type: "toolCall" }> =>
+          block.type === "toolCall",
+      );
+      diagnostics.hooks.onPostResponseSnapshot?.({
+        kind: "normalized-assistant-message",
+        contentTypes: message.content.map((block) => block.type),
+        toolCallCount: normalizedToolCalls.length,
+        toolCallIds: normalizedToolCalls.map((block) => block.id),
+        toolNames: normalizedToolCalls.map((block) => block.name),
+      });
+      normalizedToolCalls.forEach(() => {
+        diagnostics.hooks.onPostResponseCounter?.({ name: "tool-call-observation" });
+      });
       for (const block of message.content) {
         if (block.type !== "toolCall") {
           continue;
@@ -1793,11 +1910,16 @@ async function runOne(input: {
       });
       let result: EmbeddedAgentRunResult;
       try {
-        result = await runEmbeddedAgent({
+        const runAbortSignal = mergeV1IAbortSignals([
+          params.abortSignal,
+          postResponseLiveness?.signal,
+        ]);
+        const runPromise = runEmbeddedAgent({
           ...params,
           ...(harness ? buildSyntheticRunnerOverrides(harness) : {}),
           ...(input.arm === "B" ? { extraSystemPrompt: ARM_B_INSTRUCTION } : {}),
           capabilityIntelligenceExperiment: diagnostics.hooks,
+          ...(runAbortSignal ? { abortSignal: runAbortSignal } : {}),
           onEmbeddedReplayFact: (fact) => {
             if (fact.kind === "ranking") {
               observedRanking = fact;
@@ -1826,6 +1948,9 @@ async function runOne(input: {
             originalResultListener?.(event);
           },
         });
+        result = postResponseLiveness
+          ? await Promise.race([runPromise, postResponseLiveness.timeoutPromise])
+          : await runPromise;
       } catch (error) {
         diagnostics.hooks.onRequestPreparationError?.({
           error,
@@ -1912,9 +2037,14 @@ async function runOne(input: {
       });
     }
   } finally {
+    postResponseLiveness?.complete();
     restoreAssistantMessageObserver?.();
     configureAiTransportHost(originalAiTransportHost);
     capture.restore();
+  }
+  const postResponseTimeout = postResponseLiveness?.readTimeout();
+  if (postResponseTimeout) {
+    throw postResponseTimeout;
   }
   const completedExecution = execution;
   if (!completedExecution) {
@@ -2588,6 +2718,16 @@ function captureModelPayloads(
   let delegatedRequests = 0;
   const originalFetch = globalThis.fetch;
   const wrapFetch = (baseFetch: typeof globalThis.fetch): typeof globalThis.fetch => {
+    const emitResponseSummary = (summary: ProviderResponseSummary) => {
+      hooks?.onPostResponseSnapshot?.({
+        kind: "provider-response",
+        contentTypes: summary.outputItemTypes,
+        toolCallCount: summary.toolCallCount,
+        toolCallIds: summary.toolCallIds,
+        toolNames: summary.toolCallNames,
+      });
+      options?.onResponseSummary?.(summary);
+    };
     return async (input, init) => {
       const url =
         typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
@@ -2633,14 +2773,14 @@ function captureModelPayloads(
       }
       const initialSummary = createPendingProviderResponseSummary(response);
       responseSummaries.push(initialSummary);
-      options?.onResponseSummary?.(initialSummary);
+      emitResponseSummary(initialSummary);
       if (!response.body) {
         const emptySummary = {
           ...initialSummary,
           parserOutcome: "empty-body",
         } satisfies ProviderResponseSummary;
         responseSummaries.push(emptySummary);
-        options?.onResponseSummary?.(emptySummary);
+        emitResponseSummary(emptySummary);
         return response;
       }
       const state = createResponseSummaryState(response.headers.get("content-type"));
@@ -2654,7 +2794,7 @@ function captureModelPayloads(
             finishProviderResponseState(state);
             const summary = finishProviderResponseSummary(initialSummary, state);
             responseSummaries.push(summary);
-            options?.onResponseSummary?.(summary);
+            emitResponseSummary(summary);
           },
         }),
       );

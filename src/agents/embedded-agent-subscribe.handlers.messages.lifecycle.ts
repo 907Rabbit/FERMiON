@@ -147,7 +147,12 @@ export function handleMessageEnd(
   // This is the first normalized response boundary shared by live providers.
   // Observe it before tool execution so evidence cannot be reconstructed from
   // downstream dispatch, and keep the callback experiment-only.
+  ctx.params.onPostResponseCheckpoint?.({ stage: "assistant-message-dispatch-entered" });
+  ctx.params.onPostResponseCounter?.({ name: "message-end-callback" });
+  ctx.params.onPostResponseCheckpoint?.({ stage: "tool-call-extraction-entered" });
   ctx.params.onAssistantMessage?.(msg);
+  ctx.params.onPostResponseCheckpoint?.({ stage: "tool-call-extraction-complete" });
+  ctx.params.onPostResponseCheckpoint?.({ stage: "assistant-message-dispatch-complete" });
 
   // Transcript-only messages never reach the provider, so this counts exactly
   // the completed model round trips consumers see as `assistantTurns`.

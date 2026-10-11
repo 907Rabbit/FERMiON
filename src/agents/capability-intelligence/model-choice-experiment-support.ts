@@ -2,9 +2,16 @@ import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { performance } from "node:perf_hooks";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { withEnvAsync } from "../../test-utils/env.js";
 import type { RunEmbeddedAgentParams } from "../embedded-agent-runner/run/params.js";
+import type {
+  PostResponseCheckpoint,
+  PostResponseCounter,
+  PostResponseHeartbeat,
+  PostResponseSnapshot,
+} from "../post-response-liveness.js";
 import type { PreparedRuntimeAcquisitionHeartbeat } from "../prepared-runtime-acquisition-liveness.js";
 import { getBenchmarkRealToolMapping } from "./benchmark-real-tool-mapping.js";
 import {
@@ -327,6 +334,10 @@ export function withSyntheticModelChoiceEnvironment<T>(fn: () => Promise<T>): Pr
 export type ExperimentDiagnostics = {
   checkpoints: V1IExperimentCheckpoint[];
   preparedRuntimeAcquisitionHeartbeats: PreparedRuntimeAcquisitionHeartbeat[];
+  postResponseCheckpoints: PostResponseCheckpoint[];
+  postResponseHeartbeats: PostResponseHeartbeat[];
+  postResponseSnapshots: PostResponseSnapshot[];
+  postResponseCounters: PostResponseCounter[];
   readFailure: () => V1IRequestPreparationDiagnostics["failure"];
   hooks: NonNullable<RunEmbeddedAgentParams["capabilityIntelligenceExperiment"]>;
 };
@@ -334,6 +345,10 @@ export type ExperimentDiagnostics = {
 export function createExperimentDiagnostics(): ExperimentDiagnostics {
   const checkpoints: V1IExperimentCheckpoint[] = [];
   const preparedRuntimeAcquisitionHeartbeats: PreparedRuntimeAcquisitionHeartbeat[] = [];
+  const postResponseCheckpoints: PostResponseCheckpoint[] = [];
+  const postResponseHeartbeats: PostResponseHeartbeat[] = [];
+  const postResponseSnapshots: PostResponseSnapshot[] = [];
+  const postResponseCounters: PostResponseCounter[] = [];
   const startedAt = performance.now();
   let failure: V1IRequestPreparationDiagnostics["failure"];
   const hooks: NonNullable<RunEmbeddedAgentParams["capabilityIntelligenceExperiment"]> = {
@@ -352,10 +367,30 @@ export function createExperimentDiagnostics(): ExperimentDiagnostics {
     onPreparedRuntimeAcquisitionHeartbeat: (heartbeat) => {
       preparedRuntimeAcquisitionHeartbeats.push(heartbeat);
     },
+    onPostResponseCheckpoint: (checkpoint) => {
+      postResponseCheckpoints.push({
+        ...checkpoint,
+        observedAt: new Date().toISOString(),
+        elapsedMs: Math.round(performance.now() - startedAt),
+      });
+    },
+    onPostResponseHeartbeat: (heartbeat) => {
+      postResponseHeartbeats.push(heartbeat);
+    },
+    onPostResponseSnapshot: (snapshot) => {
+      postResponseSnapshots.push(snapshot);
+    },
+    onPostResponseCounter: (counter) => {
+      postResponseCounters.push(counter);
+    },
   };
   return {
     checkpoints,
     preparedRuntimeAcquisitionHeartbeats,
+    postResponseCheckpoints,
+    postResponseHeartbeats,
+    postResponseSnapshots,
+    postResponseCounters,
     readFailure: () => failure,
     hooks,
   };

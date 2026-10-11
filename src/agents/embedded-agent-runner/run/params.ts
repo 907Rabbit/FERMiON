@@ -54,6 +54,12 @@ import type { ExpectedAgentHarnessRuntimeArtifact } from "../../harness/runtime-
 import type { AgentInternalEvent } from "../../internal-events.js";
 import type { PreparedModelThinkingCapability } from "../../model-catalog-lookup.js";
 import type {
+  PostResponseCheckpoint,
+  PostResponseCounter,
+  PostResponseHeartbeat,
+  PostResponseSnapshot,
+} from "../../post-response-liveness.js";
+import type {
   PreparedRuntimeAcquisitionCheckpoint,
   PreparedRuntimeAcquisitionHeartbeat,
 } from "../../prepared-runtime-acquisition-liveness.js";
@@ -119,6 +125,10 @@ export type EmbeddedCapabilityIntelligenceExperimentHooks = {
     representativeToolNames: readonly string[];
   }) => void;
   onPreparedRuntimeAcquisitionHeartbeat?: (heartbeat: PreparedRuntimeAcquisitionHeartbeat) => void;
+  onPostResponseCheckpoint?: (checkpoint: PostResponseCheckpoint) => void;
+  onPostResponseHeartbeat?: (heartbeat: PostResponseHeartbeat) => void;
+  onPostResponseSnapshot?: (snapshot: PostResponseSnapshot) => void;
+  onPostResponseCounter?: (counter: PostResponseCounter) => void;
   onRequestPreparationError?: (input: { error: unknown; stage: string }) => void;
   onProviderRequest?: (input: { payload: unknown; model: unknown }) => void | Promise<void>;
   onProviderResponse?: (input: { response: unknown; model: unknown }) => void | Promise<void>;

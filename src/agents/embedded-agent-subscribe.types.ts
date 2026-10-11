@@ -23,6 +23,11 @@ import type {
   ToolResultFormat,
 } from "./embedded-agent-subscribe.shared-types.js";
 import type { AgentInternalEvent } from "./internal-events.js";
+import type {
+  PostResponseCheckpoint,
+  PostResponseCounter,
+  PostResponseSnapshot,
+} from "./post-response-liveness.js";
 import type { AgentMessage } from "./runtime/index.js";
 import type { AgentSession } from "./sessions/index.js";
 export type { BlockReplyChunking } from "./embedded-agent-subscribe.shared-types.js";
@@ -59,6 +64,9 @@ export type SubscribeEmbeddedAgentSessionParams = {
   onAgentToolResult?: (event: { toolName: string; result: unknown; isError: boolean }) => void;
   /** Experiment-only observer for the normalized assistant response before tool execution. */
   onAssistantMessage?: (message: AssistantMessage) => void;
+  onPostResponseCheckpoint?: (checkpoint: PostResponseCheckpoint) => void;
+  onPostResponseSnapshot?: (snapshot: PostResponseSnapshot) => void;
+  onPostResponseCounter?: (counter: PostResponseCounter) => void;
   observeToolTerminal?: EmbeddedRunAttemptParams["observeToolTerminal"];
   onReasoningStream?: (payload: ReasoningStreamPayload) => void | Promise<void>;
   /** Expands window reasoning beyond "stream" mode for callers with their own display gate. */

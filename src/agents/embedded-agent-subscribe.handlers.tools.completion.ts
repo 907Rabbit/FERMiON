@@ -221,6 +221,13 @@ export async function handleToolExecutionEnd(
       ? createToolValidationErrorSummary(toolName)
       : undefined;
   const endedAt = Date.now();
+  ctx.params.onPostResponseCheckpoint?.({
+    stage: "terminal-observation-entered",
+    toolCallId,
+    toolName,
+    ...(evt.executionId ? { executionId: evt.executionId } : {}),
+  });
+  ctx.params.onPostResponseCounter?.({ name: "terminal-callback" });
   const terminal = (ctx.params.observeToolTerminal ?? resolveFallbackToolTerminalObserver(ctx))({
     toolCallId,
     ...((evt.executionId ?? startData?.executionId)
@@ -431,6 +438,12 @@ export async function handleToolExecutionEnd(
       ...(toolErrorSummary ? { toolErrorSummary } : {}),
       ...(hideFromChannelProgress ? { hideFromChannelProgress: true } : {}),
     },
+  });
+  ctx.params.onPostResponseCheckpoint?.({
+    stage: "terminal-observation-complete",
+    toolCallId,
+    toolName,
+    ...(evt.executionId ? { executionId: evt.executionId } : {}),
   });
   const itemId = buildToolItemId(toolCallId);
   const itemData: AgentItemEventData = {

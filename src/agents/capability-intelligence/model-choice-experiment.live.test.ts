@@ -1,7 +1,10 @@
 /* oxlint-disable max-lines -- v1I live/offline evidence paths share one frozen harness. */
+import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { configureAiTransportHost, getAiTransportHost } from "@openclaw/ai";
 import { describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
@@ -167,9 +170,51 @@ class V1ISmokeEvidenceError extends Error {
 }
 
 const SMOKE_TEST = LIVE && process.env.OPENCLAW_V1I_SMOKE_TEST === "1";
-const describeFullLive = LIVE && !SMOKE_TEST ? describe : describe.skip;
+const DIAGNOSTIC_TEST = LIVE && process.env.OPENCLAW_V1I_DIAGNOSTIC_TEST === "1";
+const describeFullLive = LIVE && !SMOKE_TEST && !DIAGNOSTIC_TEST ? describe : describe.skip;
 const describeSmokeLive = SMOKE_TEST ? describe : describe.skip;
+const describeDiagnosticLive = DIAGNOSTIC_TEST ? describe : describe.skip;
 const LIVE_MODE = resolveV1IMode(LIVE, process.env.OPENCLAW_V1I_MODE);
+
+describe("v1I diagnostic resource resolution", () => {
+  it("resolves the production state schema independently of CWD and artifact location", async () => {
+    const previousArtifactDir = process.env.OPENCLAW_V1I_DIAGNOSTIC_ARTIFACT_DIR;
+    const unrelatedCwd = fs.mkdtempSync(path.join(os.tmpdir(), "v1i-schema-cwd-"));
+    const artifactDir = fs.mkdtempSync(path.join(os.tmpdir(), "v1i-schema-artifact-"));
+    const schemaPath = fileURLToPath(
+      new URL("../../state/openclaw-state-schema.sql", import.meta.url),
+    );
+    const expectedSchema = fs.readFileSync(schemaPath, "utf8");
+    const expectedHash = createHash("sha256").update(expectedSchema).digest("hex");
+    const schemaModuleUrl = pathToFileURL(
+      fileURLToPath(new URL("../../state/openclaw-state-schema.ts", import.meta.url)),
+    ).href;
+    const tsxLoader = pathToFileURL(path.resolve("node_modules/tsx/dist/loader.mjs")).href;
+    const probe = [
+      `const { createHash } = await import("node:crypto");`,
+      `const schema = await import(${JSON.stringify(schemaModuleUrl)});`,
+      `process.stdout.write(createHash("sha256").update(schema.OPENCLAW_STATE_SCHEMA_SQL).digest("hex"));`,
+    ].join(" ");
+    const readSchemaHash = (cwd: string): string =>
+      execFileSync(process.execPath, ["--import", tsxLoader, "--input-type=module", "-e", probe], {
+        cwd,
+        encoding: "utf8",
+      }).trim();
+    try {
+      process.env.OPENCLAW_V1I_DIAGNOSTIC_ARTIFACT_DIR = artifactDir;
+      expect(readSchemaHash(unrelatedCwd)).toBe(expectedHash);
+      expect(readSchemaHash(artifactDir)).toBe(expectedHash);
+    } finally {
+      if (previousArtifactDir === undefined) {
+        delete process.env.OPENCLAW_V1I_DIAGNOSTIC_ARTIFACT_DIR;
+      } else {
+        process.env.OPENCLAW_V1I_DIAGNOSTIC_ARTIFACT_DIR = previousArtifactDir;
+      }
+      fs.rmSync(unrelatedCwd, { recursive: true, force: true });
+      fs.rmSync(artifactDir, { recursive: true, force: true });
+    }
+  });
+});
 
 describe("v1I model-choice experiment preparation", () => {
   it("keeps both experimental surfaces explicit and diagnostic-only", () => {
@@ -1096,6 +1141,174 @@ describe("v1I smoke timeout controls", () => {
     });
     expect(performance.now() - startedAt).toBeLessThan(1_000);
   });
+});
+
+describeDiagnosticLive("v1I model-choice diagnostic", () => {
+  it(
+    "runs one non-formal synthetic diagnostic cell with durable checkpoints",
+    { timeout: 600_000 },
+    async () => {
+      expect(LIVE_MODE).toBe("synthetic");
+      expect(ACTIVE_FILTERING_ENABLED).toBe(false);
+      const diagnosticRootValue = process.env.OPENCLAW_V1I_DIAGNOSTIC_ARTIFACT_DIR;
+      if (!diagnosticRootValue) {
+        throw new Error("OPENCLAW_V1I_DIAGNOSTIC_ARTIFACT_DIR is required");
+      }
+      const diagnosticRoot = path.resolve(diagnosticRootValue);
+      if (diagnosticRoot.includes("v1i-formal-60fe82b1-real-exact-run1")) {
+        throw new Error("diagnostic artifact must not be the formal REAL_EXACT artifact");
+      }
+      if (fs.existsSync(diagnosticRoot) && fs.readdirSync(diagnosticRoot).length > 0) {
+        throw new Error(`diagnostic artifact directory must be fresh: ${diagnosticRoot}`);
+      }
+      fs.mkdirSync(diagnosticRoot, { recursive: true });
+      const benchmarkCase = TOOL_RANKING_HELD_OUT_CASES.find(
+        (entry) => entry.id === "file-write-notes",
+      );
+      if (!benchmarkCase) {
+        throw new Error("file-write-notes benchmark case is missing");
+      }
+      const journal = createV1IAttemptCheckpointJournal({
+        root: diagnosticRoot,
+        attemptId: v1IAttemptId("SYNTHETIC", benchmarkCase.id, "B", 3, 1),
+        caseId: benchmarkCase.id,
+        arm: "B",
+        replicate: 3,
+        attemptIndex: 1,
+      });
+      journal.record("attempt-initialized");
+      fs.writeFileSync(
+        path.join(diagnosticRoot, "diagnostic-manifest.json"),
+        `${JSON.stringify(
+          {
+            diagnosticOnly: true,
+            harnessCommit: HARNESS_COMMIT,
+            caseId: benchmarkCase.id,
+            arm: "B",
+            replicate: 3,
+            attempt: 1,
+            model: MODEL_ID,
+            provider: PROVIDER,
+            contextLength: CONTEXT_LENGTH,
+            modelConfigHash: hashV1ICanonical(modelConfigIdentity()),
+            activeFilteringEnabled: false,
+          },
+          null,
+          2,
+        )}\n`,
+      );
+      const workspaceDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-v1i-diagnostic-"));
+      const config = buildLiveConfig(workspaceDir);
+      const requestBodies: Record<string, unknown>[] = [];
+      const assistantToolCalls: Array<{ name: string; id: string }> = [];
+      let observation: ExperimentRun | undefined;
+      let failure: unknown;
+      try {
+        journal.record("model-discovery-start");
+        await assertLiveModelAvailable();
+        journal.record("model-discovery-complete");
+        journal.record("workspace-session-prep-start");
+        journal.record("workspace-session-prep-complete");
+        observation = await runOne({
+          mode: "synthetic",
+          surfaceMode: "SYNTHETIC",
+          benchmarkCase,
+          mappingClass: "SYNTHETIC",
+          authorizedNames: benchmarkCase.tools.map((tool) => tool.name),
+          v1cTop8: rankTop8(benchmarkCase.tools, benchmarkCase.query),
+          arm: "B",
+          replicate: 3,
+          attempt: 1,
+          scheduleSeed: scheduleSeedFor(benchmarkCase.id, 3),
+          config,
+          workspaceDir,
+          timeoutMs: 120_000,
+          attemptCheckpointJournal: journal,
+          requestCapture: {
+            onRequestCaptured: (request) => requestBodies.push(request.body),
+            onAssistantMessage: (message) => {
+              for (const block of message.content) {
+                if (block.type === "toolCall") {
+                  assistantToolCalls.push({ name: block.name, id: block.id });
+                }
+              }
+            },
+          },
+        });
+      } catch (error) {
+        failure = error;
+        fs.writeFileSync(
+          path.join(diagnosticRoot, "diagnostic-invalid.json"),
+          `${JSON.stringify(
+            {
+              valid: false,
+              invalidReason: "HARNESS_ERROR",
+              experimentLevelFailureClass: "HARNESS_ERROR",
+              rawErrorName: error instanceof Error ? error.name : "NonErrorThrown",
+              rawErrorMessage: error instanceof Error ? error.message : String(error),
+              recordedAt: new Date().toISOString(),
+            },
+            null,
+            2,
+          )}\n`,
+        );
+      } finally {
+        fs.rmSync(workspaceDir, { recursive: true, force: true });
+      }
+      const checkpointPath = path.join(diagnosticRoot, "attempt-checkpoints.jsonl");
+      const checkpoints = fs
+        .readFileSync(checkpointPath, "utf8")
+        .trim()
+        .split(/\r?\n/)
+        .filter(Boolean)
+        .map((line) => JSON.parse(line) as { stage: string });
+      const diagnosticResult = {
+        diagnosticOnly: true,
+        harnessCommit: HARNESS_COMMIT,
+        caseId: benchmarkCase.id,
+        arm: "B",
+        replicate: 3,
+        model: MODEL_ID,
+        provider: PROVIDER,
+        contextLength: CONTEXT_LENGTH,
+        modelConfigHash: hashV1ICanonical(modelConfigIdentity()),
+        activeFilteringEnabled: false,
+        status: failure ? "FAILED" : observation?.valid ? "COMPLETED" : "COMPLETED_INVALID",
+        checkpointSequence: checkpoints.map((checkpoint) => checkpoint.stage),
+        lastDurableCheckpoint: checkpoints.at(-1)?.stage ?? null,
+        timeoutArmed: checkpoints.some((checkpoint) => checkpoint.stage === "timeout-armed"),
+        timeoutFired: checkpoints.some((checkpoint) => checkpoint.stage === "timeout-fired"),
+        abortRequested: checkpoints.some((checkpoint) => checkpoint.stage === "abort-requested"),
+        abortObserved: checkpoints.some((checkpoint) => checkpoint.stage === "abort-observed"),
+        modelRequestSent: requestBodies.length > 0,
+        providerResponseReceived: checkpoints.some(
+          (checkpoint) => checkpoint.stage === "provider-response-received",
+        ),
+        toolCallNames: assistantToolCalls.map((call) => call.name),
+        toolCallIds: assistantToolCalls.map((call) => call.id),
+        executedToolSequence: observation?.executedToolSequence ?? [],
+        rankingEpoch: observation?.rankingEpoch ?? null,
+        correlationStatus: observation?.correlationStatus ?? null,
+        terminalObserved: checkpoints.some(
+          (checkpoint) => checkpoint.stage === "terminal-observed",
+        ),
+        terminalSuccess: observation?.terminalSuccess ?? null,
+        invalidReason: observation?.invalidReason ?? (failure ? "HARNESS_ERROR" : null),
+        rawRuntimeStatus:
+          observation?.requestPreparationDiagnostics.normalizedRuntimeStatus ?? null,
+        originalErrorName: failure instanceof Error ? failure.name : null,
+        originalErrorMessage: failure instanceof Error ? failure.message : null,
+        artifactSerialization: "PASS",
+      };
+      fs.writeFileSync(
+        path.join(diagnosticRoot, "diagnostic-result.json"),
+        `${JSON.stringify(diagnosticResult, null, 2)}\n`,
+      );
+      if (failure) {
+        throw failure;
+      }
+    },
+  );
 });
 
 describeFullLive("v1I model-choice experiment live", () => {

@@ -87,13 +87,21 @@ type CapturedModelRequest = {
 };
 
 type ProviderResponseSummary = {
+  responseClass: string;
+  responseObjectType: string | null;
+  responseId: string | null;
+  responseModel: string | null;
   responseShape: string;
   finishReason: string | null;
+  messageRole: string | null;
   contentPresent: boolean;
   contentLength: number;
+  toolCallFieldPresent: boolean;
   toolCallCount: number;
   toolCallNames: string[];
+  functionCallFieldPresent: boolean;
   outputItemTypes: string[];
+  responseEventTypes: string[];
   parserOutcome: string;
   httpStatus: number | null;
   contentType: string | null;
@@ -102,6 +110,15 @@ type ProviderResponseSummary = {
 type SerializedSmokeError = {
   name: string;
   message: string;
+};
+
+type ProviderSummaryWriteDiagnostics = {
+  providerSummaryPath: string;
+  providerSummaryWriteAttempted: boolean;
+  providerSummaryWriteCompleted: boolean;
+  providerSummaryCallbackInvocations: number;
+  providerSummaryWriteErrorName: string | null;
+  providerSummaryWriteErrorMessage: string | null;
 };
 
 type ExperimentRun = V1IObservation;
@@ -127,6 +144,13 @@ class V1ISmokeValidityError extends Error {
   constructor(readonly validityReason: string) {
     super(`v1I smoke validity failed: ${validityReason}`);
     this.name = "V1ISmokeValidityError";
+  }
+}
+
+class V1ISmokeEvidenceError extends Error {
+  constructor(readonly evidenceReason: string) {
+    super(`v1I smoke evidence failed: ${evidenceReason}`);
+    this.name = "V1ISmokeEvidenceError";
   }
 }
 
@@ -239,6 +263,10 @@ describe("v1I harness evidence repair", () => {
     expect(noTool.finishReason).toBe("stop");
     expect(noTool.contentPresent).toBe(true);
     expect(noTool.contentLength).toBe(4);
+    expect(noTool.messageRole).toBeNull();
+    expect(noTool.toolCallFieldPresent).toBe(false);
+    expect(noTool.functionCallFieldPresent).toBe(false);
+    expect(noTool.responseEventTypes).toEqual([]);
     expect(noTool.toolCallCount).toBe(0);
 
     const toolCall = await captureProviderSummaryForFixture(
@@ -249,6 +277,8 @@ describe("v1I harness evidence repair", () => {
       ].join("\n\n"),
     );
     expect(toolCall.parserOutcome).toBe("tool-call-complete");
+    expect(toolCall.toolCallFieldPresent).toBe(true);
+    expect(toolCall.functionCallFieldPresent).toBe(true);
     expect(toolCall.toolCallCount).toBe(1);
     expect(toolCall.toolCallNames).toEqual(["git_diff"]);
   });
@@ -318,12 +348,16 @@ describe("v1I harness evidence repair", () => {
       }
       const response = await hostFetch(`${LM_STUDIO_BASE_URL}/chat/completions`, {
         method: "POST",
-        body: JSON.stringify({ tools: [{ function: { name: "git_status" } }] }),
+        body: new TextEncoder().encode(
+          JSON.stringify({ tools: [{ function: { name: "git_status" } }] }),
+        ),
       });
       await response.text();
       expect(summaries.at(-1)).toMatchObject({
         parserOutcome: "tool-call-complete",
         toolCallNames: ["git_status"],
+        toolCallFieldPresent: true,
+        functionCallFieldPresent: true,
       });
     } finally {
       configureAiTransportHost(previousHost);
@@ -341,16 +375,23 @@ describe("v1I harness evidence repair", () => {
           "data: [DONE]",
         ].join("\n\n"),
       );
-      fs.writeFileSync(
+      const writeResult = writeSmokeProviderResponseSummary(
         path.join(smokeRoot, "smoke-provider-response.json"),
-        `${JSON.stringify({ summaries: [summary] }, null, 2)}\n`,
+        [summary],
       );
+      expect(writeResult.providerSummaryWriteAttempted).toBe(true);
+      expect(writeResult.providerSummaryWriteCompleted).toBe(true);
       writeSmokeInvalidArtifact({
         smokeRoot,
         error: new V1ISmokeValidityError("AUTHORIZED_SURFACE_DRIFT"),
         lastSuccessfulCheckpoint: "terminal-observed",
         harnessCommit: HARNESS_COMMIT,
         modelConfigHash: hashV1ICanonical(modelConfigIdentity()),
+        providerSummaryWrite: {
+          providerSummaryPath: path.join(smokeRoot, "smoke-provider-response.json"),
+          ...writeResult,
+          providerSummaryCallbackInvocations: 1,
+        },
       });
       expect(fs.existsSync(path.join(smokeRoot, "smoke-provider-response.json"))).toBe(true);
       expect(
@@ -367,6 +408,19 @@ describe("v1I harness evidence repair", () => {
     } finally {
       fs.rmSync(smokeRoot, { recursive: true, force: true });
     }
+  });
+
+  it("records explicit provider-summary write failures", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "v1i-summary-write-failure-"));
+    fs.rmSync(root, { recursive: true, force: true });
+    const writeResult = writeSmokeProviderResponseSummary(
+      path.join(root, "smoke-provider-response.json"),
+      [],
+    );
+    expect(writeResult.providerSummaryWriteAttempted).toBe(true);
+    expect(writeResult.providerSummaryWriteCompleted).toBe(false);
+    expect(writeResult.providerSummaryWriteErrorName).toBeTruthy();
+    expect(writeResult.providerSummaryWriteErrorMessage).toBeTruthy();
   });
 
   it("retains duplicate tool executions for accounting instead of normalizing them away", () => {
@@ -461,6 +515,14 @@ describeSmokeLive("v1I model-choice experiment smoke", () => {
         appendV1ISmokeCheckpoint(smokeRoot, { stage, ...details });
       };
       const cleanupErrors: SerializedSmokeError[] = [];
+      const providerSummaryWrite: ProviderSummaryWriteDiagnostics = {
+        providerSummaryPath: path.join(smokeRoot, "smoke-provider-response.json"),
+        providerSummaryWriteAttempted: false,
+        providerSummaryWriteCompleted: false,
+        providerSummaryCallbackInvocations: 0,
+        providerSummaryWriteErrorName: null,
+        providerSummaryWriteErrorMessage: null,
+      };
       recordCheckpoint("manifest-written", { harnessCommit: HARNESS_COMMIT });
       try {
         await runV1ISmokeStage({
@@ -496,10 +558,23 @@ describeSmokeLive("v1I model-choice experiment smoke", () => {
               requestCapture: {
                 onResponseSummary: (summary) => {
                   responseSummaries.push(summary);
-                  fs.writeFileSync(
-                    path.join(smokeRoot, "smoke-provider-response.json"),
-                    `${JSON.stringify({ summaries: responseSummaries }, null, 2)}\n`,
+                  providerSummaryWrite.providerSummaryCallbackInvocations += 1;
+                  const writeResult = writeSmokeProviderResponseSummary(
+                    providerSummaryWrite.providerSummaryPath,
+                    responseSummaries,
                   );
+                  Object.assign(providerSummaryWrite, writeResult);
+                  if (!writeResult.providerSummaryWriteCompleted) {
+                    recordCheckpoint("provider-response-summary-write-failed", {
+                      providerSummaryPath: providerSummaryWrite.providerSummaryPath,
+                      providerSummaryWriteAttempted:
+                        providerSummaryWrite.providerSummaryWriteAttempted,
+                      providerSummaryWriteErrorName:
+                        providerSummaryWrite.providerSummaryWriteErrorName,
+                      providerSummaryWriteErrorMessage:
+                        providerSummaryWrite.providerSummaryWriteErrorMessage,
+                    });
+                  }
                   recordCheckpoint(
                     summary.parserOutcome === "body-pending"
                       ? "provider-response-body-pending"
@@ -509,9 +584,16 @@ describeSmokeLive("v1I model-choice experiment smoke", () => {
                       finishReason: summary.finishReason,
                       contentPresent: summary.contentPresent,
                       contentLength: summary.contentLength,
+                      responseObjectType: summary.responseObjectType,
+                      responseId: summary.responseId,
+                      responseModel: summary.responseModel,
+                      messageRole: summary.messageRole,
+                      toolCallFieldPresent: summary.toolCallFieldPresent,
                       toolCallCount: summary.toolCallCount,
                       toolCallNames: summary.toolCallNames,
+                      functionCallFieldPresent: summary.functionCallFieldPresent,
                       outputItemTypes: summary.outputItemTypes,
+                      responseEventTypes: summary.responseEventTypes,
                       parserOutcome: summary.parserOutcome,
                     },
                   );
@@ -558,19 +640,30 @@ describeSmokeLive("v1I model-choice experiment smoke", () => {
             cleanupErrors.push(serializeSmokeError(error));
           }
         }
+        const evidenceFailure = providerSummaryWrite.providerSummaryWriteCompleted
+          ? undefined
+          : new V1ISmokeEvidenceError(
+              providerSummaryWrite.providerSummaryCallbackInvocations === 0
+                ? "PROVIDER_RESPONSE_SUMMARY_MISSING"
+                : "PROVIDER_RESPONSE_SUMMARY_WRITE_FAILED",
+            );
         const result = {
-          status: observation.valid ? "PASS" : "FAIL",
+          status: observation.valid && !evidenceFailure ? "PASS" : "FAIL",
           harnessCommit: HARNESS_COMMIT,
           modelConfigHash: smokeManifest.modelConfigHash,
           activeFilteringEnabled: false,
           observationValid: observation.valid,
           rankingEpoch: observation.rankingEpoch,
           cleanupErrors,
+          ...providerSummaryWrite,
         };
         fs.writeFileSync(
           path.join(smokeRoot, "smoke-result.json"),
           `${JSON.stringify(result, null, 2)}\n`,
         );
+        if (evidenceFailure) {
+          throw evidenceFailure;
+        }
         if (!observation.valid) {
           throw new V1ISmokeValidityError(observation.invalidReason ?? "UNKNOWN_VALIDITY_ERROR");
         }
@@ -582,6 +675,7 @@ describeSmokeLive("v1I model-choice experiment smoke", () => {
           harnessCommit: HARNESS_COMMIT,
           modelConfigHash: smokeManifest.modelConfigHash,
           cleanupErrors,
+          providerSummaryWrite,
         });
         throw error;
       }
@@ -605,6 +699,34 @@ function recordSmokeTimeout(smokeRoot: string, error: V1ISmokeTimeoutError): voi
   });
 }
 
+function writeSmokeProviderResponseSummary(
+  providerSummaryPath: string,
+  summaries: readonly ProviderResponseSummary[],
+): Pick<
+  ProviderSummaryWriteDiagnostics,
+  | "providerSummaryWriteAttempted"
+  | "providerSummaryWriteCompleted"
+  | "providerSummaryWriteErrorName"
+  | "providerSummaryWriteErrorMessage"
+> {
+  try {
+    fs.writeFileSync(providerSummaryPath, `${JSON.stringify({ summaries }, null, 2)}\n`);
+    return {
+      providerSummaryWriteAttempted: true,
+      providerSummaryWriteCompleted: true,
+      providerSummaryWriteErrorName: null,
+      providerSummaryWriteErrorMessage: null,
+    };
+  } catch (error) {
+    return {
+      providerSummaryWriteAttempted: true,
+      providerSummaryWriteCompleted: false,
+      providerSummaryWriteErrorName: error instanceof Error ? error.name : "NonErrorThrown",
+      providerSummaryWriteErrorMessage: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
 function writeSmokeInvalidArtifact(input: {
   smokeRoot: string;
   error: unknown;
@@ -612,22 +734,30 @@ function writeSmokeInvalidArtifact(input: {
   harnessCommit: string;
   modelConfigHash: string;
   cleanupErrors?: readonly SerializedSmokeError[];
+  providerSummaryWrite?: ProviderSummaryWriteDiagnostics;
 }): void {
   const timeout = input.error instanceof V1ISmokeTimeoutError ? input.error : undefined;
   const validity = input.error instanceof V1ISmokeValidityError ? input.error : undefined;
+  const evidence = input.error instanceof V1ISmokeEvidenceError ? input.error : undefined;
   const rawErrorName = input.error instanceof Error ? input.error.name : "NonErrorThrown";
   const rawErrorMessage = input.error instanceof Error ? input.error.message : String(input.error);
   const invalid = {
     valid: false,
     invalidReason: timeout
       ? "INFRASTRUCTURE_TIMEOUT"
-      : (validity?.validityReason ?? "HARNESS_ERROR"),
+      : evidence
+        ? evidence.evidenceReason
+        : (validity?.validityReason ?? "HARNESS_ERROR"),
     experimentLevelFailureClass: timeout
       ? "INFRASTRUCTURE_TIMEOUT"
-      : validity
-        ? "VALIDITY_ERROR"
-        : "HARNESS_ERROR",
-    failureStage: timeout?.timeoutStage ?? (validity ? "validity" : "smoke-harness"),
+      : evidence
+        ? "EVIDENCE_ARTIFACT_FAILURE"
+        : validity
+          ? "VALIDITY_ERROR"
+          : "HARNESS_ERROR",
+    failureStage:
+      timeout?.timeoutStage ??
+      (evidence ? "evidence-artifact" : validity ? "validity" : "smoke-harness"),
     validityReason: validity?.validityReason ?? null,
     rawErrorName,
     rawErrorMessage,
@@ -636,6 +766,7 @@ function writeSmokeInvalidArtifact(input: {
     harnessCommit: input.harnessCommit,
     modelConfigHash: input.modelConfigHash,
     cleanupErrors: input.cleanupErrors ?? [],
+    providerSummaryWrite: input.providerSummaryWrite ?? null,
     recordedAt: new Date().toISOString(),
   };
   fs.writeFileSync(
@@ -1784,6 +1915,29 @@ function abortReason(signal: AbortSignal | undefined): Error {
     : new DOMException("The operation was aborted", "AbortError");
 }
 
+async function readCapturedFetchBody(
+  input: RequestInfo | URL,
+  init: RequestInit | undefined,
+): Promise<string | undefined> {
+  const body = init?.body;
+  if (typeof body === "string") {
+    return body;
+  }
+  if (body instanceof Uint8Array) {
+    return new TextDecoder().decode(body);
+  }
+  if (body instanceof ArrayBuffer) {
+    return new TextDecoder().decode(new Uint8Array(body));
+  }
+  if (ArrayBuffer.isView(body)) {
+    return new TextDecoder().decode(new Uint8Array(body.buffer, body.byteOffset, body.byteLength));
+  }
+  if (input instanceof Request) {
+    return await input.clone().text();
+  }
+  return undefined;
+}
+
 function captureModelPayloads(
   hooks?: NonNullable<RunEmbeddedAgentParams["capabilityIntelligenceExperiment"]>,
   options?: {
@@ -1803,8 +1957,7 @@ function captureModelPayloads(
     return async (input, init) => {
       const url =
         typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
-      const body =
-        init?.body ?? (input instanceof Request ? await input.clone().text() : undefined);
+      const body = await readCapturedFetchBody(input, init);
       const isProviderRequest =
         (url.startsWith(LM_STUDIO_BASE_URL) ||
           url.includes("/chat/completions") ||
@@ -1928,11 +2081,18 @@ type ProviderResponseSummaryState = {
   buffer: string;
   sse: boolean;
   shapes: Set<string>;
+  responseObjectType: string | null;
+  responseId: string | null;
+  responseModel: string | null;
   finishReason: string | null;
+  messageRole: string | null;
   contentPresent: boolean;
   contentLength: number;
+  toolCallFieldPresent: boolean;
   toolCalls: Map<string, string>;
+  functionCallFieldPresent: boolean;
   outputItemTypes: Set<string>;
+  responseEventTypes: Set<string>;
   sawTerminal: boolean;
   parseErrors: number;
 };
@@ -1946,11 +2106,18 @@ function createResponseSummaryState(
     buffer: "",
     sse: contentType?.toLowerCase().includes("text/event-stream") ?? false,
     shapes: new Set(),
+    responseObjectType: null,
+    responseId: null,
+    responseModel: null,
     finishReason: null,
+    messageRole: null,
     contentPresent: false,
     contentLength: 0,
+    toolCallFieldPresent: false,
     toolCalls: new Map(),
+    functionCallFieldPresent: false,
     outputItemTypes: new Set(),
+    responseEventTypes: new Set(),
     sawTerminal: false,
     parseErrors: 0,
   };
@@ -1958,15 +2125,25 @@ function createResponseSummaryState(
 
 function createPendingProviderResponseSummary(response: Response): ProviderResponseSummary {
   return {
+    responseClass: response.headers.get("content-type")?.includes("event-stream")
+      ? "streaming"
+      : "non-streaming",
+    responseObjectType: null,
+    responseId: null,
+    responseModel: null,
     responseShape: response.headers.get("content-type")?.includes("event-stream")
       ? "sse"
       : "unknown",
     finishReason: null,
+    messageRole: null,
     contentPresent: false,
     contentLength: 0,
+    toolCallFieldPresent: false,
     toolCallCount: 0,
     toolCallNames: [],
+    functionCallFieldPresent: false,
     outputItemTypes: [],
+    responseEventTypes: [],
     parserOutcome: response.body ? "body-pending" : "empty-body",
     httpStatus: response.status,
     contentType: response.headers.get("content-type"),
@@ -2018,6 +2195,7 @@ function consumeProviderResponseLine(state: ProviderResponseSummaryState, line: 
   const trimmed = line.trim();
   if (trimmed.startsWith("event:")) {
     const eventName = trimmed.slice("event:".length).trim();
+    addStringShape(state.responseEventTypes, eventName);
     if (eventName === "response.completed" || eventName === "response.done") {
       state.sawTerminal = true;
     }
@@ -2046,6 +2224,16 @@ function consumeProviderResponsePayload(state: ProviderResponseSummaryState, val
   const payload = value as Record<string, unknown>;
   addStringShape(state.shapes, payload.object);
   addStringShape(state.shapes, payload.type);
+  if (state.responseObjectType === null) {
+    state.responseObjectType = firstString(payload.object, payload.type);
+  }
+  if (state.responseId === null && typeof payload.id === "string") {
+    state.responseId = payload.id;
+  }
+  if (state.responseModel === null && typeof payload.model === "string") {
+    state.responseModel = payload.model;
+  }
+  addStringShape(state.responseEventTypes, payload.type);
   if (payload.type === "response.completed" || payload.type === "response.done") {
     state.sawTerminal = true;
   }
@@ -2061,8 +2249,17 @@ function consumeProviderResponsePayload(state: ProviderResponseSummaryState, val
     }
     const delta = asRecord(choiceRecord.delta) ?? asRecord(choiceRecord.message);
     if (delta) {
+      if (state.messageRole === null && typeof delta.role === "string") {
+        state.messageRole = delta.role;
+      }
       collectProviderResponseContent(state, delta.content);
       collectProviderResponseToolCalls(state, delta.tool_calls);
+    }
+    if (Object.hasOwn(choiceRecord, "message")) {
+      const message = asRecord(choiceRecord.message);
+      if (state.messageRole === null && typeof message?.role === "string") {
+        state.messageRole = message.role;
+      }
     }
   }
   collectProviderResponseContent(state, payload.content);
@@ -2070,6 +2267,9 @@ function consumeProviderResponsePayload(state: ProviderResponseSummaryState, val
   collectProviderResponseToolCalls(state, payload.tool_calls);
   const item = asRecord(payload.item);
   if (item) {
+    if (state.messageRole === null && typeof item.role === "string") {
+      state.messageRole = item.role;
+    }
     addStringShape(state.outputItemTypes, item.type);
     collectProviderResponseContent(state, item.content);
     collectProviderResponseToolCalls(state, item.tool_calls);
@@ -2098,12 +2298,18 @@ function collectProviderResponseToolCalls(
   state: ProviderResponseSummaryState,
   value: unknown,
 ): void {
+  if (value !== undefined) {
+    state.toolCallFieldPresent = true;
+  }
   if (!Array.isArray(value)) {
     return;
   }
   for (const [index, call] of value.entries()) {
     const record = asRecord(call);
     const functionRecord = record ? asRecord(record.function) : undefined;
+    if (functionRecord) {
+      state.functionCallFieldPresent = true;
+    }
     const name =
       (functionRecord && typeof functionRecord.name === "string" && functionRecord.name) ||
       (record && typeof record.name === "string" && record.name) ||
@@ -2130,13 +2336,20 @@ function finishProviderResponseSummary(
   const toolCallNames = [...state.toolCalls.values()];
   return {
     ...initial,
+    responseObjectType: state.responseObjectType,
+    responseId: state.responseId,
+    responseModel: state.responseModel,
     responseShape: [...state.shapes].join("|") || initial.responseShape,
     finishReason: state.finishReason,
+    messageRole: state.messageRole,
     contentPresent: state.contentPresent,
     contentLength: state.contentLength,
+    toolCallFieldPresent: state.toolCallFieldPresent,
     toolCallCount: toolCallNames.length,
     toolCallNames,
+    functionCallFieldPresent: state.functionCallFieldPresent,
     outputItemTypes: [...state.outputItemTypes],
+    responseEventTypes: [...state.responseEventTypes],
     parserOutcome:
       state.parseErrors > 0
         ? "parse-error"
@@ -2148,6 +2361,10 @@ function finishProviderResponseSummary(
             ? "tool-call-stream-closed-without-terminal"
             : "stream-closed-without-terminal",
   };
+}
+
+function firstString(...values: unknown[]): string | null {
+  return values.find((value): value is string => typeof value === "string") ?? null;
 }
 
 function addStringShape(target: Set<string>, value: unknown): void {

@@ -6,6 +6,7 @@ import { configureAiTransportHost, getAiTransportHost } from "@openclaw/ai";
 import { describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { AssistantMessage } from "../../llm/types.js";
+import { applyTestPluginDefaults } from "../../plugins/config-state.js";
 import type { RunEmbeddedAgentParams } from "../embedded-agent-runner/run/params.js";
 import type { EmbeddedAgentRunResult } from "../embedded-agent-runner/types.js";
 import { resolveAgentRunSessionTarget } from "../run-session-target.js";
@@ -379,6 +380,120 @@ describe("v1I harness evidence repair", () => {
         ["git_diff", "git_status"],
       ),
     ).toBe(true);
+  });
+
+  it("validates REAL_EXACT against the authorized runtime surface, not the synthetic inventory", () => {
+    const authorized = makeRealRuntimeToolSurface();
+    const provider = { tools: authorized };
+    const valid = validateV1IRealSurface({
+      authorizedRuntimeNames: REAL_RUNTIME_TOOL_NAMES,
+      authorizedToolDefinitions: authorized,
+      providerBodies: [provider],
+      requiredTools: ["write"],
+    });
+    expect(valid).toMatchObject({
+      valid: true,
+      authorizedProviderNameSetEqual: true,
+      authorizedProviderSchemaSetEqual: true,
+      orderEqual: true,
+      exactToolPresent: true,
+    });
+    expect(REAL_RUNTIME_TOOL_NAMES).toHaveLength(15);
+    expect(toolNamesFromBody(provider)).toHaveLength(15);
+  });
+
+  it.each([
+    [
+      "missing one authorized tool",
+      (tools: unknown[]) => tools.slice(1),
+      "AUTHORIZED_SURFACE_DRIFT",
+    ],
+    [
+      "adding one unauthorized tool",
+      (tools: unknown[]) => [...tools, makeRealRuntimeTool("unexpected")],
+      "AUTHORIZED_SURFACE_DRIFT",
+    ],
+    [
+      "changing a tool schema",
+      (tools: unknown[]) => [
+        ...tools.slice(0, 1),
+        {
+          ...(tools[1] as Record<string, unknown>),
+          function: { name: "edit", parameters: { type: "string" } },
+        },
+        ...tools.slice(2),
+      ],
+      "SCHEMA_DRIFT",
+    ],
+  ])("rejects REAL_EXACT %s", (_label, mutate, expectedReason) => {
+    const authorized = makeRealRuntimeToolSurface();
+    const providerTools = mutate(authorized);
+    const validation = validateV1IRealSurface({
+      authorizedRuntimeNames: REAL_RUNTIME_TOOL_NAMES,
+      authorizedToolDefinitions: authorized,
+      providerBodies: [{ tools: providerTools }],
+      requiredTools: ["write"],
+    });
+    expect(validation.valid).toBe(false);
+    expect(validation.invalidReason).toBe(expectedReason);
+  });
+
+  it("rejects REAL_EXACT when the required mapped tool is absent from both surfaces", () => {
+    const authorized = makeRealRuntimeToolSurface().filter(
+      (tool) => toolNameFromDefinition(tool) !== "write",
+    );
+    const authorizedNames = REAL_RUNTIME_TOOL_NAMES.filter((name) => name !== "write");
+    const validation = validateV1IRealSurface({
+      authorizedRuntimeNames: authorizedNames,
+      authorizedToolDefinitions: authorized,
+      providerBodies: [{ tools: authorized }],
+      requiredTools: ["write"],
+    });
+    expect(validation).toMatchObject({
+      valid: false,
+      authorizedProviderNameSetEqual: true,
+      authorizedProviderSchemaSetEqual: true,
+      exactToolPresent: false,
+      invalidReason: "EXACT_MAPPED_TOOL_MISSING",
+    });
+  });
+
+  it("accepts provider order changes without treating them as surface drift", () => {
+    const authorized = makeRealRuntimeToolSurface();
+    const validation = validateV1IRealSurface({
+      authorizedRuntimeNames: REAL_RUNTIME_TOOL_NAMES,
+      authorizedToolDefinitions: authorized,
+      providerBodies: [{ tools: authorized.toReversed() }],
+      requiredTools: ["write"],
+    });
+    expect(validation).toMatchObject({
+      valid: true,
+      authorizedProviderNameSetEqual: true,
+      authorizedProviderSchemaSetEqual: true,
+      orderEqual: false,
+    });
+  });
+
+  it("keeps all eight REAL_EXACT mappings on the real runtime surface", () => {
+    const mappingSummary = summarizeBenchmarkRealToolMappings(TOOL_RANKING_HELD_OUT_CASES);
+    const exactCases = mappingSummary.cases.filter((entry) => entry.mappingClass === "EXACT");
+    expect(exactCases).toHaveLength(8);
+    for (const entry of exactCases) {
+      const benchmarkCase = TOOL_RANKING_HELD_OUT_CASES.find(
+        (candidate) => candidate.id === entry.caseId,
+      );
+      expect(benchmarkCase).toBeDefined();
+      const requiredTool = getBenchmarkRealToolMapping(
+        benchmarkCase!.expectedTopTools[0]!,
+      ).realTool;
+      expect(requiredTool).not.toBeNull();
+      const requiredTools = benchmarkCase!.expectedTopTools.flatMap((tool) => {
+        const mapped = getBenchmarkRealToolMapping(tool).realTool;
+        return mapped ? [mapped] : [];
+      });
+      expect(requiredTools.every((tool) => new Set(REAL_RUNTIME_TOOL_NAMES).has(tool))).toBe(true);
+      expect(entry.mappingClass).toBe("EXACT");
+    }
   });
 
   it("canonicalizes tool schema key and array order but detects schema changes", () => {
@@ -1104,6 +1219,13 @@ async function runStratum(input: {
         ? benchmarkCase.tools
         : authorizedNames.map((name) => ({ name, description: `OpenClaw ${name} capability` }));
     const v1cTop8 = rankTop8(v1cTools, benchmarkCase.query);
+    const requiredMappedTools =
+      input.mode === "synthetic"
+        ? []
+        : benchmarkCase.expectedTopTools.flatMap((tool) => {
+            const mapped = getBenchmarkRealToolMapping(tool).realTool;
+            return mapped ? [mapped] : [];
+          });
     for (let replicate = 1; replicate <= 3; replicate += 1) {
       const scheduleSeed = scheduleSeedFor(benchmarkCase.id, replicate);
       for (const arm of orderedArms(scheduleSeed)) {
@@ -1127,6 +1249,7 @@ async function runStratum(input: {
           mappingClass,
           authorizedNames,
           v1cTop8,
+          requiredMappedTools,
           arm,
           replicate,
           attempt:
@@ -1161,6 +1284,7 @@ async function runOne(input: {
   mappingClass: MappingClass;
   authorizedNames: readonly string[];
   v1cTop8: readonly string[];
+  requiredMappedTools?: readonly string[];
   arm: Arm;
   replicate: number;
   attempt: number;
@@ -1451,19 +1575,26 @@ async function runOne(input: {
   const preferredMapping = getBenchmarkRealToolMapping(preferredBenchmarkTool);
   const mappedRealTool =
     input.mode === "synthetic" ? preferredBenchmarkTool : preferredMapping.realTool;
+  const actualV1cTop8 = observedRanking
+    ? observedRanking.rankings.slice(0, 8).map((entry) => entry.name)
+    : input.v1cTop8;
+  const authorizedRuntimeNames = observedRanking?.authorizedNames ?? [];
+  const surfaceValidation = validateV1IRealSurface({
+    authorizedRuntimeNames,
+    providerBodies: requestBodies,
+    requiredTools: input.requiredMappedTools ?? [],
+  });
   const firstExecutedTool = executedToolSequence[0] ?? null;
   const valid =
     completedExecution.status === "completed" &&
     Boolean(observedRanking?.epoch) &&
     requestBodies.length > 0 &&
-    sameSurfaceAcrossRequests(requestBodies) &&
-    sameSurfaceAsExpected(firstBody, input.authorizedNames) &&
-    sameSchemaAcrossRequests(requestBodies) &&
+    surfaceValidation.valid &&
     correlation.status === "PROVABLE";
   const terminalSuccess = completedExecution.result.terminal === "success";
   const preferredToolAuthorized =
-    mappedRealTool !== null && input.authorizedNames.includes(mappedRealTool);
-  const preferredToolInTop8 = mappedRealTool !== null && input.v1cTop8.includes(mappedRealTool);
+    mappedRealTool !== null && authorizedRuntimeNames.includes(mappedRealTool);
+  const preferredToolInTop8 = mappedRealTool !== null && actualV1cTop8.includes(mappedRealTool);
   const preferredToolAttempted =
     mappedRealTool !== null && executedToolSequence.includes(mappedRealTool);
   const substitutionWithoutPreferredAttempt = Boolean(
@@ -1493,14 +1624,14 @@ async function runOne(input: {
     systemPromptHash: sha256(extractSystemPrompt(firstBody)),
     userPromptHash: sha256(input.benchmarkCase.query),
     experimentalInstructionHash: sha256(input.arm === "B" ? ARM_B_INSTRUCTION : ""),
-    authorizedSurfaceHash: hashV1ICanonical(toolNamesFromBody(firstBody).toSorted()),
+    authorizedSurfaceHash: hashV1ICanonical(authorizedRuntimeNames.toSorted()),
     schemaHash: hashV1ICanonical(
       requestBodies.map((body) => sortToolDefinitions(body.tools ?? null)),
     ),
     caseSetHash: frozenCaseSetHash(),
     rankerVersion: SHADOW_RANKER_VERSION,
     qualificationPolicyVersion: SHADOW_QUALIFICATION_POLICY_VERSION,
-    v1cTop8: input.v1cTop8,
+    v1cTop8: actualV1cTop8,
     rankingEpoch: observedRanking?.epoch ?? null,
     selectedTools: completedExecution.result.executedTools.map((tool) => tool.name),
     firstExecutedTool,
@@ -1527,7 +1658,8 @@ async function runOne(input: {
       : describeInvalidRun({
           execution: completedExecution,
           firstBody,
-          expected: input.authorizedNames,
+          authorizedRuntimeNames,
+          requiredTools: input.requiredMappedTools ?? [],
           observedRanking,
           requestBodies,
           correlationStatus: correlation.status,
@@ -1598,6 +1730,10 @@ function buildLiveConfig(workspaceDir: string): OpenClawConfig {
         },
       },
     },
+    plugins: {
+      // Vitest disables implicit plugins; pin the production default for REAL_EXACT parity.
+      slots: { memory: "memory-core" },
+    },
   };
 }
 
@@ -1641,6 +1777,17 @@ function buildOfflineRequestConfig(workspaceDir: string): OpenClawConfig {
 }
 
 describe("v1I offline request preparation", () => {
+  it("preserves the production default memory slot in the live harness", () => {
+    const workspaceDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-v1i-memory-slot-"));
+    try {
+      const config = buildLiveConfig(workspaceDir);
+      expect(config.plugins?.slots?.memory).toBe("memory-core");
+      expect(applyTestPluginDefaults(config).plugins?.slots?.memory).toBe("memory-core");
+    } finally {
+      fs.rmSync(workspaceDir, { recursive: true, force: true });
+    }
+  });
+
   it("completes workspace and session preparation with a fresh roster offline", async () => {
     const workspaceDir = fs.mkdtempSync(
       path.join(os.tmpdir(), "openclaw-v1i-workspace-prep-offline-"),
@@ -2628,9 +2775,89 @@ function serializeSmokeError(error: unknown): SerializedSmokeError {
   };
 }
 
-function sameSurfaceAcrossRequests(bodies: readonly Record<string, unknown>[]): boolean {
-  const first = canonicalizeToolNames(toolNamesFromBody(bodies[0] ?? {}));
-  return bodies.every((body) => canonicalizeToolNames(toolNamesFromBody(body)) === first);
+const REAL_RUNTIME_TOOL_NAMES = [
+  "apply_patch",
+  "edit",
+  "exec",
+  "memory_get",
+  "memory_search",
+  "message",
+  "process",
+  "read",
+  "sessions_history",
+  "sessions_list",
+  "sessions_search",
+  "sessions_spawn",
+  "web_fetch",
+  "web_search",
+  "write",
+] as const;
+
+function makeRealRuntimeTool(name: string): Record<string, unknown> {
+  return {
+    type: "function",
+    function: {
+      name,
+      description: `OpenClaw ${name} capability`,
+      parameters: { type: "object", properties: {} },
+    },
+  };
+}
+
+function makeRealRuntimeToolSurface(): Record<string, unknown>[] {
+  return REAL_RUNTIME_TOOL_NAMES.map(makeRealRuntimeTool);
+}
+
+type V1IRealSurfaceValidation = {
+  valid: boolean;
+  authorizedProviderNameSetEqual: boolean;
+  authorizedProviderSchemaSetEqual: boolean;
+  providerSchemaStable: boolean;
+  orderEqual: boolean;
+  exactToolPresent: boolean;
+  invalidReason: "AUTHORIZED_SURFACE_DRIFT" | "SCHEMA_DRIFT" | "EXACT_MAPPED_TOOL_MISSING" | null;
+};
+
+function validateV1IRealSurface(input: {
+  authorizedRuntimeNames: readonly string[];
+  authorizedToolDefinitions?: readonly unknown[];
+  providerBodies: readonly Record<string, unknown>[];
+  requiredTools: readonly string[];
+}): V1IRealSurfaceValidation {
+  const firstBody = input.providerBodies[0] ?? {};
+  const providerTools = Array.isArray(firstBody.tools) ? firstBody.tools : [];
+  const comparison = compareToolSurfaces(
+    input.authorizedRuntimeNames,
+    toolNamesFromBody(firstBody),
+  );
+  const authorizedProviderSchemaSetEqual =
+    input.authorizedToolDefinitions === undefined ||
+    canonicalizeToolDefinitions(input.authorizedToolDefinitions) ===
+      canonicalizeToolDefinitions(providerTools);
+  const providerSchemaStable = sameSchemaAcrossRequests(input.providerBodies);
+  const exactToolPresent = input.requiredTools.every((tool) =>
+    input.authorizedRuntimeNames.includes(tool),
+  );
+  const valid =
+    comparison.canonicalEqual &&
+    authorizedProviderSchemaSetEqual &&
+    providerSchemaStable &&
+    exactToolPresent;
+  return {
+    valid,
+    authorizedProviderNameSetEqual: comparison.canonicalEqual,
+    authorizedProviderSchemaSetEqual,
+    providerSchemaStable,
+    orderEqual: comparison.orderEqual,
+    exactToolPresent,
+    invalidReason: valid
+      ? null
+      : !comparison.canonicalEqual
+        ? "AUTHORIZED_SURFACE_DRIFT"
+        : !authorizedProviderSchemaSetEqual || !providerSchemaStable
+          ? "SCHEMA_DRIFT"
+          : "EXACT_MAPPED_TOOL_MISSING",
+  };
 }
 
 function sameSchemaAcrossRequests(bodies: readonly Record<string, unknown>[]): boolean {
@@ -2749,7 +2976,8 @@ function extractSystemPrompt(body: Record<string, unknown>): string {
 function describeInvalidRun(input: {
   execution: { status: string };
   firstBody: Record<string, unknown>;
-  expected: readonly string[];
+  authorizedRuntimeNames: readonly string[];
+  requiredTools: readonly string[];
   observedRanking?: { epoch: string };
   requestBodies: readonly Record<string, unknown>[];
   correlationStatus?: "PROVABLE" | "UNPROVABLE";
@@ -2767,14 +2995,22 @@ function describeInvalidRun(input: {
   if (!input.observedRanking?.epoch) {
     return "MISSING_RANKING_EPOCH";
   }
-  if (!sameSurfaceAsExpected(input.firstBody, input.expected)) {
+  const surfaceValidation = validateV1IRealSurface({
+    authorizedRuntimeNames: input.authorizedRuntimeNames,
+    providerBodies: input.requestBodies,
+    requiredTools: input.requiredTools,
+  });
+  if (!surfaceValidation.authorizedProviderNameSetEqual) {
     return "AUTHORIZED_SURFACE_DRIFT";
   }
-  if (!sameSurfaceAcrossRequests(input.requestBodies)) {
-    return "AUTHORIZED_SURFACE_DRIFT";
-  }
-  if (!sameSchemaAcrossRequests(input.requestBodies)) {
+  if (
+    !surfaceValidation.providerSchemaStable ||
+    !surfaceValidation.authorizedProviderSchemaSetEqual
+  ) {
     return "SCHEMA_DRIFT";
+  }
+  if (!surfaceValidation.exactToolPresent) {
+    return "EXACT_MAPPED_TOOL_MISSING";
   }
   return "INCOMPLETE_TERMINAL_EVIDENCE";
 }

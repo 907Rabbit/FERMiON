@@ -19,6 +19,10 @@ import {
   type V1IManifest,
   type V1IObservation,
 } from "./model-choice-experiment-evidence.js";
+import {
+  V1I_MIXED_PROVENANCE_AMENDMENT_TYPE,
+  V1I_PROVENANCE_AMENDMENT_FILENAME,
+} from "./model-choice-experiment-provenance.js";
 import { TOOL_RANKING_HELD_OUT_CASES } from "./tool-ranking-benchmark-cases.js";
 
 describe("v1I evidence protocol", () => {
@@ -126,6 +130,68 @@ describe("v1I evidence protocol", () => {
         102,
       );
       expect(fs.existsSync(path.join(root, "manifest.json"))).toBe(true);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("accepts an explicit mixed-provenance continuation without rewriting evidence", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "v1i-mixed-provenance-test-"));
+    try {
+      const baseManifest = makeManifest();
+      const continuationManifest = { ...baseManifest, harnessCommit: "continuation" };
+      fs.writeFileSync(path.join(root, "manifest.json"), `${JSON.stringify(baseManifest)}\n`);
+      const observationsPath = path.join(root, "synthetic-observations.jsonl");
+      const invalidPath = path.join(root, "synthetic-invalid.jsonl");
+      fs.writeFileSync(observationsPath, `${JSON.stringify(makeObservation())}\n`);
+      fs.writeFileSync(
+        invalidPath,
+        `${JSON.stringify(makeObservation({ valid: false, invalidReason: "MODEL_ERROR" }))}\n`,
+      );
+      fs.writeFileSync(
+        path.join(root, V1I_PROVENANCE_AMENDMENT_FILENAME),
+        `${JSON.stringify({
+          provenanceAmendment: true,
+          amendmentType: V1I_MIXED_PROVENANCE_AMENDMENT_TYPE,
+          baseHarnessCommit: baseManifest.harnessCommit,
+          continuationHarnessCommit: continuationManifest.harnessCommit,
+          scientificProtocolChanged: false,
+          modelFacingBehaviorChanged: false,
+          runtimeBehaviorChanged: false,
+        })}\n`,
+      );
+      const observationsBefore = fs.readFileSync(observationsPath);
+      const invalidBefore = fs.readFileSync(invalidPath);
+      const resumed = createV1IArtifactState(root, continuationManifest, "synthetic");
+      expect(resumed.manifest.harnessCommit).toBe(baseManifest.harnessCommit);
+      expect(fs.readFileSync(observationsPath)).toEqual(observationsBefore);
+      expect(fs.readFileSync(invalidPath)).toEqual(invalidBefore);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects mixed provenance without an exact no-behavior-change amendment", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "v1i-mixed-provenance-reject-"));
+    try {
+      const baseManifest = makeManifest();
+      const continuationManifest = { ...baseManifest, harnessCommit: "continuation" };
+      fs.writeFileSync(path.join(root, "manifest.json"), `${JSON.stringify(baseManifest)}\n`);
+      fs.writeFileSync(
+        path.join(root, V1I_PROVENANCE_AMENDMENT_FILENAME),
+        `${JSON.stringify({
+          provenanceAmendment: true,
+          amendmentType: V1I_MIXED_PROVENANCE_AMENDMENT_TYPE,
+          baseHarnessCommit: "wrong-base",
+          continuationHarnessCommit: continuationManifest.harnessCommit,
+          scientificProtocolChanged: false,
+          modelFacingBehaviorChanged: false,
+          runtimeBehaviorChanged: false,
+        })}\n`,
+      );
+      expect(() => createV1IArtifactState(root, continuationManifest, "synthetic")).toThrow(
+        "incompatible v1I manifest",
+      );
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }

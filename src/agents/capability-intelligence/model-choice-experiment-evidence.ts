@@ -2,6 +2,10 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import type { BenchmarkRealToolMappingSummary } from "./benchmark-real-tool-mapping.js";
+import {
+  isV1IProvenanceAmendment,
+  V1I_PROVENANCE_AMENDMENT_FILENAME,
+} from "./model-choice-experiment-provenance.js";
 import type { ToolRankingBenchmarkCase } from "./tool-ranking-benchmark-cases.js";
 
 export const V1I_SCHEMA_VERSION = 1;
@@ -9,7 +13,6 @@ export const V1I_EXPERIMENT_VERSION = "v1I";
 export const V1I_BOOTSTRAP_SEED = 0x1a1f1;
 export const V1I_REPLICATES = 3;
 
-/** Canonical JSON hashing is limited to the evidence protocol's JSON provenance values. */
 export function canonicalizeV1IValue(value: unknown): string {
   return stringifyV1IValue(value, "$", new WeakSet());
 }
@@ -453,7 +456,11 @@ export function createV1IArtifactState(
       canonicalizeV1IValue(manifestCompatibility(existing)) !==
       canonicalizeV1IValue(manifestCompatibility(manifest))
     ) {
-      throw new Error("incompatible v1I manifest; use a fresh artifact directory");
+      // A continuation may change only the harness commit when the sidecar
+      // binds both commits and explicitly records that runtime semantics stayed frozen.
+      if (!isValidatedMixedProvenanceContinuation(root, existing, manifest)) {
+        throw new Error("incompatible v1I manifest; use a fresh artifact directory");
+      }
     }
     resolvedManifest = existing;
   } else {
@@ -640,6 +647,35 @@ function manifestCompatibility(manifest: V1IManifest): Record<string, unknown> {
     experimentalInstructionHash: manifest.experimentalInstructionHash,
     activeFilteringEnabled: manifest.activeFilteringEnabled,
   };
+}
+
+function isValidatedMixedProvenanceContinuation(
+  root: string,
+  existing: V1IManifest,
+  continuation: V1IManifest,
+): boolean {
+  if (
+    canonicalizeV1IValue(manifestCompatibilityWithoutHarness(existing)) !==
+    canonicalizeV1IValue(manifestCompatibilityWithoutHarness(continuation))
+  ) {
+    return false;
+  }
+  const amendmentPath = path.join(root, V1I_PROVENANCE_AMENDMENT_FILENAME);
+  if (!fs.existsSync(amendmentPath)) {
+    return false;
+  }
+  let amendment: unknown;
+  try {
+    amendment = JSON.parse(fs.readFileSync(amendmentPath, "utf8"));
+  } catch {
+    return false;
+  }
+  return isV1IProvenanceAmendment(amendment, existing.harnessCommit, continuation.harnessCommit);
+}
+
+function manifestCompatibilityWithoutHarness(manifest: V1IManifest): Record<string, unknown> {
+  const { harnessCommit: _harnessCommit, ...compatibility } = manifestCompatibility(manifest);
+  return compatibility;
 }
 
 function readJsonl<T>(filename: string): T[] {

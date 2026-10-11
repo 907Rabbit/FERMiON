@@ -10,6 +10,34 @@ import {
 import { createOpenAiResponsesTextBlock } from "./embedded-agent-subscribe.openai-responses.test-helpers.js";
 
 describe("handleMessageEnd", () => {
+  it("observes the normalized assistant response before message delivery", async () => {
+    const order: string[] = [];
+    const onAssistantMessage = vi.fn(() => {
+      order.push("assistant-observed");
+    });
+    const noteCompletedAssistant = vi.fn(() => {
+      order.push("assistant-completed");
+    });
+    const ctx = createMessageEndContext({ onAssistantMessage, noteCompletedAssistant });
+
+    await endMessage(ctx, {
+      message: {
+        role: "assistant",
+        responseId: "response-1",
+        model: "qwen/qwen3.5-9b",
+        content: [{ type: "toolCall", id: "call-git-status", name: "git_status", arguments: {} }],
+      },
+    });
+
+    expect(onAssistantMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        responseId: "response-1",
+        content: [expect.objectContaining({ type: "toolCall", id: "call-git-status" })],
+      }),
+    );
+    expect(order).toEqual(["assistant-observed", "assistant-completed"]);
+  });
+
   it.each(["answer part A msg [[E1008]timeout] answer part B", "answer ending ["])(
     "keeps malformed directive-looking final text identical across delivery paths: %s",
     (text) => {

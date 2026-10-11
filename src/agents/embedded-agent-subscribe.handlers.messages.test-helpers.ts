@@ -112,6 +112,8 @@ export function createMessageUpdateContext(
 export function createMessageEndContext(
   params: {
     onAgentEvent?: ReturnType<typeof vi.fn>;
+    onAssistantMessage?: ReturnType<typeof vi.fn>;
+    noteCompletedAssistant?: ReturnType<typeof vi.fn>;
     onBlockReply?: ReturnType<typeof vi.fn>;
     emitBlockReply?: ReturnType<typeof vi.fn>;
     finalizeAssistantTexts?: ReturnType<typeof vi.fn>;
@@ -138,6 +140,7 @@ export function createMessageEndContext(
         : {}),
       ...(params.enforceFinalTag !== undefined ? { enforceFinalTag: params.enforceFinalTag } : {}),
       ...(params.onAgentEvent ? { onAgentEvent: params.onAgentEvent } : {}),
+      ...(params.onAssistantMessage ? { onAssistantMessage: params.onAssistantMessage } : {}),
       ...(params.onBlockReply ? { onBlockReply: params.onBlockReply } : { onBlockReply: vi.fn() }),
     },
     state: {
@@ -172,7 +175,7 @@ export function createMessageEndContext(
       ...params.state,
     },
     noteLastAssistant: vi.fn(),
-    noteCompletedAssistant: vi.fn(),
+    noteCompletedAssistant: params.noteCompletedAssistant ?? vi.fn(),
     recordAssistantUsage: vi.fn(),
     commitAssistantUsage: vi.fn(),
     log: { debug: vi.fn(), info: vi.fn(), warn: params.warn ?? vi.fn() },

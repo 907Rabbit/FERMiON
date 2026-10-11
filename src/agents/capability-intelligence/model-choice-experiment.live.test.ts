@@ -5,6 +5,7 @@ import path from "node:path";
 import { configureAiTransportHost, getAiTransportHost } from "@openclaw/ai";
 import { describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import type { AssistantMessage } from "../../llm/types.js";
 import type { RunEmbeddedAgentParams } from "../embedded-agent-runner/run/params.js";
 import type { EmbeddedAgentRunResult } from "../embedded-agent-runner/types.js";
 import { resolveAgentRunSessionTarget } from "../run-session-target.js";
@@ -99,12 +100,14 @@ type ProviderResponseSummary = {
   toolCallFieldPresent: boolean;
   toolCallCount: number;
   toolCallNames: string[];
+  toolCallIds: string[];
   functionCallFieldPresent: boolean;
   outputItemTypes: string[];
   responseEventTypes: string[];
   parserOutcome: string;
   httpStatus: number | null;
   contentType: string | null;
+  modelTurnIndex: number | null;
 };
 
 type SerializedSmokeError = {
@@ -283,6 +286,74 @@ describe("v1I harness evidence repair", () => {
     expect(toolCall.toolCallNames).toEqual(["git_diff"]);
   });
 
+  it("captures the normalized live-path tool-call and no-tool response shapes", () => {
+    const toolCall = summarizeAssistantMessage(
+      makeAssistantMessage([
+        { type: "toolCall", id: "call-git-status", name: "git_status", arguments: {} },
+      ]),
+      0,
+    );
+    expect(toolCall.responseClass).toBe("TOOL_CALL_RESPONSE");
+    expect(toolCall.toolCallCount).toBe(1);
+    expect(toolCall.toolCallNames).toEqual(["git_status"]);
+    expect(toolCall.toolCallIds).toEqual(["call-git-status"]);
+    expect(toolCall.modelTurnIndex).toBe(0);
+
+    const noTool = summarizeAssistantMessage(
+      makeAssistantMessage([{ type: "text", text: "done" }]),
+      1,
+    );
+    expect(noTool.responseClass).toBe("NO_TOOL_TEXT_RESPONSE");
+    expect(noTool.toolCallCount).toBe(0);
+    expect(noTool.contentLength).toBe(4);
+    expect(noTool.modelTurnIndex).toBe(1);
+  });
+
+  it("installs the live-path observer before the run and restores it afterward", async () => {
+    const diagnostics = createExperimentDiagnostics();
+    const observations: string[] = [];
+    const restore = installAssistantMessageObserver(diagnostics.hooks, (_message, turn) => {
+      observations.push(
+        `turn-${turn}:${diagnostics.hooks.onAssistantMessage ? "active" : "missing"}`,
+      );
+    });
+
+    expect(diagnostics.hooks.onAssistantMessage).toBeTypeOf("function");
+    await diagnostics.hooks.onAssistantMessage?.(
+      makeAssistantMessage([{ type: "text", text: "ok" }]),
+    );
+    expect(observations).toEqual(["turn-0:active"]);
+
+    restore();
+    expect(diagnostics.hooks.onAssistantMessage).toBeUndefined();
+  });
+
+  it("writes normalized response evidence before later terminal stages", () => {
+    const smokeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "v1i-normalized-evidence-"));
+    const providerSummaryPath = path.join(smokeRoot, "smoke-provider-response.json");
+    try {
+      const diagnostics = createExperimentDiagnostics();
+      const summaries: ProviderResponseSummary[] = [];
+      const restore = installAssistantMessageObserver(diagnostics.hooks, (message, turn) => {
+        summaries.push(summarizeAssistantMessage(message, turn));
+        writeSmokeProviderResponseSummary(providerSummaryPath, summaries);
+      });
+      diagnostics.hooks.onAssistantMessage?.(
+        makeAssistantMessage([
+          { type: "toolCall", id: "call-git-status", name: "git_status", arguments: {} },
+        ]),
+      );
+      expect(fs.existsSync(providerSummaryPath)).toBe(true);
+      expect(JSON.parse(fs.readFileSync(providerSummaryPath, "utf8")).summaries[0]).toMatchObject({
+        responseClass: "TOOL_CALL_RESPONSE",
+        toolCallNames: ["git_status"],
+      });
+      restore();
+    } finally {
+      fs.rmSync(smokeRoot, { recursive: true, force: true });
+    }
+  });
+
   it("compares authorized tool surfaces semantically while reporting real drift", () => {
     const expected = ["git_diff", "pytest", "git_status"];
     expect(compareToolSurfaces(expected, ["git_status", "git_diff", "pytest"])).toEqual({
@@ -434,6 +505,27 @@ describe("v1I harness evidence repair", () => {
     expect(accounting.duplicateExecutionCount).toBe(1);
   });
 
+  it("distinguishes duplicate provider observations by call id and model turn", () => {
+    expect(
+      classifyObservedToolCalls([
+        { name: "git_status", id: "call-1", modelTurnIndex: 0 },
+        { name: "git_status", id: "call-2", modelTurnIndex: 0 },
+      ]),
+    ).toBe("DISTINCT_PROVIDER_CALLS");
+    expect(
+      classifyObservedToolCalls([
+        { name: "git_status", id: "call-1", modelTurnIndex: 0 },
+        { name: "git_status", id: "call-1", modelTurnIndex: 0 },
+      ]),
+    ).toBe("DUPLICATE_OBSERVATION");
+    expect(
+      classifyObservedToolCalls([
+        { name: "git_status", id: "call-1", modelTurnIndex: 0 },
+        { name: "git_status", id: "call-2", modelTurnIndex: 1 },
+      ]),
+    ).toBe("MULTI_TURN_REPEAT");
+  });
+
   it("keeps a primary terminal timeout authoritative over cleanup errors", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "v1i-cleanup-precedence-"));
     try {
@@ -556,7 +648,8 @@ describeSmokeLive("v1I model-choice experiment smoke", () => {
                 }
               },
               requestCapture: {
-                onResponseSummary: (summary) => {
+                onAssistantMessage: (message, modelTurnIndex) => {
+                  const summary = summarizeAssistantMessage(message, modelTurnIndex);
                   responseSummaries.push(summary);
                   providerSummaryWrite.providerSummaryCallbackInvocations += 1;
                   const writeResult = writeSmokeProviderResponseSummary(
@@ -591,10 +684,12 @@ describeSmokeLive("v1I model-choice experiment smoke", () => {
                       toolCallFieldPresent: summary.toolCallFieldPresent,
                       toolCallCount: summary.toolCallCount,
                       toolCallNames: summary.toolCallNames,
+                      toolCallIds: summary.toolCallIds,
                       functionCallFieldPresent: summary.functionCallFieldPresent,
                       outputItemTypes: summary.outputItemTypes,
                       responseEventTypes: summary.responseEventTypes,
                       parserOutcome: summary.parserOutcome,
+                      modelTurnIndex: summary.modelTurnIndex,
                     },
                   );
                   if (summary.toolCallCount > 0) {
@@ -1073,6 +1168,7 @@ async function runOne(input: {
     onRequestCaptured?: (request: CapturedModelRequest) => void;
     onDelegatedRequest?: () => void;
     onResponseSummary?: (summary: ProviderResponseSummary) => void;
+    onAssistantMessage?: (message: AssistantMessage, modelTurnIndex: number) => void;
   };
   abortSignal?: AbortSignal;
   timeoutMs?: number;
@@ -1157,6 +1253,9 @@ async function runOne(input: {
     });
     await diagnosticsProviderResponse?.({ response, model });
   };
+  const restoreAssistantMessageObserver = input.requestCapture?.onAssistantMessage
+    ? installAssistantMessageObserver(diagnostics.hooks, input.requestCapture.onAssistantMessage)
+    : undefined;
   const startTime = new Date().toISOString();
   let observedRanking: Extract<EmbeddedReplayFact, { kind: "ranking" }> | undefined;
   let observedFailure = false;
@@ -1312,6 +1411,7 @@ async function runOne(input: {
       });
     }
   } finally {
+    restoreAssistantMessageObserver?.();
     configureAiTransportHost(originalAiTransportHost);
     capture.restore();
   }
@@ -2048,6 +2148,45 @@ function captureModelPayloads(
   };
 }
 
+function installAssistantMessageObserver(
+  hooks: NonNullable<RunEmbeddedAgentParams["capabilityIntelligenceExperiment"]>,
+  observer: (message: AssistantMessage, modelTurnIndex: number) => void,
+): () => void {
+  const previous = hooks.onAssistantMessage;
+  let modelTurnIndex = 0;
+  const installed = (message: AssistantMessage) => {
+    const currentTurnIndex = modelTurnIndex++;
+    previous?.(message);
+    observer(message, currentTurnIndex);
+  };
+  hooks.onAssistantMessage = installed;
+  return () => {
+    if (hooks.onAssistantMessage === installed) {
+      hooks.onAssistantMessage = previous;
+    }
+  };
+}
+
+function makeAssistantMessage(content: AssistantMessage["content"]): AssistantMessage {
+  return {
+    role: "assistant",
+    content,
+    api: "openai-completions",
+    provider: PROVIDER,
+    model: MODEL_ID,
+    usage: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason: content.some((block) => block.type === "toolCall") ? "toolUse" : "stop",
+    timestamp: 0,
+  };
+}
+
 async function captureProviderSummaryForFixture(fixture: string): Promise<ProviderResponseSummary> {
   const originalFetch = globalThis.fetch;
   const summaries: ProviderResponseSummary[] = [];
@@ -2075,6 +2214,72 @@ async function captureProviderSummaryForFixture(fixture: string): Promise<Provid
   return summary;
 }
 
+function summarizeAssistantMessage(
+  message: AssistantMessage,
+  modelTurnIndex: number,
+): ProviderResponseSummary {
+  const toolCalls = message.content.filter(
+    (block): block is Extract<AssistantMessage["content"][number], { type: "toolCall" }> =>
+      block.type === "toolCall",
+  );
+  const textBlocks = message.content.filter(
+    (block): block is Extract<AssistantMessage["content"][number], { type: "text" }> =>
+      block.type === "text",
+  );
+  const contentLength = textBlocks.reduce((total, block) => total + block.text.length, 0);
+  const responseClass =
+    message.stopReason === "error" || message.stopReason === "aborted"
+      ? "PROVIDER_FAILURE"
+      : toolCalls.length > 0
+        ? "TOOL_CALL_RESPONSE"
+        : contentLength > 0
+          ? "NO_TOOL_TEXT_RESPONSE"
+          : "EMPTY_RESPONSE";
+  return {
+    responseClass,
+    responseObjectType: "AssistantMessage",
+    responseId: message.responseId ?? null,
+    responseModel: message.responseModel ?? message.model ?? null,
+    responseShape: "normalized-assistant-message",
+    finishReason: message.stopReason,
+    messageRole: message.role,
+    contentPresent: contentLength > 0,
+    contentLength,
+    toolCallFieldPresent: toolCalls.length > 0,
+    toolCallCount: toolCalls.length,
+    toolCallNames: toolCalls.map((toolCall) => toolCall.name),
+    toolCallIds: toolCalls.map((toolCall) => toolCall.id),
+    functionCallFieldPresent: toolCalls.length > 0,
+    outputItemTypes: message.content.map((block) => block.type),
+    responseEventTypes: [],
+    parserOutcome: "normalized-assistant-message",
+    httpStatus: null,
+    contentType: null,
+    modelTurnIndex,
+  };
+}
+
+type ObservedToolCall = {
+  name: string;
+  id: string;
+  modelTurnIndex: number;
+};
+
+function classifyObservedToolCalls(
+  calls: readonly ObservedToolCall[],
+): "NONE" | "DISTINCT_PROVIDER_CALLS" | "DUPLICATE_OBSERVATION" | "MULTI_TURN_REPEAT" {
+  const ids = new Set(calls.map((call) => call.id));
+  if (ids.size !== calls.length) {
+    return "DUPLICATE_OBSERVATION";
+  }
+  const names = new Set(calls.map((call) => call.name));
+  if (names.size === calls.length) {
+    return calls.length === 0 ? "NONE" : "DISTINCT_PROVIDER_CALLS";
+  }
+  const turns = new Set(calls.map((call) => call.modelTurnIndex));
+  return turns.size > 1 ? "MULTI_TURN_REPEAT" : "DISTINCT_PROVIDER_CALLS";
+}
+
 type ProviderResponseSummaryState = {
   contentType: string | null;
   decoder: TextDecoder;
@@ -2089,7 +2294,7 @@ type ProviderResponseSummaryState = {
   contentPresent: boolean;
   contentLength: number;
   toolCallFieldPresent: boolean;
-  toolCalls: Map<string, string>;
+  toolCalls: Map<string, { name: string; id: string | null }>;
   functionCallFieldPresent: boolean;
   outputItemTypes: Set<string>;
   responseEventTypes: Set<string>;
@@ -2141,12 +2346,14 @@ function createPendingProviderResponseSummary(response: Response): ProviderRespo
     toolCallFieldPresent: false,
     toolCallCount: 0,
     toolCallNames: [],
+    toolCallIds: [],
     functionCallFieldPresent: false,
     outputItemTypes: [],
     responseEventTypes: [],
     parserOutcome: response.body ? "body-pending" : "empty-body",
     httpStatus: response.status,
     contentType: response.headers.get("content-type"),
+    modelTurnIndex: null,
   };
 }
 
@@ -2325,15 +2532,18 @@ function addProviderToolCall(
   name: string,
   identity: unknown,
 ): void {
-  const key = `${typeof identity === "string" || typeof identity === "number" ? identity : "?"}:${name}`;
-  state.toolCalls.set(key, name);
+  const id = typeof identity === "string" || typeof identity === "number" ? String(identity) : null;
+  const key = `${id ?? "?"}:${name}`;
+  state.toolCalls.set(key, { name, id });
 }
 
 function finishProviderResponseSummary(
   initial: ProviderResponseSummary,
   state: ProviderResponseSummaryState,
 ): ProviderResponseSummary {
-  const toolCallNames = [...state.toolCalls.values()];
+  const toolCalls = [...state.toolCalls.values()];
+  const toolCallNames = toolCalls.map((toolCall) => toolCall.name);
+  const toolCallIds = toolCalls.flatMap((toolCall) => (toolCall.id === null ? [] : [toolCall.id]));
   return {
     ...initial,
     responseObjectType: state.responseObjectType,
@@ -2347,9 +2557,11 @@ function finishProviderResponseSummary(
     toolCallFieldPresent: state.toolCallFieldPresent,
     toolCallCount: toolCallNames.length,
     toolCallNames,
+    toolCallIds,
     functionCallFieldPresent: state.functionCallFieldPresent,
     outputItemTypes: [...state.outputItemTypes],
     responseEventTypes: [...state.responseEventTypes],
+    modelTurnIndex: initial.modelTurnIndex,
     parserOutcome:
       state.parseErrors > 0
         ? "parse-error"

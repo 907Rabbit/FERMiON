@@ -10,6 +10,7 @@ import type { HeartbeatToolResponse } from "../auto-reply/heartbeat-tool-respons
 import type { ReplyPayload } from "../auto-reply/reply-payload.js";
 import type { ReasoningLevel, ThinkLevel, VerboseLevel } from "../auto-reply/thinking.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import type { AssistantMessage } from "../llm/types.js";
 import type { HookRunner } from "../plugins/hooks.js";
 import type { BlockReplyPayload } from "./embedded-agent-payloads.js";
 import type { EmbeddedRunReplayState } from "./embedded-agent-runner/replay-state.js";
@@ -56,6 +57,8 @@ export type SubscribeEmbeddedAgentSessionParams = {
   onDeliveredMessageToolOnlySourceReply?: () => void;
   onToolResult?: (payload: ReplyPayload) => void | Promise<void>;
   onAgentToolResult?: (event: { toolName: string; result: unknown; isError: boolean }) => void;
+  /** Experiment-only observer for the normalized assistant response before tool execution. */
+  onAssistantMessage?: (message: AssistantMessage) => void;
   observeToolTerminal?: EmbeddedRunAttemptParams["observeToolTerminal"];
   onReasoningStream?: (payload: ReasoningStreamPayload) => void | Promise<void>;
   /** Expands window reasoning beyond "stream" mode for callers with their own display gate. */

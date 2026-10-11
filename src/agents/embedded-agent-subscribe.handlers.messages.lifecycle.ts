@@ -144,6 +144,11 @@ export function handleMessageEnd(
     return;
   }
 
+  // This is the first normalized response boundary shared by live providers.
+  // Observe it before tool execution so evidence cannot be reconstructed from
+  // downstream dispatch, and keep the callback experiment-only.
+  ctx.params.onAssistantMessage?.(msg);
+
   // Transcript-only messages never reach the provider, so this counts exactly
   // the completed model round trips consumers see as `assistantTurns`.
   ctx.state.assistantTurnCount += 1;

@@ -17,7 +17,7 @@ import type { SessionEntry, SessionToolOverrides } from "../../../config/session
 import type { OpenClawConfig } from "../../../config/types.openclaw.js";
 import type { GroupToolPolicyConfig } from "../../../config/types.tools.js";
 import type { CronRuntimeAuthority } from "../../../cron/runtime-authority.js";
-import type { ImageContent } from "../../../llm/types.js";
+import type { AssistantMessage, ImageContent } from "../../../llm/types.js";
 import type { MediaFact } from "../../../media/media-facts.js";
 import type { PromptImageOrderEntry } from "../../../media/prompt-image-order.js";
 import type { PluginHookChannelContext } from "../../../plugins/hook-types.js";
@@ -116,6 +116,8 @@ export type EmbeddedCapabilityIntelligenceExperimentHooks = {
   onRequestPreparationError?: (input: { error: unknown; stage: string }) => void;
   onProviderRequest?: (input: { payload: unknown; model: unknown }) => void | Promise<void>;
   onProviderResponse?: (input: { response: unknown; model: unknown }) => void | Promise<void>;
+  /** Observes the normalized assistant response before any tool execution. */
+  onAssistantMessage?: (message: AssistantMessage) => void;
 };
 
 export type ResolvedToolPromptFinalizer = (params: {

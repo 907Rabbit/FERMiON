@@ -72,6 +72,10 @@ import {
   TOOL_RANKING_HELD_OUT_CASES,
   type ToolRankingBenchmarkCase,
 } from "./tool-ranking-benchmark-cases.js";
+import {
+  cleanupV1IWorkspace,
+  persistV1IEvidenceBeforeCleanup,
+} from "./v1i-evidence-finalization.js";
 
 const LIVE = process.env.OPENCLAW_V1I_LIVE_TEST === "1";
 import {
@@ -297,6 +301,107 @@ describe("v1I harness evidence repair", () => {
       expect(recorded).toHaveLength(1);
       expect(persisted.valid).toBe(false);
       expect(persisted.invalidReason).toBe("HARNESS_ERROR");
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("serializes completed evidence before cleanup", async () => {
+    const events: string[] = [];
+    const record = { outcome: "tool-call", tool: "write" };
+    const finalization = await persistV1IEvidenceBeforeCleanup({
+      record,
+      evidenceComplete: true,
+      serialize: (value) => {
+        events.push(`serialize:${value.outcome}`);
+      },
+      cleanup: async ({ evidenceComplete, serializationComplete }) => {
+        events.push(`cleanup:${evidenceComplete}:${serializationComplete}`);
+        return makeCleanupOutcome({ secondary: false });
+      },
+    });
+    expect(events).toEqual(["serialize:tool-call", "cleanup:true:true"]);
+    expect(finalization.serializationComplete).toBe(true);
+    expect(finalization.cleanup.result).toBe("SUCCESS");
+  });
+
+  it("keeps cleanup EPERM secondary after durable evidence", async () => {
+    let serialized = false;
+    const finalization = await persistV1IEvidenceBeforeCleanup({
+      record: { valid: true },
+      evidenceComplete: true,
+      serialize: () => {
+        serialized = true;
+      },
+      cleanup: async ({ evidenceComplete, serializationComplete }) => {
+        expect(serialized).toBe(true);
+        expect(evidenceComplete).toBe(true);
+        expect(serializationComplete).toBe(true);
+        return makeCleanupOutcome({ result: "EPERM", secondary: true });
+      },
+    });
+    expect(finalization.serializationComplete).toBe(true);
+    expect(finalization.cleanup).toMatchObject({ result: "EPERM", secondary: true });
+  });
+
+  it("fails closed when evidence serialization fails", async () => {
+    let cleanupInput: { evidenceComplete: boolean; serializationComplete: boolean } | undefined;
+    const finalization = await persistV1IEvidenceBeforeCleanup({
+      record: { valid: true },
+      evidenceComplete: true,
+      serialize: () => {
+        throw new Error("disk full");
+      },
+      cleanup: async (input) => {
+        cleanupInput = input;
+        return makeCleanupOutcome({ result: "EPERM", secondary: false });
+      },
+    });
+    expect(finalization.serializationComplete).toBe(false);
+    expect(finalization.serializationErrorMessage).toBe("disk full");
+    expect(cleanupInput).toEqual({ evidenceComplete: true, serializationComplete: false });
+    expect(finalization.cleanup.secondary).toBe(false);
+  });
+
+  it("keeps cleanup failure non-secondary when terminal evidence is incomplete", async () => {
+    const finalization = await persistV1IEvidenceBeforeCleanup({
+      record: { valid: false, invalidReason: "HARNESS_ERROR" },
+      evidenceComplete: false,
+      serialize: () => undefined,
+      cleanup: async ({ evidenceComplete, serializationComplete }) => {
+        expect(evidenceComplete).toBe(false);
+        expect(serializationComplete).toBe(true);
+        return makeCleanupOutcome({ result: "EPERM", secondary: false });
+      },
+    });
+    expect(finalization.cleanup).toMatchObject({ result: "EPERM", secondary: false });
+  });
+
+  it("writes an invalid attempt before cleanup and resumes without duplicating a valid cell", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "v1i-evidence-resume-"));
+    try {
+      const input = makeTestInvalidObservationInput();
+      const invalid = makeInvalidObservation({ ...input, reason: "HARNESS_ERROR" });
+      fs.writeFileSync(path.join(root, "synthetic-invalid.jsonl"), `${JSON.stringify(invalid)}\n`);
+      const valid = {
+        ...invalid,
+        valid: true,
+        invalidReason: null,
+        rankingEpoch: "epoch-1",
+        correlationStatus: "PROVABLE" as const,
+      };
+      appendV1IObservation(root, "synthetic", valid);
+      const sets = splitV1IExperimentSets(
+        TOOL_RANKING_HELD_OUT_CASES,
+        summarizeBenchmarkRealToolMappings(TOOL_RANKING_HELD_OUT_CASES),
+      );
+      const state = createV1IArtifactState(root, buildManifest(sets), "synthetic");
+      expect(state.observations).toHaveLength(1);
+      expect(state.invalidAttempts).toHaveLength(1);
+      expect(v1ICellKey(state.observations[0]!)).toBe(v1ICellKey(valid));
+      expect(() => assertNoDuplicateValidCells([...state.observations, valid])).toThrow(
+        "duplicate valid v1I cell",
+      );
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
@@ -1262,23 +1367,6 @@ describeDiagnosticLive("v1I model-choice diagnostic", () => {
         });
       } catch (error) {
         failure = error;
-        fs.writeFileSync(
-          path.join(diagnosticRoot, "diagnostic-invalid.json"),
-          `${JSON.stringify(
-            {
-              valid: false,
-              invalidReason: "HARNESS_ERROR",
-              experimentLevelFailureClass: "HARNESS_ERROR",
-              rawErrorName: error instanceof Error ? error.name : "NonErrorThrown",
-              rawErrorMessage: error instanceof Error ? error.message : String(error),
-              recordedAt: new Date().toISOString(),
-            },
-            null,
-            2,
-          )}\n`,
-        );
-      } finally {
-        fs.rmSync(workspaceDir, { recursive: true, force: true });
       }
       const checkpointPath = path.join(diagnosticRoot, "attempt-checkpoints.jsonl");
       const checkpoints = fs
@@ -1287,6 +1375,11 @@ describeDiagnosticLive("v1I model-choice diagnostic", () => {
         .split(/\r?\n/)
         .filter(Boolean)
         .map((line) => JSON.parse(line) as { stage: string });
+      const terminalObserved =
+        checkpoints.some((checkpoint) => checkpoint.stage === "terminal-observed") ||
+        postResponseCheckpoints.some(
+          (checkpoint) => checkpoint.stage === "terminal-observation-complete",
+        );
       const diagnosticResult = {
         diagnosticOnly: true,
         harnessCommit: HARNESS_COMMIT,
@@ -1329,9 +1422,10 @@ describeDiagnosticLive("v1I model-choice diagnostic", () => {
         executedToolSequence: observation?.executedToolSequence ?? [],
         rankingEpoch: observation?.rankingEpoch ?? null,
         correlationStatus: observation?.correlationStatus ?? null,
-        terminalObserved: checkpoints.some(
-          (checkpoint) => checkpoint.stage === "terminal-observed",
-        ),
+        terminalObserved,
+        terminalEvidenceComplete: terminalObserved,
+        resultValidationComplete: true,
+        resultSerializationComplete: true,
         terminalSuccess: observation?.terminalSuccess ?? null,
         invalidReason: observation?.invalidReason ?? (failure ? "HARNESS_ERROR" : null),
         rawRuntimeStatus:
@@ -1340,10 +1434,67 @@ describeDiagnosticLive("v1I model-choice diagnostic", () => {
         originalErrorMessage: failure instanceof Error ? failure.message : null,
         artifactSerialization: "PASS",
       };
-      fs.writeFileSync(
-        path.join(diagnosticRoot, "diagnostic-result.json"),
-        `${JSON.stringify(diagnosticResult, null, 2)}\n`,
-      );
+      const normalizedResponseComplete =
+        requestBodies.length > 0 &&
+        (responseSummaries.length > 0 ||
+          postResponseSnapshots.some(
+            (snapshot) => snapshot.kind === "normalized-assistant-message",
+          ));
+      const evidenceComplete =
+        normalizedResponseComplete &&
+        terminalObserved &&
+        diagnosticResult.correlationStatus === "PROVABLE";
+      const finalization = await persistV1IEvidenceBeforeCleanup({
+        record: diagnosticResult,
+        evidenceComplete,
+        serialize: (record) => {
+          if (failure) {
+            fs.writeFileSync(
+              path.join(diagnosticRoot, "diagnostic-invalid.json"),
+              `${JSON.stringify(
+                {
+                  valid: false,
+                  invalidReason: "HARNESS_ERROR",
+                  experimentLevelFailureClass: "HARNESS_ERROR",
+                  rawErrorName: failure instanceof Error ? failure.name : "NonErrorThrown",
+                  rawErrorMessage:
+                    failure instanceof Error ? failure.message : JSON.stringify(failure),
+                  recordedAt: new Date().toISOString(),
+                },
+                null,
+                2,
+              )}\n`,
+            );
+          }
+          fs.writeFileSync(
+            path.join(diagnosticRoot, "diagnostic-result.json"),
+            `${JSON.stringify(record, null, 2)}\n`,
+          );
+          journal.record("result-serialization-complete");
+        },
+        cleanup: async (cleanupInput) => {
+          journal.record("cleanup-started-after-serialization", {
+            elapsedMs: cleanupInput.serializationComplete ? 0 : undefined,
+          });
+          const cleanup = await cleanupV1IWorkspace({
+            workspaceDir,
+            ...cleanupInput,
+          });
+          journal.record(cleanup.result === "SUCCESS" ? "cleanup-complete" : "cleanup-failed", {
+            elapsedMs: cleanup.cleanupElapsedMs,
+          });
+          fs.writeFileSync(
+            path.join(diagnosticRoot, "diagnostic-cleanup.json"),
+            `${JSON.stringify(cleanup, null, 2)}\n`,
+          );
+          return cleanup;
+        },
+      });
+      if (!finalization.serializationComplete) {
+        throw new Error(
+          `v1I diagnostic evidence serialization failed: ${finalization.serializationErrorMessage ?? "unknown error"}`,
+        );
+      }
       if (failure) {
         throw failure instanceof Error ? failure : new Error("v1I diagnostic failure");
       }
@@ -3263,6 +3414,25 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : undefined;
+}
+
+function makeCleanupOutcome(
+  overrides: Partial<{
+    result: "SUCCESS" | "EPERM" | "ERROR";
+    secondary: boolean;
+  }> = {},
+) {
+  return {
+    attempted: true as const,
+    result: "SUCCESS" as const,
+    secondary: false,
+    cleanupPath: "diagnostic-workspace",
+    cleanupAttempts: 1,
+    cleanupElapsedMs: 0,
+    cleanupErrorCode: null,
+    cleanupErrorMessage: null,
+    ...overrides,
+  };
 }
 
 function serializeSmokeError(error: unknown): SerializedSmokeError {

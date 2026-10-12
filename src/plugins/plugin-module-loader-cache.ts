@@ -4,6 +4,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import type { createJiti } from "jiti";
 import { toSafeImportPath } from "../shared/import-specifier.js";
+import { emitPluginModuleLoaderDiagnostic } from "./module-loader-diagnostics.js";
 import {
   clearNativeRequireJavaScriptModuleCache,
   tryNativeRequireJavaScriptModule,
@@ -216,6 +217,10 @@ function createLazySourceTransformLoader(params: {
     const jitiOptions = buildPluginLoaderJitiOptions(params.aliasMap, {
       modulePath: params.loaderFilename,
     });
+    emitPluginModuleLoaderDiagnostic({
+      stage: "jiti-loader-create-entered",
+      modulePath: params.loaderFilename,
+    });
     const jitiLoader = (params.createLoader ?? loadCreateJitiLoaderFactory())(
       params.loaderFilename,
       {
@@ -226,7 +231,32 @@ function createLazySourceTransformLoader(params: {
         tryNative: false,
       },
     );
-    loadWithSourceTransform = (target) => jitiLoader(toSourceTransformImportPath(target));
+    emitPluginModuleLoaderDiagnostic({
+      stage: "jiti-loader-create-complete",
+      modulePath: params.loaderFilename,
+    });
+    loadWithSourceTransform = (target) => {
+      const importPath = toSourceTransformImportPath(target);
+      emitPluginModuleLoaderDiagnostic({
+        stage: "jiti-module-load-entered",
+        modulePath: importPath,
+      });
+      try {
+        const loaded = jitiLoader(importPath);
+        emitPluginModuleLoaderDiagnostic({
+          stage: "jiti-module-load-complete",
+          modulePath: importPath,
+        });
+        return loaded;
+      } catch (error) {
+        emitPluginModuleLoaderDiagnostic({
+          stage: "jiti-module-load-error",
+          modulePath: importPath,
+          ...(error instanceof Error ? { errorName: error.name } : {}),
+        });
+        throw error;
+      }
+    };
     return loadWithSourceTransform;
   };
 }

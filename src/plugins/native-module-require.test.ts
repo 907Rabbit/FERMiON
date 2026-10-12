@@ -31,6 +31,51 @@ describe("tryNativeRequireJavaScriptModule", () => {
     expect(result).toEqual({ ok: true, moduleExport: { marker: "native" } });
   });
 
+  it("records native success and fallback decision diagnostics when enabled", () => {
+    const dir = tempDirs.make("openclaw-native-require-diagnostics-");
+    const diagnosticPath = path.join(dir, "diagnostics.jsonl");
+    const nativePath = path.join(dir, "native.cjs");
+    fs.writeFileSync(nativePath, 'module.exports = { marker: "native" };\n', "utf8");
+    const packageDir = path.join(dir, "node_modules", "esm-only");
+    fs.mkdirSync(packageDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(packageDir, "package.json"),
+      JSON.stringify({ name: "esm-only", type: "module", exports: { import: "./index.js" } }),
+      "utf8",
+    );
+    fs.writeFileSync(path.join(packageDir, "index.js"), "export const marker = true;\n", "utf8");
+    const fallbackPath = path.join(dir, "fallback.cjs");
+    fs.writeFileSync(fallbackPath, 'require("esm-only");\n', "utf8");
+    const previousDiagnosticPath = process.env.OPENCLAW_PLUGIN_LOADER_DIAGNOSTICS_FILE;
+    process.env.OPENCLAW_PLUGIN_LOADER_DIAGNOSTICS_FILE = diagnosticPath;
+    try {
+      expect(tryNativeRequireJavaScriptModule(nativePath, { allowWindows: true }).ok).toBe(true);
+      expect(tryNativeRequireJavaScriptModule(fallbackPath, { allowWindows: true })).toEqual({
+        ok: false,
+      });
+    } finally {
+      if (previousDiagnosticPath === undefined) {
+        delete process.env.OPENCLAW_PLUGIN_LOADER_DIAGNOSTICS_FILE;
+      } else {
+        process.env.OPENCLAW_PLUGIN_LOADER_DIAGNOSTICS_FILE = previousDiagnosticPath;
+      }
+    }
+    const stages = fs
+      .readFileSync(diagnosticPath, "utf8")
+      .trim()
+      .split(/\r?\n/u)
+      .map((line) => JSON.parse(line) as { stage: string; selected?: boolean });
+    expect(stages.map((event) => event.stage)).toEqual([
+      "native-module-load-entered",
+      "native-module-load-complete",
+      "native-module-load-entered",
+      "native-module-load-error",
+      "fallback-decision-entered",
+      "fallback-decision-complete",
+    ]);
+    expect(stages.at(-1)?.selected).toBe(true);
+  });
+
   it("declines modules that need source-transform fallback", () => {
     const dir = tempDirs.make("openclaw-native-require-");
     const modulePath = path.join(dir, "plugin.mjs");

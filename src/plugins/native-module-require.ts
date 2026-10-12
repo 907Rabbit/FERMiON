@@ -4,6 +4,7 @@ import Module, { createRequire } from "node:module";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { isPathInside } from "../infra/path-guards.js";
+import { emitPluginModuleLoaderDiagnostic } from "./module-loader-diagnostics.js";
 
 const nodeRequire = createRequire(import.meta.url);
 type ResolveFilename = (
@@ -76,16 +77,42 @@ export function tryNativeRequireJavaScriptModule(
     return { ok: false };
   }
   try {
-    return { ok: true, moduleExport: requireWithOptionalAliases(modulePath, options.aliasMap) };
+    emitPluginModuleLoaderDiagnostic({
+      stage: "native-module-load-entered",
+      modulePath,
+    });
+    const moduleExport = requireWithOptionalAliases(modulePath, options.aliasMap);
+    emitPluginModuleLoaderDiagnostic({
+      stage: "native-module-load-complete",
+      modulePath,
+    });
+    return { ok: true, moduleExport };
   } catch (error) {
     const code =
       error && typeof error === "object" ? (error as { code?: unknown }).code : undefined;
-    if (
+    emitPluginModuleLoaderDiagnostic({
+      stage: "native-module-load-error",
+      modulePath,
+      ...(typeof code === "string" ? { code } : {}),
+      ...(error instanceof Error ? { errorName: error.name } : {}),
+    });
+    emitPluginModuleLoaderDiagnostic({
+      stage: "fallback-decision-entered",
+      modulePath,
+      ...(typeof code === "string" ? { code } : {}),
+    });
+    const fallbackSelected =
       isSourceTransformFallbackError(error, modulePath) ||
       options.fallbackOnNativeError ||
       (options.fallbackOnMissingDependency === true &&
-        (code === "MODULE_NOT_FOUND" || code === "ERR_MODULE_NOT_FOUND"))
-    ) {
+        (code === "MODULE_NOT_FOUND" || code === "ERR_MODULE_NOT_FOUND"));
+    emitPluginModuleLoaderDiagnostic({
+      stage: "fallback-decision-complete",
+      modulePath,
+      selected: fallbackSelected,
+      ...(typeof code === "string" ? { code } : {}),
+    });
+    if (fallbackSelected) {
       return { ok: false };
     }
     throw error;

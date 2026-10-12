@@ -48,6 +48,7 @@ import {
   resolveManifestOwnerBasePolicyBlock,
 } from "./manifest-owner-policy.js";
 import type { PluginManifestRecord } from "./manifest-registry.js";
+import { emitPluginModuleLoaderDiagnostic } from "./module-loader-diagnostics.js";
 import { withProfile } from "./plugin-load-profile.js";
 import { normalizePluginPolicyId } from "./plugin-policy-id.js";
 import {
@@ -467,7 +468,15 @@ export function loadRuntimePluginCandidate(params: {
   }
   trace("runtime-registry-candidate-setup-completed");
 
+  emitPluginModuleLoaderDiagnostic({
+    stage: "module-export-validation-entered",
+    modulePath: safeSource,
+  });
   const resolved = resolvePluginModuleExport(mod);
+  emitPluginModuleLoaderDiagnostic({
+    stage: "module-export-validation-complete",
+    modulePath: safeSource,
+  });
   const { definition, register } = resolved;
   if (definition?.id && definition.id !== record.id) {
     pushPluginLoadError(

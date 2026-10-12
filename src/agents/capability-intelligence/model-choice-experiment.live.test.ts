@@ -4230,7 +4230,7 @@ describeV1JSchemaCapture("v1J provider schema capture-only entrypoint", () => {
       liveness.record("capture-entrypoint-start");
       let workspaceDir: string | undefined;
       const captured: CapturedModelRequest[] = [];
-      const authorizedSchemas: V1JAuthorizedToolSchema[] = [];
+      let authorizedSchemas: V1JAuthorizedToolSchema[] = [];
       let imageFactoryObservation: V1JImageFactoryObservation | undefined;
       const abortController = new AbortController();
       let delegatedRequests = 0;
@@ -4279,7 +4279,9 @@ describeV1JSchemaCapture("v1J provider schema capture-only entrypoint", () => {
             onProviderDispatchAttempt: (count) => {
               providerDispatchAttempts = count;
             },
-            onAuthorizedToolsCaptured: (tools) => authorizedSchemas.push(...tools),
+            onAuthorizedToolsCaptured: (tools) => {
+              authorizedSchemas = [...tools];
+            },
             onRequestCaptured: (request) => captured.push(request),
             onDelegatedRequest: () => {
               delegatedRequests += 1;

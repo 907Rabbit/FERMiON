@@ -352,6 +352,8 @@ export function prepareEmbeddedAttemptToolBase(params: {
           cronCreatorToolAllowlistCaptureRef,
           authProfileStore: attempt.authProfileStore,
           recordToolPrepStage: params.markCoreToolStage,
+          onImageToolPreparationDiagnostic:
+            attempt.capabilityIntelligenceExperiment?.onImageToolPreparationDiagnostic,
           onToolOutcome: attempt.onToolOutcome,
           isTurnTainted: attempt.isTurnTainted,
           allocateToolOutcomeOrdinal: attempt.allocateToolOutcomeOrdinal,

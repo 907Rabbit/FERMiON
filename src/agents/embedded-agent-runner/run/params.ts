@@ -54,6 +54,7 @@ import type { ContextEngineTurnAttemptFacts } from "../../harness/context-engine
 import type { ExpectedAgentHarnessRuntimeArtifact } from "../../harness/runtime-artifact.types.js";
 import type { AgentInternalEvent } from "../../internal-events.js";
 import type { PreparedModelThinkingCapability } from "../../model-catalog-lookup.js";
+import type { ImageToolPreparationDiagnostic } from "../../openclaw-tools.types.js";
 import type {
   PostResponseCheckpoint,
   PostResponseCounter,
@@ -171,6 +172,7 @@ export type EmbeddedCapabilityIntelligenceExperimentHooks = {
       parameters: unknown;
     }[],
   ) => void;
+  onImageToolPreparationDiagnostic?: (event: ImageToolPreparationDiagnostic) => void;
   onModelLoopSubstage?: (event: {
     stage: EmbeddedCapabilityIntelligenceModelLoopSubstage;
     elapsedMs: number;

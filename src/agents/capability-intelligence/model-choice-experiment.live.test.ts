@@ -166,6 +166,9 @@ type V1JCaptureCheckpoint =
   | "schema-sink-fsync-or-close-complete"
   | "schema-sink-error"
   | "schema-sink-complete"
+  | "image-tool-factory"
+  | "image-tool-pre-authorization"
+  | "image-tool-post-authorization"
   | "provider-dispatch-guard-reached"
   | "prepared-runtime-heartbeat"
   | "capture-entrypoint-complete";
@@ -238,6 +241,11 @@ function createV1JCaptureLiveness(name: V1JSchemaCaptureName, diagnosticId?: str
         errorMessage?: string;
         targetPath?: string;
         validationAudit?: V1JSchemaValidationAudit;
+        imageFactoryCalled?: boolean;
+        imageFactoryReturnedTool?: boolean;
+        imageFactoryToolName?: string;
+        viewImagePresent?: boolean;
+        imagePresent?: boolean;
       } = {},
     ) {
       if (closed) {
@@ -283,6 +291,19 @@ function createV1JCaptureLiveness(name: V1JSchemaCaptureName, diagnosticId?: str
         ...(metadata.validationAudit === undefined
           ? {}
           : { validationAudit: metadata.validationAudit }),
+        ...(metadata.imageFactoryCalled === undefined
+          ? {}
+          : { imageFactoryCalled: metadata.imageFactoryCalled }),
+        ...(metadata.imageFactoryReturnedTool === undefined
+          ? {}
+          : { imageFactoryReturnedTool: metadata.imageFactoryReturnedTool }),
+        ...(metadata.imageFactoryToolName === undefined
+          ? {}
+          : { imageFactoryToolName: metadata.imageFactoryToolName }),
+        ...(metadata.viewImagePresent === undefined
+          ? {}
+          : { viewImagePresent: metadata.viewImagePresent }),
+        ...(metadata.imagePresent === undefined ? {} : { imagePresent: metadata.imagePresent }),
       };
       fs.writeSync(fd, `${JSON.stringify(row)}\n`);
       fs.fsyncSync(fd);
@@ -2978,6 +2999,29 @@ async function runOne(input: {
               : {}),
           capabilityIntelligenceExperiment: {
             ...diagnostics.hooks,
+            onImageToolPreparationDiagnostic: (event) => {
+              const checkpoint =
+                event.stage === "factory"
+                  ? "image-tool-factory"
+                  : event.stage === "pre-authorization"
+                    ? "image-tool-pre-authorization"
+                    : "image-tool-post-authorization";
+              const metadata =
+                event.stage === "factory"
+                  ? {
+                      imageFactoryCalled: event.imageFactoryCalled,
+                      imageFactoryReturnedTool: event.imageFactoryReturnedTool,
+                      ...(event.imageFactoryToolName
+                        ? { imageFactoryToolName: event.imageFactoryToolName }
+                        : {}),
+                    }
+                  : {
+                      viewImagePresent: event.viewImagePresent,
+                      imagePresent: event.imagePresent,
+                    };
+              input.requestCapture?.liveness?.record(checkpoint, metadata);
+              diagnostics.hooks.onImageToolPreparationDiagnostic?.(event);
+            },
             onAuthorizedToolsPrepared: (tools) => {
               authorizedToolSchemas = tools;
               input.requestCapture?.onAuthorizedToolsCaptured?.(tools);

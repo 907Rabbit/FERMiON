@@ -141,7 +141,7 @@ export function createOpenClawTools(options?: OpenClawToolsOptions): AnyAgentToo
     onYield: options?.onYield,
   });
   const taskKey = normalizeOptionalString(options?.runSessionKey ?? options?.agentSessionKey);
-  const imageTool =
+  const imageFactoryCalled = Boolean(
     options?.agentDir &&
     resolveImageToolFactoryAvailable({
       config: availabilityConfig ?? resolvedConfig,
@@ -150,23 +150,31 @@ export function createOpenClawTools(options?: OpenClawToolsOptions): AnyAgentToo
       modelHasVision: options?.modelHasVision,
       authStore: options?.authProfileStore,
       preparedModelRuntime: options?.preparedModelRuntime,
-    })
-      ? createImageTool({
-          config: availabilityConfig ?? options?.config,
-          agentId: sessionAgentId,
-          agentDir: options.agentDir,
-          preparedModelRuntime: options?.preparedModelRuntime,
-          authProfileStore: options?.authProfileStore,
-          workspaceDir,
-          sandbox,
-          fsPolicy: options?.fsPolicy,
-          agentChannel: options?.agentChannel,
-          agentAccountId: options?.agentAccountId,
-          currentChannelId: options?.currentChannelId,
-          modelHasVision: options?.modelHasVision,
-          deferAutoModelResolution: true,
-        })
-      : null;
+    }),
+  );
+  const imageTool = imageFactoryCalled
+    ? createImageTool({
+        config: availabilityConfig ?? options?.config,
+        agentId: sessionAgentId,
+        agentDir: options?.agentDir,
+        preparedModelRuntime: options?.preparedModelRuntime,
+        authProfileStore: options?.authProfileStore,
+        workspaceDir,
+        sandbox,
+        fsPolicy: options?.fsPolicy,
+        agentChannel: options?.agentChannel,
+        agentAccountId: options?.agentAccountId,
+        currentChannelId: options?.currentChannelId,
+        modelHasVision: options?.modelHasVision,
+        deferAutoModelResolution: true,
+      })
+    : null;
+  options?.onImageToolPreparationDiagnostic?.({
+    stage: "factory",
+    imageFactoryCalled,
+    imageFactoryReturnedTool: imageTool !== null,
+    ...(imageTool ? { imageFactoryToolName: imageTool.name } : {}),
+  });
   options?.recordToolPrepStage?.("openclaw-tools:image-tool");
   const mediaGenerationToolOptions = {
     config: options?.config,

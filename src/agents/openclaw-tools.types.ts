@@ -15,6 +15,19 @@ import type { SpawnedToolContext } from "./spawned-context.js";
 import type { ToolFsPolicy } from "./tool-fs-policy.js";
 import type { CronToolOptions } from "./tools/cron-tool.types.js";
 
+export type ImageToolPreparationDiagnostic =
+  | {
+      stage: "factory";
+      imageFactoryCalled: boolean;
+      imageFactoryReturnedTool: boolean;
+      imageFactoryToolName?: string;
+    }
+  | {
+      stage: "pre-authorization" | "post-authorization";
+      viewImagePresent: boolean;
+      imagePresent: boolean;
+    };
+
 export type OpenClawToolsOptions = {
   sandboxBrowserBridgeUrl?: string;
   allowHostBrowserControl?: boolean;
@@ -121,6 +134,8 @@ export type OpenClawToolsOptions = {
   beforeToolCallHookContext?: HookContext;
   /** Records hot-path tool-prep stages for reply startup diagnostics. */
   recordToolPrepStage?: (name: string) => void;
+  /** Optional name-only image factory/authorization trace for bounded diagnostics. */
+  onImageToolPreparationDiagnostic?: (event: ImageToolPreparationDiagnostic) => void;
   /** Trusted sender id from inbound context (not tool args). */
   requesterSenderId?: string | null;
   /** Ephemeral session UUID — regenerated on /new and /reset. */

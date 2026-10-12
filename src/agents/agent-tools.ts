@@ -72,6 +72,7 @@ import { createMemoryWriteProvenanceObserver } from "./memory-write-provenance.j
 import type { ModelAuthMode } from "./model-auth.js";
 import { resolveOpenClawPluginToolsForOptions } from "./openclaw-plugin-tools.js";
 import { createOpenClawTools, filterToolsByClientCaps } from "./openclaw-tools.js";
+import type { ImageToolPreparationDiagnostic } from "./openclaw-tools.types.js";
 import type { PreparedModelRuntimeSnapshot } from "./prepared-model-runtime.js";
 import type { SandboxContext } from "./sandbox.js";
 import {
@@ -357,6 +358,8 @@ type OpenClawCodingToolsOptions = {
   claimYieldCompletion?: () => boolean | Promise<boolean>;
   /** Optional instrumentation callback for tool preparation stage timing. */
   recordToolPrepStage?: (name: string) => void;
+  /** Optional name-only image factory/authorization trace for bounded diagnostics. */
+  onImageToolPreparationDiagnostic?: (event: ImageToolPreparationDiagnostic) => void;
   /** Live observer called after wrapped tool outcomes are recorded. */
   onToolOutcome?: ToolOutcomeObserver;
   /** Reads the sticky untrusted-content flag for the current user turn. */
@@ -847,6 +850,7 @@ function createOpenClawCodingToolsInternal(options?: OpenClawCodingToolsOptions)
             requesterSenderId: options?.senderId,
             senderIsOwner: options?.senderIsOwner,
             authProfileStore: options?.authProfileStore,
+            onImageToolPreparationDiagnostic: options?.onImageToolPreparationDiagnostic,
             sessionId: options?.sessionId,
             conversationRecall: options?.conversationRecall,
             oneShotCliRun: options?.oneShotCliRun,
@@ -862,6 +866,11 @@ function createOpenClawCodingToolsInternal(options?: OpenClawCodingToolsOptions)
     ...toolSearchTools,
   ];
   options?.recordToolPrepStage?.("openclaw-tools");
+  options?.onImageToolPreparationDiagnostic?.({
+    stage: "pre-authorization",
+    viewImagePresent: tools.some((tool) => tool.name === "view_image"),
+    imagePresent: tools.some((tool) => tool.name === "image"),
+  });
   const swarmStructuredOutputTool =
     options?.swarmCollector && options.swarmOutputSchema
       ? tools.find((tool) => tool.name === "structured_output")
@@ -956,6 +965,11 @@ function createOpenClawCodingToolsInternal(options?: OpenClawCodingToolsOptions)
     // Collector output is a run contract, not an operator-configurable capability.
     authorizedTools.push(swarmStructuredOutputTool);
   }
+  options?.onImageToolPreparationDiagnostic?.({
+    stage: "post-authorization",
+    viewImagePresent: authorizedTools.some((tool) => tool.name === "view_image"),
+    imagePresent: authorizedTools.some((tool) => tool.name === "image"),
+  });
   processToolAvailabilityRef.value = authorizedTools.some((tool) => tool.name === "process");
   if (shouldInheritEffectiveToolAllowlist) {
     // Snapshot exporter only: this copies authorizedTools for descendants and

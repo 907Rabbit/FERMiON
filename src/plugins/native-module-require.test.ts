@@ -100,6 +100,28 @@ describe("tryNativeRequireJavaScriptModule", () => {
     ).toEqual({ ok: false });
   });
 
+  it("declines export-map errors so ESM-compatible source fallback can run", () => {
+    const dir = tempDirs.make("openclaw-native-require-");
+    const packageDir = path.join(dir, "node_modules", "esm-only");
+    fs.mkdirSync(packageDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(packageDir, "package.json"),
+      JSON.stringify({
+        name: "esm-only",
+        type: "module",
+        exports: { import: "./index.js" },
+      }),
+      "utf8",
+    );
+    fs.writeFileSync(path.join(packageDir, "index.js"), "export const marker = true;\n", "utf8");
+    const modulePath = path.join(dir, "plugin.cjs");
+    fs.writeFileSync(modulePath, 'require("esm-only");\n', "utf8");
+
+    expect(tryNativeRequireJavaScriptModule(modulePath, { allowWindows: true })).toEqual({
+      ok: false,
+    });
+  });
+
   beforeAll(() => {
     const dir = tempDirs.make("openclaw-native-require-");
     const sdkPath = path.join(dir, "sdk.js");

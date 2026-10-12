@@ -153,6 +153,7 @@ type V1JCaptureCheckpoint =
   | "schema-sink-provider-copy-complete"
   | "schema-sink-canonicalize-start"
   | "schema-sink-canonicalize-complete"
+  | "schema-sink-validation"
   | "schema-sink-validate-start"
   | "schema-sink-validate-complete"
   | "schema-sink-mkdir-start"
@@ -170,6 +171,27 @@ type V1JCaptureCheckpoint =
   | "capture-entrypoint-complete";
 
 type V1JCaptureLiveness = ReturnType<typeof createV1JCaptureLiveness>;
+type V1JSchemaValidationAudit = {
+  authorizedCount: number;
+  providerCount: number;
+  authorizedUniqueCount: number;
+  providerUniqueCount: number;
+  authorizedNamesUnique: boolean;
+  providerNamesUnique: boolean;
+  authorizedNamesSha256: string;
+  providerNamesSha256: string;
+  authorizedDuplicateNames: string[];
+  providerDuplicateNames: string[];
+  authorizedOnlyNames: string[];
+  providerOnlyNames: string[];
+  missingAuthorizedSchemas: Array<{ index: number; name?: string; missingFields: string[] }>;
+  missingProviderSchemas: Array<{ index: number; name?: string; missingFields: string[] }>;
+  providerSubsetOfAuthorized: boolean;
+  complete31ToolAuthorizedSurface: boolean;
+  complete31ToolProviderSurface: boolean;
+  authorizedNameSetMatchesExpected: boolean;
+  validationPredicatesFailed: string[];
+};
 
 const V1J_SCHEMA_CAPTURE_NAME_ARM: Record<V1JSchemaCaptureName, V1JSchemaCaptureArm> = {
   "capture-1": "A",
@@ -215,6 +237,7 @@ function createV1JCaptureLiveness(name: V1JSchemaCaptureName, diagnosticId?: str
         errorCode?: string | number;
         errorMessage?: string;
         targetPath?: string;
+        validationAudit?: V1JSchemaValidationAudit;
       } = {},
     ) {
       if (closed) {
@@ -257,6 +280,9 @@ function createV1JCaptureLiveness(name: V1JSchemaCaptureName, diagnosticId?: str
         ...(metadata.errorCode === undefined ? {} : { errorCode: metadata.errorCode }),
         ...(metadata.errorMessage === undefined ? {} : { errorMessage: metadata.errorMessage }),
         ...(metadata.targetPath === undefined ? {} : { targetPath: metadata.targetPath }),
+        ...(metadata.validationAudit === undefined
+          ? {}
+          : { validationAudit: metadata.validationAudit }),
       };
       fs.writeSync(fd, `${JSON.stringify(row)}\n`);
       fs.fsyncSync(fd);
@@ -394,6 +420,7 @@ function persistV1JSchemaCapture(input: {
   authorizedTools: readonly V1JAuthorizedToolSchema[];
   providerTools: unknown;
   model: string;
+  expectedAuthorizedNames?: readonly string[];
   invocation?: {
     index: number;
     caseId: string;
@@ -417,6 +444,7 @@ function persistV1JSchemaCapture(input: {
       errorName?: string;
       errorCode?: string | number;
       errorMessage?: string;
+      validationAudit?: V1JSchemaValidationAudit;
     },
   ) => void;
 }): void {
@@ -446,7 +474,11 @@ function persistV1JSchemaCapture(input: {
   let targetPath = "schema-baseline";
   const checkpoint = (
     name: V1JCaptureCheckpoint,
-    metadata: { operation?: string; targetPath?: string } = {},
+    metadata: {
+      operation?: string;
+      targetPath?: string;
+      validationAudit?: V1JSchemaValidationAudit;
+    } = {},
   ) => input.recordCheckpoint?.(name, { ...invocationMetadata, ...metadata });
   const runOperation = <T>(
     operationName: string,
@@ -511,6 +543,106 @@ function persistV1JSchemaCapture(input: {
         ) {
           throw new Error("v1J schema capture output path escapes schema-baseline directory");
         }
+        const authorizedNameSet = new Set(
+          authorizedNames.filter((name): name is string => Boolean(name)),
+        );
+        const providerNameSet = new Set(
+          providerNames.filter((name): name is string => Boolean(name)),
+        );
+        const duplicateNames = (names: Array<string | undefined>) =>
+          [
+            ...new Set(
+              names.filter(
+                (name): name is string =>
+                  Boolean(name) && names.indexOf(name) !== names.lastIndexOf(name),
+              ),
+            ),
+          ].toSorted();
+        const missingSchemas = (
+          tools: unknown[],
+          names: Array<string | undefined>,
+          provider: boolean,
+        ): V1JSchemaValidationAudit["missingAuthorizedSchemas"] =>
+          tools.flatMap((tool, index) => {
+            const record =
+              tool && typeof tool === "object" && !Array.isArray(tool)
+                ? (tool as Record<string, unknown>)
+                : undefined;
+            const schema =
+              provider && record?.function && typeof record.function === "object"
+                ? (record.function as Record<string, unknown>)
+                : record;
+            const missingFields = [
+              ...(typeof names[index] === "string" && names[index] ? [] : ["name"]),
+              ...(schema && Object.hasOwn(schema, "parameters") && schema.parameters != null
+                ? []
+                : ["parameters"]),
+            ];
+            return missingFields.length > 0
+              ? [{ index, ...(names[index] ? { name: names[index] } : {}), missingFields }]
+              : [];
+          });
+        const nameDigest = (names: Array<string | undefined>) =>
+          createHash("sha256")
+            .update(
+              JSON.stringify(
+                names.toSorted((left, right) => (left ?? "").localeCompare(right ?? "")),
+              ),
+            )
+            .digest("hex");
+        const authorizedOnlyNames = [...authorizedNameSet]
+          .filter((name) => !providerNameSet.has(name))
+          .toSorted();
+        const providerOnlyNames = [...providerNameSet]
+          .filter((name) => !authorizedNameSet.has(name))
+          .toSorted();
+        const missingAuthorizedSchemas = missingSchemas(authorizedTools, authorizedNames, false);
+        const missingProviderSchemas = missingSchemas(providerTools, providerNames, true);
+        const expectedAuthorizedNameSet = new Set(input.expectedAuthorizedNames ?? authorizedNames);
+        const authorizedNameSetMatchesExpected =
+          authorizedNameSet.size === expectedAuthorizedNameSet.size &&
+          [...authorizedNameSet].every((name) => expectedAuthorizedNameSet.has(name));
+        const providerSubsetOfAuthorized = providerOnlyNames.length === 0;
+        const validationAudit: V1JSchemaValidationAudit = {
+          authorizedCount: authorizedNames.length,
+          providerCount: providerNames.length,
+          authorizedUniqueCount: authorizedNameSet.size,
+          providerUniqueCount: providerNameSet.size,
+          authorizedNamesUnique: authorizedNameSet.size === authorizedNames.length,
+          providerNamesUnique: providerNameSet.size === providerNames.length,
+          authorizedNamesSha256: nameDigest(authorizedNames),
+          providerNamesSha256: nameDigest(providerNames),
+          authorizedDuplicateNames: duplicateNames(authorizedNames),
+          providerDuplicateNames: duplicateNames(providerNames),
+          authorizedOnlyNames,
+          providerOnlyNames,
+          missingAuthorizedSchemas,
+          missingProviderSchemas,
+          providerSubsetOfAuthorized,
+          complete31ToolAuthorizedSurface:
+            authorizedNames.length === 31 &&
+            authorizedNameSet.size === 31 &&
+            missingAuthorizedSchemas.length === 0,
+          complete31ToolProviderSurface:
+            providerNames.length === 31 &&
+            providerNameSet.size === 31 &&
+            missingProviderSchemas.length === 0,
+          authorizedNameSetMatchesExpected,
+          validationPredicatesFailed: [
+            ...(providerNames.length === 31 ? [] : ["providerCountIs31"]),
+            ...(authorizedNames.length === 31 ? [] : ["authorizedCountIs31"]),
+            ...(providerNames.every((name) => Boolean(name)) ? [] : ["providerNamesPresent"]),
+            ...(authorizedNames.every((name) => Boolean(name)) ? [] : ["authorizedNamesPresent"]),
+            ...(providerNameSet.size === 31 ? [] : ["providerUniqueCountIs31"]),
+            ...(authorizedNameSet.size === 31 ? [] : ["authorizedUniqueCountIs31"]),
+            ...(providerSubsetOfAuthorized ? [] : ["providerSubsetOfAuthorized"]),
+          ],
+        };
+        checkpoint("schema-sink-validation", {
+          operation: "independent-surface-predicate-audit",
+          targetPath: "tool-surface-metadata-only",
+          validationAudit,
+        });
         if (fs.existsSync(toolsPath) || fs.existsSync(metadataPath)) {
           throw new Error(`v1J schema capture already exists: ${input.name}`);
         }
@@ -2717,6 +2849,7 @@ async function runOne(input: {
         authorizedTools: authorizedToolSchemas,
         providerTools: body.tools,
         model: runModel,
+        expectedAuthorizedNames: input.authorizedNames,
         invocation,
         recordCheckpoint: (checkpoint, metadata) =>
           input.requestCapture?.liveness?.record(checkpoint, metadata),
@@ -3260,6 +3393,7 @@ describe("v1I offline request preparation", () => {
         "schema-sink-mkdir-start",
         "schema-sink-mkdir-complete",
         "schema-sink-validate-start",
+        "schema-sink-validation",
         "schema-sink-validate-complete",
         "schema-sink-canonicalize-start",
         "schema-sink-canonicalize-complete",
@@ -3272,6 +3406,64 @@ describe("v1I offline request preparation", () => {
         "schema-sink-fsync-or-close-complete",
         "schema-sink-write-metadata-complete",
       ]);
+      const validAudit = checkpoints.find(
+        ({ checkpoint }) => checkpoint === "schema-sink-validation",
+      )?.metadata.validationAudit as V1JSchemaValidationAudit | undefined;
+      expect(validAudit).toMatchObject({
+        authorizedCount: 31,
+        providerCount: 31,
+        authorizedUniqueCount: 31,
+        providerUniqueCount: 31,
+        authorizedNamesUnique: true,
+        providerNamesUnique: true,
+        authorizedOnlyNames: [],
+        providerOnlyNames: [],
+        providerSubsetOfAuthorized: true,
+        complete31ToolAuthorizedSurface: true,
+        complete31ToolProviderSurface: true,
+        validationPredicatesFailed: [],
+      });
+      expect(validAudit?.authorizedNamesSha256).toMatch(/^[a-f0-9]{64}$/);
+      expect(validAudit?.providerNamesSha256).toMatch(/^[a-f0-9]{64}$/);
+      expect(fs.readFileSync(liveness.filePath, "utf8")).not.toContain("Capability ");
+
+      expect(() =>
+        persistV1JSchemaCapture({
+          name: "capture-2",
+          arm: "A",
+          model: "qwen/qwen3.5-9b",
+          authorizedTools,
+          providerTools: providerTools.slice(1),
+          expectedAuthorizedNames: names,
+          invocation: {
+            index: 2,
+            caseId: "test-case",
+            arm: "A",
+            replicate: 1,
+            providerRequestPhase: "offline-test",
+            callSite: "offline-test",
+          },
+          recordCheckpoint: (checkpoint, metadata) => {
+            checkpoints.push({ checkpoint, metadata });
+            liveness.record(checkpoint, metadata);
+          },
+        }),
+      ).toThrow("matching complete 31-tool surfaces");
+      const projectedAudit = checkpoints.findLast(
+        ({ checkpoint }) => checkpoint === "schema-sink-validation",
+      )?.metadata.validationAudit as V1JSchemaValidationAudit | undefined;
+      expect(projectedAudit).toMatchObject({
+        authorizedCount: 31,
+        providerCount: 30,
+        providerNamesUnique: true,
+        authorizedOnlyNames: [names[0]],
+        providerOnlyNames: [],
+        providerSubsetOfAuthorized: true,
+        complete31ToolAuthorizedSurface: true,
+        complete31ToolProviderSurface: false,
+        authorizedNameSetMatchesExpected: true,
+        validationPredicatesFailed: ["providerCountIs31", "providerUniqueCountIs31"],
+      });
       expect(() =>
         persistV1JSchemaCapture({
           name: "capture-1",
@@ -3280,7 +3472,7 @@ describe("v1I offline request preparation", () => {
           authorizedTools,
           providerTools,
           invocation: {
-            index: 2,
+            index: 3,
             caseId: "test-case",
             arm: "A",
             replicate: 1,
@@ -3310,7 +3502,7 @@ describe("v1I offline request preparation", () => {
       });
       expect(rows.at(-1)).toMatchObject({
         checkpoint: "schema-sink-error",
-        sinkInvocationIndex: 2,
+        sinkInvocationIndex: 3,
         operation: "capture-validation",
         errorName: "Error",
         errorMessage: "v1J schema capture already exists: capture-1",

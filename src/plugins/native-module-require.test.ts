@@ -31,21 +31,27 @@ describe("tryNativeRequireJavaScriptModule", () => {
     expect(result).toEqual({ ok: true, moduleExport: { marker: "native" } });
   });
 
+  it("loads file URL entries natively without source fallback", () => {
+    const dir = tempDirs.make("openclaw-native-file-url-");
+    const modulePath = path.join(dir, "plugin.cjs");
+    fs.writeFileSync(modulePath, 'module.exports = { marker: "file-url-native" };\n', "utf8");
+
+    expect(
+      tryNativeRequireJavaScriptModule(pathToFileURL(modulePath).href, { allowWindows: true }),
+    ).toEqual({ ok: true, moduleExport: { marker: "file-url-native" } });
+  });
+
   it("records native success and fallback decision diagnostics when enabled", () => {
     const dir = tempDirs.make("openclaw-native-require-diagnostics-");
     const diagnosticPath = path.join(dir, "diagnostics.jsonl");
     const nativePath = path.join(dir, "native.cjs");
     fs.writeFileSync(nativePath, 'module.exports = { marker: "native" };\n', "utf8");
-    const packageDir = path.join(dir, "node_modules", "esm-only");
-    fs.mkdirSync(packageDir, { recursive: true });
+    const fallbackPath = path.join(dir, "fallback.cjs");
     fs.writeFileSync(
-      path.join(packageDir, "package.json"),
-      JSON.stringify({ name: "esm-only", type: "module", exports: { import: "./index.js" } }),
+      fallbackPath,
+      'throw Object.assign(new Error("entry export-map incompatibility"), { code: "ERR_PACKAGE_PATH_NOT_EXPORTED" });\n',
       "utf8",
     );
-    fs.writeFileSync(path.join(packageDir, "index.js"), "export const marker = true;\n", "utf8");
-    const fallbackPath = path.join(dir, "fallback.cjs");
-    fs.writeFileSync(fallbackPath, 'require("esm-only");\n', "utf8");
     const previousDiagnosticPath = process.env.OPENCLAW_PLUGIN_LOADER_DIAGNOSTICS_FILE;
     process.env.OPENCLAW_PLUGIN_LOADER_DIAGNOSTICS_FILE = diagnosticPath;
     try {
@@ -74,6 +80,7 @@ describe("tryNativeRequireJavaScriptModule", () => {
       "fallback-decision-complete",
     ]);
     expect(stages.at(-1)?.selected).toBe(true);
+    expect(stages.at(4)?.errorOrigin).toBe("TOP_LEVEL_ENTRY");
   });
 
   it("declines modules that need source-transform fallback", () => {
@@ -137,15 +144,29 @@ describe("tryNativeRequireJavaScriptModule", () => {
     const modulePath = path.join(dir, "plugin.cjs");
     fs.writeFileSync(modulePath, 'require("openclaw/plugin-sdk/core");\n', "utf8");
 
-    expect(
+    expect(() =>
       tryNativeRequireJavaScriptModule(modulePath, {
         allowWindows: true,
         fallbackOnMissingDependency: true,
       }),
-    ).toEqual({ ok: false });
+    ).toThrow("openclaw/plugin-sdk/core");
   });
 
-  it("declines export-map errors so ESM-compatible source fallback can run", () => {
+  it("declines a top-level export-map error so ESM-compatible source fallback can run", () => {
+    const dir = tempDirs.make("openclaw-native-require-");
+    const modulePath = path.join(dir, "plugin.cjs");
+    fs.writeFileSync(
+      modulePath,
+      'throw Object.assign(new Error("entry export-map incompatibility"), { code: "ERR_PACKAGE_PATH_NOT_EXPORTED" });\n',
+      "utf8",
+    );
+
+    expect(tryNativeRequireJavaScriptModule(modulePath, { allowWindows: true })).toEqual({
+      ok: false,
+    });
+  });
+
+  it("propagates transitive export-map errors without selecting source fallback", () => {
     const dir = tempDirs.make("openclaw-native-require-");
     const packageDir = path.join(dir, "node_modules", "esm-only");
     fs.mkdirSync(packageDir, { recursive: true });
@@ -162,9 +183,12 @@ describe("tryNativeRequireJavaScriptModule", () => {
     const modulePath = path.join(dir, "plugin.cjs");
     fs.writeFileSync(modulePath, 'require("esm-only");\n', "utf8");
 
-    expect(tryNativeRequireJavaScriptModule(modulePath, { allowWindows: true })).toEqual({
-      ok: false,
-    });
+    expect(() =>
+      tryNativeRequireJavaScriptModule(modulePath, {
+        allowWindows: true,
+        fallbackOnMissingDependency: true,
+      }),
+    ).toThrow("esm-only");
   });
 
   beforeAll(() => {
@@ -219,18 +243,18 @@ describe("tryNativeRequireJavaScriptModule", () => {
     expect(nativeEsmGraphProbe.stdout.trim()).toBe("adapter");
   });
 
-  it("declines missing dependency errors when the caller can use source transform fallback", () => {
+  it("propagates transitive missing dependency errors even when fallback is available", () => {
     const dir = tempDirs.make("openclaw-native-require-");
     const modulePath = path.join(dir, "plugin.cjs");
     fs.writeFileSync(modulePath, 'require("./helper.js");\n', "utf8");
     fs.writeFileSync(path.join(dir, "helper.ts"), "export const loaded = true;\n", "utf8");
 
-    expect(
+    expect(() =>
       tryNativeRequireJavaScriptModule(modulePath, {
         allowWindows: true,
         fallbackOnNativeError: true,
       }),
-    ).toEqual({ ok: false });
+    ).toThrow("helper.js");
   });
 
   it("propagates real module evaluation errors instead of falling back", () => {

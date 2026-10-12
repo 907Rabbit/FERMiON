@@ -5,6 +5,9 @@ export type PluginModuleLoaderDiagnostic = Readonly<{
   stage: string;
   modulePath?: string;
   code?: string;
+  errorOrigin?: "TOP_LEVEL_ENTRY" | "TRANSITIVE_DEPENDENCY" | "UNKNOWN";
+  errorPackage?: string;
+  errorModule?: string;
   errorName?: string;
   selected?: boolean;
 }>;

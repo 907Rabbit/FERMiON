@@ -131,6 +131,28 @@ type CapturedModelRequest = {
 type V1JSchemaCaptureName = "capture-1" | "capture-2" | "arm-a" | "arm-c";
 type V1JSchemaCaptureArm = "A" | "C";
 type V1JAuthorizedToolSchema = { name: string; description?: string; parameters: unknown };
+type V1JCaptureCheckpoint =
+  | "capture-entrypoint-start"
+  | "config-loaded"
+  | "isolated-state-resolved"
+  | "prepared-runtime-start"
+  | "plugin-discovery-start"
+  | "plugin-discovery-complete"
+  | "runtime-registry-start"
+  | "runtime-registry-complete"
+  | "selected-runtime-load-start"
+  | "selected-runtime-load-complete"
+  | "authorized-catalog-start"
+  | "authorized-catalog-complete"
+  | "provider-tool-projection-start"
+  | "provider-tool-projection-complete"
+  | "schema-sink-start"
+  | "schema-sink-complete"
+  | "provider-dispatch-guard-reached"
+  | "prepared-runtime-heartbeat"
+  | "capture-entrypoint-complete";
+
+type V1JCaptureLiveness = ReturnType<typeof createV1JCaptureLiveness>;
 
 const V1J_SCHEMA_CAPTURE_NAME_ARM: Record<V1JSchemaCaptureName, V1JSchemaCaptureArm> = {
   "capture-1": "A",
@@ -138,6 +160,97 @@ const V1J_SCHEMA_CAPTURE_NAME_ARM: Record<V1JSchemaCaptureName, V1JSchemaCapture
   "arm-a": "A",
   "arm-c": "C",
 };
+
+function createV1JCaptureLiveness(name: V1JSchemaCaptureName) {
+  const root = path.resolve(
+    "artifacts/capability-intelligence/v1j-action-initiation/schema-baseline",
+  );
+  const filePath = path.join(root, `${name}-liveness.jsonl`);
+  if (path.relative(root, filePath).startsWith(`..${path.sep}`) || fs.existsSync(filePath)) {
+    throw new Error("v1J capture liveness output is unsafe or already exists");
+  }
+  fs.mkdirSync(root, { recursive: true });
+  const fd = fs.openSync(filePath, "wx");
+  const startedAt = process.hrtime.bigint();
+  let lastSuccessfulCheckpoint: V1JCaptureCheckpoint | null = null;
+  let selectedRuntimes: string[] = [];
+  let lastLoadedRuntime: string | null = null;
+  let closed = false;
+  return {
+    filePath,
+    record(
+      checkpoint: V1JCaptureCheckpoint,
+      metadata: {
+        selectedRuntimes?: readonly string[];
+        runtimeId?: string;
+        providerDispatchAttempts?: number;
+        eventLoopDelayMs?: number;
+        errorName?: string;
+      } = {},
+    ) {
+      if (closed) {
+        throw new Error("v1J capture liveness journal is closed");
+      }
+      if (metadata.selectedRuntimes) {
+        selectedRuntimes = [...metadata.selectedRuntimes];
+      }
+      if (checkpoint === "selected-runtime-load-complete" && metadata.runtimeId) {
+        lastLoadedRuntime = metadata.runtimeId;
+      }
+      const row = {
+        timestamp: new Date().toISOString(),
+        checkpoint,
+        elapsedMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000,
+        pid: process.pid,
+        eventLoopPhase: null,
+        ...(metadata.eventLoopDelayMs === undefined
+          ? {}
+          : { eventLoopDelayMs: metadata.eventLoopDelayMs }),
+        selectedRuntimes,
+        lastLoadedRuntime,
+        lastSuccessfulCheckpoint,
+        ...(metadata.providerDispatchAttempts === undefined
+          ? {}
+          : { providerDispatchAttempts: metadata.providerDispatchAttempts }),
+        ...(metadata.errorName === undefined ? {} : { errorName: metadata.errorName }),
+      };
+      fs.writeSync(fd, `${JSON.stringify(row)}\n`);
+      fs.fsyncSync(fd);
+      lastSuccessfulCheckpoint = checkpoint;
+    },
+    close() {
+      if (!closed) {
+        fs.closeSync(fd);
+        closed = true;
+      }
+    },
+  };
+}
+
+function recordV1JRuntimeCheckpoint(
+  liveness: V1JCaptureLiveness | undefined,
+  stage: string,
+  runtimeId?: string,
+): void {
+  if (!liveness) {
+    return;
+  }
+  const checkpoints: Record<string, V1JCaptureCheckpoint> = {
+    "runtime-registry-discovery-started": "plugin-discovery-start",
+    "runtime-registry-discovery-completed": "plugin-discovery-complete",
+    "plugin-prep-runtime-registry-entered": "runtime-registry-start",
+    "plugin-prep-runtime-registry-complete": "runtime-registry-complete",
+    "runtime-registry-candidate-module-load-started": "selected-runtime-load-start",
+    "runtime-registry-candidate-module-load-completed": "selected-runtime-load-complete",
+    "attempt-tool-catalog-entered": "authorized-catalog-start",
+    "attempt-tool-catalog-completed": "authorized-catalog-complete",
+    "provider-adapter-entered": "provider-tool-projection-start",
+  };
+  const checkpoint = checkpoints[stage];
+  if (checkpoint) {
+    liveness.record(checkpoint, runtimeId ? { runtimeId } : {});
+  }
+}
 
 function resolveV1JSchemaCaptureOptions(
   env: NodeJS.ProcessEnv,
@@ -367,6 +480,7 @@ type ExperimentRun = V1IObservation;
 type ModelPayloadCapture = {
   requests: CapturedModelRequest[];
   delegatedRequests: number;
+  providerDispatchAttempts: number;
   responseSummaries: ProviderResponseSummary[];
   originalFetch: typeof globalThis.fetch;
   wrapFetch: (baseFetch: typeof globalThis.fetch) => typeof globalThis.fetch;
@@ -378,6 +492,13 @@ class V1IProviderRequestCapturedError extends Error {
   constructor() {
     super("v1I provider request captured before network I/O");
     this.name = "V1IProviderRequestCapturedError";
+  }
+}
+
+class V1IProviderDispatchAttemptError extends Error {
+  constructor() {
+    super("v1J capture blocked a provider dispatch attempt");
+    this.name = "V1IProviderDispatchAttemptError";
   }
 }
 
@@ -442,6 +563,46 @@ describe("v1I diagnostic resource resolution", () => {
       }
       fs.rmSync(unrelatedCwd, { recursive: true, force: true });
       fs.rmSync(artifactDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("v1J schema-capture dispatch guard", () => {
+  it("blocks the wrapped provider fetch in capture mode and preserves normal dispatch", async () => {
+    let captureFetchCalls = 0;
+    const capture = captureModelPayloads(undefined, {
+      schemaCaptureName: "capture-1",
+    });
+    try {
+      await expect(
+        capture.wrapFetch(async () => {
+          captureFetchCalls += 1;
+          return new Response("{}");
+        })(`${LM_STUDIO_BASE_URL}/chat/completions`, {
+          method: "POST",
+          body: JSON.stringify({ model: MODEL_ID, tools: [] }),
+        }),
+      ).rejects.toBeInstanceOf(V1IProviderDispatchAttemptError);
+      expect(capture.providerDispatchAttempts).toBe(1);
+      expect(captureFetchCalls).toBe(0);
+    } finally {
+      capture.restore();
+    }
+
+    let normalFetchCalls = 0;
+    const normal = captureModelPayloads();
+    try {
+      await normal.wrapFetch(async () => {
+        normalFetchCalls += 1;
+        return new Response("{}", { headers: { "content-type": "application/json" } });
+      })(`${LM_STUDIO_BASE_URL}/chat/completions`, {
+        method: "POST",
+        body: JSON.stringify({ model: MODEL_ID, tools: [] }),
+      });
+      expect(normal.providerDispatchAttempts).toBe(1);
+      expect(normalFetchCalls).toBe(1);
+    } finally {
+      normal.restore();
     }
   });
 });
@@ -2143,6 +2304,8 @@ async function runOne(input: {
     onDelegatedRequest?: () => void;
     onResponseSummary?: (summary: ProviderResponseSummary) => void;
     onAssistantMessage?: (message: AssistantMessage, modelTurnIndex: number) => void;
+    liveness?: V1JCaptureLiveness;
+    onProviderDispatchAttempt?: (count: number) => void;
   };
   abortSignal?: AbortSignal;
   timeoutMs?: number;
@@ -2206,6 +2369,9 @@ async function runOne(input: {
         : { elapsedMs: recordedCheckpoint.elapsedMs },
     );
     input.onCheckpoint?.(checkpoint);
+    if (input.requestCapture?.liveness) {
+      recordV1JRuntimeCheckpoint(input.requestCapture.liveness, checkpoint.stage);
+    }
   };
   if (input.modelLoopDiagnostics) {
     diagnostics.hooks.onModelLoopSubstage = (event) => {
@@ -2237,11 +2403,17 @@ async function runOne(input: {
     });
     diagnosticsHeartbeat?.(heartbeat);
     input.onAcquisitionHeartbeat?.(heartbeat);
+    input.requestCapture?.liveness?.record("prepared-runtime-heartbeat", {
+      eventLoopDelayMs: heartbeat.eventLoopDelayMs,
+    });
   };
   const diagnosticsPluginDiscoveryInputs = diagnostics.hooks.onPreparedRuntimePluginDiscoveryInputs;
   diagnostics.hooks.onPreparedRuntimePluginDiscoveryInputs = (inputs) => {
     diagnosticsPluginDiscoveryInputs?.(inputs);
     input.onPluginPrepDiscoveryInputs?.(inputs);
+    input.requestCapture?.liveness?.record("plugin-discovery-start", {
+      selectedRuntimes: inputs.enabledPluginIds,
+    });
   };
   const diagnosticsPluginTiming = diagnostics.hooks.onPreparedRuntimePluginTiming;
   diagnostics.hooks.onPreparedRuntimePluginTiming = (timing) => {
@@ -2256,6 +2428,7 @@ async function runOne(input: {
     });
     diagnosticsPluginRegistryTrace?.(event);
     input.onPluginPrepRegistryTrace?.(event);
+    recordV1JRuntimeCheckpoint(input.requestCapture?.liveness, event.stage, event.pluginId);
   };
   const diagnosticsPostResponseCheckpoint = diagnostics.hooks.onPostResponseCheckpoint;
   diagnostics.hooks.onPostResponseCheckpoint = (checkpoint) => {
@@ -2324,7 +2497,9 @@ async function runOne(input: {
         ? (payload as Record<string, unknown>)
         : {};
     const request = { body, url: "provider-adapter" };
+    input.requestCapture?.liveness?.record("provider-tool-projection-complete");
     if (input.requestCapture?.schemaCaptureName) {
+      input.requestCapture.liveness?.record("schema-sink-start");
       persistV1JSchemaCapture({
         name: input.requestCapture.schemaCaptureName,
         arm: input.requestCapture.schemaCaptureArm ?? "A",
@@ -2332,6 +2507,7 @@ async function runOne(input: {
         providerTools: body.tools,
         model: runModel,
       });
+      input.requestCapture.liveness?.record("schema-sink-complete");
     }
     capture.recordProviderRequest(request);
     input.requestCapture?.onRequestCaptured?.(request);
@@ -2343,6 +2519,9 @@ async function runOne(input: {
     });
     await diagnosticsProviderRequest?.({ payload, model });
     if (input.requestCapture?.stopAfterCapture) {
+      input.requestCapture.liveness?.record("provider-dispatch-guard-reached", {
+        providerDispatchAttempts: capture.providerDispatchAttempts,
+      });
       throw new V1IProviderRequestCapturedError();
     }
     if (input.requestCapture?.holdAfterCapture) {
@@ -3284,12 +3463,20 @@ describeV1JSchemaCapture("v1J provider schema capture-only entrypoint", () => {
         const realTool = getBenchmarkRealToolMapping(toolName).realTool;
         return realTool ? [realTool] : [];
       });
-      const workspaceDir = fs.mkdtempSync(path.join(os.tmpdir(), "v1j-schema-capture-run-"));
+      const liveness = createV1JCaptureLiveness(captureOptions.name);
+      liveness.record("capture-entrypoint-start");
+      let workspaceDir: string | undefined;
       const captured: CapturedModelRequest[] = [];
       const authorizedSchemas: V1JAuthorizedToolSchema[] = [];
       const abortController = new AbortController();
       let delegatedRequests = 0;
+      let providerDispatchAttempts = 0;
       try {
+        workspaceDir = fs.mkdtempSync(path.join(os.tmpdir(), "v1j-schema-capture-run-"));
+        const config = buildLiveConfig(workspaceDir);
+        liveness.record("config-loaded");
+        liveness.record("isolated-state-resolved");
+        liveness.record("prepared-runtime-start");
         const observation = await runOne({
           mode: "real-exact",
           surfaceMode: "REAL_EXACT_ONLY",
@@ -3302,7 +3489,7 @@ describeV1JSchemaCapture("v1J provider schema capture-only entrypoint", () => {
           replicate: 1,
           attempt: 1,
           scheduleSeed: scheduleSeedFor(benchmarkCase.id, 1),
-          config: buildLiveConfig(workspaceDir),
+          config,
           workspaceDir,
           directRunner: true,
           provider: PROVIDER,
@@ -3311,6 +3498,10 @@ describeV1JSchemaCapture("v1J provider schema capture-only entrypoint", () => {
           requestCapture: {
             stopAfterCapture: true,
             ...buildV1JSchemaCaptureRequestOptions(captureOptions),
+            liveness,
+            onProviderDispatchAttempt: (count) => {
+              providerDispatchAttempts = count;
+            },
             onAuthorizedToolsCaptured: (tools) => authorizedSchemas.push(...tools),
             onRequestCaptured: (request) => captured.push(request),
             onDelegatedRequest: () => {
@@ -3319,13 +3510,22 @@ describeV1JSchemaCapture("v1J provider schema capture-only entrypoint", () => {
           },
         });
         const failure = observation.requestPreparationDiagnostics?.failure;
+        if (failure?.errorName === "V1IProviderDispatchAttemptError") {
+          throw new Error("v1J capture reached the provider dispatch guard");
+        }
         if (
           observation.valid ||
           failure?.errorName !== "V1IProviderRequestCapturedError" ||
           captured.length !== 1 ||
-          delegatedRequests !== 0
+          delegatedRequests !== 0 ||
+          observation.requestPreparationDiagnostics?.checkpoints.some(
+            (checkpoint) => checkpoint.stage === "provider-request-constructed",
+          ) !== true
         ) {
           throw new Error("v1J capture did not stop cleanly before provider dispatch");
+        }
+        if (providerDispatchAttempts !== 0) {
+          throw new Error("v1J capture recorded a provider dispatch attempt");
         }
         const names = toolNamesFromBody(captured[0]?.body ?? {});
         if (
@@ -3355,13 +3555,24 @@ describeV1JSchemaCapture("v1J provider schema capture-only entrypoint", () => {
         ) {
           throw new Error("v1J capture artifact failed safe-content validation");
         }
+        liveness.record("capture-entrypoint-complete", {
+          providerDispatchAttempts: 0,
+        });
       } finally {
         abortController.abort(new Error("v1J schema capture boundary complete"));
         try {
-          fs.rmSync(workspaceDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+          if (workspaceDir) {
+            fs.rmSync(workspaceDir, {
+              recursive: true,
+              force: true,
+              maxRetries: 3,
+              retryDelay: 50,
+            });
+          }
         } catch {
           // Windows may keep the isolated agent database open until the test process exits.
         }
+        liveness.close();
       }
     },
   );
@@ -3466,6 +3677,9 @@ function captureModelPayloads(
   options?: {
     stopAfterCapture?: boolean;
     holdAfterCapture?: boolean;
+    schemaCaptureName?: V1JSchemaCaptureName;
+    liveness?: V1JCaptureLiveness;
+    onProviderDispatchAttempt?: (count: number) => void;
     onRequestCaptured?: (request: CapturedModelRequest) => void;
     onDelegatedRequest?: () => void;
     onResponseSummary?: (summary: ProviderResponseSummary) => void;
@@ -3475,6 +3689,7 @@ function captureModelPayloads(
   const responseSummaries: ProviderResponseSummary[] = [];
   let providerRequestRecorded = false;
   let delegatedRequests = 0;
+  let providerDispatchAttempts = 0;
   const originalFetch = globalThis.fetch;
   const wrapFetch = (baseFetch: typeof globalThis.fetch): typeof globalThis.fetch => {
     const emitResponseSummary = (summary: ProviderResponseSummary) => {
@@ -3510,6 +3725,14 @@ function captureModelPayloads(
           toolCount: toolNames.length,
           representativeToolNames: toolNames,
         });
+        if (options?.schemaCaptureName) {
+          providerDispatchAttempts += 1;
+          options.onProviderDispatchAttempt?.(providerDispatchAttempts);
+          options.liveness?.record("provider-dispatch-guard-reached", {
+            providerDispatchAttempts,
+          });
+          throw new V1IProviderDispatchAttemptError();
+        }
         if (options?.stopAfterCapture) {
           throw new V1IProviderRequestCapturedError();
         }
@@ -3523,6 +3746,8 @@ function captureModelPayloads(
             signal?.addEventListener("abort", () => reject(abortReason(signal)), { once: true });
           });
         }
+        providerDispatchAttempts += 1;
+        options?.onProviderDispatchAttempt?.(providerDispatchAttempts);
       }
       options?.onDelegatedRequest?.();
       delegatedRequests += 1;
@@ -3568,6 +3793,9 @@ function captureModelPayloads(
   return {
     requests,
     delegatedRequests,
+    get providerDispatchAttempts() {
+      return providerDispatchAttempts;
+    },
     responseSummaries,
     originalFetch,
     wrapFetch,

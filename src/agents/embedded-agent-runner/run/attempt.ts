@@ -47,6 +47,7 @@ import { prepareEmbeddedAttemptSystemPrompt } from "./attempt-system-prompt-prep
 import { prepareEmbeddedAttemptToolCatalog } from "./attempt-tool-catalog.js";
 import { prepareEmbeddedAttemptToolBase } from "./attempt-tool-prepare.js";
 import { prepareEmbeddedAttemptTranscriptLifecycle } from "./attempt-transcript-lifecycle-prepare.js";
+import type { EmbeddedCapabilityIntelligenceCheckpointStage } from "./params.js";
 import {
   measureEmbeddedAgentPreparation,
   measureEmbeddedAgentPreparationSync,
@@ -54,10 +55,26 @@ import {
 import { clearToolActivityRun } from "./tool-activity-heartbeat.js";
 import type { EmbeddedRunAttemptParams, EmbeddedRunAttemptResult } from "./types.js";
 
+function emitAttemptCheckpoint(
+  params: EmbeddedRunAttemptParams,
+  stage: EmbeddedCapabilityIntelligenceCheckpointStage,
+  toolNames?: readonly string[],
+): void {
+  const names =
+    toolNames ??
+    (params.clientTools?.map((tool) => tool.function.name) ?? params.toolsAllow ?? []).slice(0, 8);
+  params.capabilityIntelligenceExperiment?.onCheckpoint?.({
+    stage,
+    toolCount: toolNames?.length ?? params.clientTools?.length ?? params.toolsAllow?.length ?? 0,
+    representativeToolNames: names,
+  });
+}
+
 export async function runEmbeddedAttempt(
   params: EmbeddedRunAttemptParams,
 ): Promise<EmbeddedRunAttemptResult> {
   const runAbortController = new AbortController();
+  emitAttemptCheckpoint(params, "attempt-setup-entered");
   const {
     agentCoreThinkingLevel,
     defaultAgentId,
@@ -83,6 +100,7 @@ export async function runEmbeddedAttempt(
       config: params.config,
     },
   );
+  emitAttemptCheckpoint(params, "attempt-setup-completed");
 
   let restoreSkillEnv: (() => void) | undefined;
   const executionState: EmbeddedAttemptExecutionState = {
@@ -154,6 +172,7 @@ export async function runEmbeddedAttempt(
     state: abortState,
   });
   try {
+    emitAttemptCheckpoint(params, "attempt-skills-entered");
     const preparedSkills = measureEmbeddedAgentPreparationSync(
       "attempt.skills",
       () =>
@@ -168,6 +187,7 @@ export async function runEmbeddedAttempt(
     restoreSkillEnv = preparedSkills.restoreSkillEnv;
     const { codeModeSkills, skillUsagePaths, skillsPrompt, skillsSnapshotForRun } = preparedSkills;
     prepStages.mark("skills");
+    emitAttemptCheckpoint(params, "attempt-skills-completed");
 
     const isRawModelRun = params.modelRun === true || params.promptMode === "none";
     if (isRawModelRun && log.isEnabled("debug")) {
@@ -190,6 +210,7 @@ export async function runEmbeddedAttempt(
     emitDiagnosticRunCompleted = emitCompleted;
     const corePluginToolStages = createEmbeddedRunStageTracker();
     let toolSearchCatalogExecutor: ToolSearchCatalogToolExecutor | undefined;
+    emitAttemptCheckpoint(params, "attempt-tool-base-entered");
     const preparedToolBase = measureEmbeddedAgentPreparationSync(
       "attempt.tool-base",
       () =>
@@ -240,7 +261,9 @@ export async function runEmbeddedAttempt(
     } = preparedToolBase;
     runCleanups = preparedRunCleanups;
     prepStages.mark("core-plugin-tools");
+    emitAttemptCheckpoint(params, "attempt-tool-base-completed");
     emitCorePluginToolStageSummary("core-plugin-tools", corePluginToolStages.snapshot());
+    emitAttemptCheckpoint(params, "attempt-bootstrap-entered");
     const preparedBootstrap = await measureEmbeddedAgentPreparation(
       "attempt.bootstrap",
       () =>
@@ -257,6 +280,7 @@ export async function runEmbeddedAttempt(
         }),
       { config: params.config },
     );
+    emitAttemptCheckpoint(params, "attempt-bootstrap-completed");
     // Track sessions_yield tool invocation (callback pattern, like clientToolCallDetected)
     let yieldDetected = false;
     let yieldMessage: string | null = null;
@@ -265,6 +289,7 @@ export async function runEmbeddedAttempt(
     let abortSessionForYield: (() => void) | null = null;
     let queueYieldInterruptForSession: (() => void) | null = null;
     let yieldAbortSettled: Promise<void> | null = null;
+    emitAttemptCheckpoint(params, "attempt-bundle-tools-entered");
     const preparedBundleTools = await measureEmbeddedAgentPreparation(
       "attempt.bundle-tools",
       () =>
@@ -283,6 +308,11 @@ export async function runEmbeddedAttempt(
     bundleMcpRuntime = preparedBundleTools.bundleMcpRuntime;
     bundleLspRuntime = preparedBundleTools.bundleLspRuntime;
     const { clientTools, uncompactedEffectiveTools } = preparedBundleTools;
+    emitAttemptCheckpoint(
+      params,
+      "attempt-bundle-tools-completed",
+      (clientTools ?? []).slice(0, 8).map((tool) => tool.function.name),
+    );
     params.capabilityIntelligenceExperiment?.onCheckpoint?.({
       stage: "attempt-bundle-completed",
       toolCount: clientTools?.length ?? 0,

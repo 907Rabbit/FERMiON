@@ -85,7 +85,19 @@ export function createOpenClawAgentHarness(): AgentHarnessV2 {
     label: "OpenClaw embedded agent",
     contextEngineHostCapabilities: OPENCLAW_EMBEDDED_CONTEXT_ENGINE_HOST.capabilities,
     supports: () => ({ supported: true, priority: 0 }),
-    runAttempt: (params) => runEmbeddedAttempt(params as EmbeddedRunAttemptParams),
+    runAttempt: (params) => {
+      const attempt = params as EmbeddedRunAttemptParams;
+      attempt.capabilityIntelligenceExperiment?.onCheckpoint?.({
+        stage: "attempt-backend-run-entered",
+        toolCount: attempt.clientTools?.length ?? attempt.toolsAllow?.length ?? 0,
+        representativeToolNames: (
+          attempt.clientTools?.map((tool) => tool.function.name) ??
+          attempt.toolsAllow ??
+          []
+        ).slice(0, 8),
+      });
+      return runEmbeddedAttempt(attempt);
+    },
     runIsolatedCompletionV2: async (params) => {
       if (params.authorization.owner !== "host") {
         throw new Error("The built-in OpenClaw harness requires host-prepared authorization.");

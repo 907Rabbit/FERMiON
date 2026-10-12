@@ -34,7 +34,10 @@ import {
   EMBEDDED_RUN_LANE_HEARTBEAT_MS,
   EMBEDDED_RUN_LANE_TIMEOUT_GRACE_MS,
 } from "./lane-runtime.js";
-import type { RunEmbeddedAgentParams } from "./params.js";
+import type {
+  EmbeddedCapabilityIntelligenceCheckpointStage,
+  RunEmbeddedAgentParams,
+} from "./params.js";
 import { resolveSkillWorkshopAttemptParams } from "./skill-workshop-attempt-params.js";
 import type { EmbeddedRunAttemptParams, EmbeddedRunAttemptTrajectoryRecorder } from "./types.js";
 
@@ -137,6 +140,18 @@ export async function dispatchEmbeddedRunAttempt(input: {
   preparedAttempt: EmbeddedRunAttemptParams;
 }> {
   const { params, runtime, control } = input;
+  const checkpoint = (stage: EmbeddedCapabilityIntelligenceCheckpointStage) => {
+    params.capabilityIntelligenceExperiment?.onCheckpoint?.({
+      stage,
+      toolCount: params.clientTools?.length ?? params.toolsAllow?.length ?? 0,
+      representativeToolNames: (
+        params.clientTools?.map((tool) => tool.function.name) ??
+        params.toolsAllow ??
+        []
+      ).slice(0, 8),
+    });
+  };
+  checkpoint("attempt-dispatch-observer-created");
   const observeToolTerminal = createToolTerminalObserver(params.runId);
   let attemptRankingCorrelation: ToolRankingShadowCorrelation | undefined;
   const observeToolTerminalWithShadowRanking: NonNullable<
@@ -221,6 +236,7 @@ export async function dispatchEmbeddedRunAttempt(input: {
   } else {
     parentAbortSignal?.addEventListener("abort", relayParentAbort, { once: true });
   }
+  checkpoint("attempt-dispatch-abort-wiring-completed");
 
   // Native attempts start the heartbeat only after their own timeout watchdog
   // is armed, keeping preflight inside the requested deadline.
@@ -277,6 +293,8 @@ export async function dispatchEmbeddedRunAttempt(input: {
     modelMaxTokens: runtime.model.maxTokens,
     userTurnTranscriptRecorder: params.userTurnTranscriptRecorder,
   });
+  checkpoint("attempt-dispatch-exec-approval-completed");
+  checkpoint("attempt-dispatch-prompt-media-entered");
   const promptMedia = control.pluginHarnessOwnsTransport
     ? await (async () => {
         const workspace = await resolveAttemptWorkspaceSandbox({
@@ -298,6 +316,7 @@ export async function dispatchEmbeddedRunAttempt(input: {
         });
       })()
     : { images: params.images, imageOrder: params.imageOrder, media: params.media };
+  checkpoint("attempt-dispatch-prompt-media-completed");
   // Plugin harnesses own their tool materialization, so the host cannot attest
   // a message tool. Finalize conservatively instead of leaking phantom guidance.
   const pluginHarnessPrompt =
@@ -308,6 +327,10 @@ export async function dispatchEmbeddedRunAttempt(input: {
           finalize: params.finalizePromptForResolvedTools,
         })
       : undefined;
+  checkpoint("attempt-dispatch-plugin-prompt-completed");
+  if (control.pluginHarnessOwnsTransport) {
+    checkpoint("attempt-dispatch-plugin-sandbox-entered");
+  }
   const pluginSandbox = control.pluginHarnessOwnsTransport
     ? ((await resolveSessionPlacementSandbox({
         agentId: runtime.agentId,
@@ -322,6 +345,9 @@ export async function dispatchEmbeddedRunAttempt(input: {
         workspaceDir: runtime.workspaceDir,
       })))
     : undefined;
+  if (control.pluginHarnessOwnsTransport) {
+    checkpoint("attempt-dispatch-plugin-sandbox-completed");
+  }
   if (!params.admittedRunContext) {
     throw new Error("embedded attempt reached dispatch without an admitted run context");
   }
@@ -347,6 +373,7 @@ export async function dispatchEmbeddedRunAttempt(input: {
     sessionKey: params.sessionKey,
     toolsAllow: params.toolsAllow,
   });
+  checkpoint("attempt-dispatch-prompt-enrichment-completed");
   const attemptParams: EmbeddedRunAttemptParams = {
     admittedRunContext: params.admittedRunContext,
     contextEngineAgentId: runtime.contextEngineAgentId,
@@ -615,6 +642,7 @@ export async function dispatchEmbeddedRunAttempt(input: {
     onUserMessagePersistenceInvalidated: control.onUserMessagePersistenceInvalidated,
     onAssistantErrorMessagePersisted: params.onAssistantErrorMessagePersisted,
   };
+  checkpoint("attempt-dispatch-attempt-params-created");
   const callerIdentity = createAdmittedGatewayToolCallerIdentity({
     admittedRunContext: attemptParams.admittedRunContext,
     agentId: runtime.agentId,
@@ -630,6 +658,8 @@ export async function dispatchEmbeddedRunAttempt(input: {
     turnSourceAccountId: params.agentAccountId,
     turnSourceThreadId: params.currentThreadTs,
   });
+  checkpoint("attempt-dispatch-caller-identity-created");
+  checkpoint("attempt-dispatch-backend-entered");
   const rawAttempt = await withGatewayToolCallerIdentity(callerIdentity, () =>
     runEmbeddedAttemptWithBackend(attemptParams),
   )

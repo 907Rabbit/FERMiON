@@ -174,9 +174,23 @@ type V1JCaptureCheckpoint =
   | "capture-entrypoint-complete";
 
 type V1JCaptureLiveness = ReturnType<typeof createV1JCaptureLiveness>;
+type V1JImageFactoryObservation = {
+  eligible: boolean;
+  constructed: boolean;
+};
+type V1JRealExactRuntimeSurface = {
+  benchmarkCandidateNames: string[];
+  mappedRuntimeNames: string[];
+  expectedRuntimeNames: string[];
+  benchmarkImageMapping: string;
+  runtimeBuiltinImageToolName: string;
+  imageFactoryEligible: boolean;
+  imageFactoryConstructed: boolean;
+};
 type V1JSchemaValidationAudit = {
   authorizedCount: number;
   providerCount: number;
+  expectedRuntimeCount: number;
   authorizedUniqueCount: number;
   providerUniqueCount: number;
   authorizedNamesUnique: boolean;
@@ -190,11 +204,61 @@ type V1JSchemaValidationAudit = {
   missingAuthorizedSchemas: Array<{ index: number; name?: string; missingFields: string[] }>;
   missingProviderSchemas: Array<{ index: number; name?: string; missingFields: string[] }>;
   providerSubsetOfAuthorized: boolean;
-  complete31ToolAuthorizedSurface: boolean;
-  complete31ToolProviderSurface: boolean;
-  authorizedNameSetMatchesExpected: boolean;
+  authorizedNameSetMatchesExpectedRuntime: boolean;
+  providerNameSetMatchesExpectedRuntime: boolean;
+  expectedRuntimeFingerprintMatchesFrozen?: boolean;
   validationPredicatesFailed: string[];
 };
+
+const V1J_REAL_EXACT_EXPECTED_RUNTIME_NAME_SET_SHA256 =
+  "741f7983e4ba7652384ee83fed16b67f81e567b2231cfccbba8f58c19ee6837b";
+const V1J_RUNTIME_BUILTIN_IMAGE_TOOL_NAME = "view_image";
+
+function deriveV1JRealExactRuntimeSurface(input: {
+  benchmarkCandidateNames: readonly string[];
+  imageFactory: V1JImageFactoryObservation;
+}): V1JRealExactRuntimeSurface {
+  const benchmarkCandidateNames = [...new Set(input.benchmarkCandidateNames)].toSorted();
+  const mappedRuntimeNames = [
+    ...new Set(
+      benchmarkCandidateNames.flatMap((name) => {
+        const realTool = getBenchmarkRealToolMapping(name).realTool;
+        return realTool ? [realTool] : [];
+      }),
+    ),
+  ].toSorted();
+  const benchmarkImageMapping = getBenchmarkRealToolMapping("image").realTool;
+  if (!benchmarkImageMapping) {
+    throw new Error("v1J REAL_EXACT image mapping must remain explicitly mapped");
+  }
+  if (input.imageFactory.eligible !== input.imageFactory.constructed) {
+    throw new Error("v1J image factory eligibility and construction disagree");
+  }
+  if (
+    input.imageFactory.eligible &&
+    benchmarkImageMapping !== V1J_RUNTIME_BUILTIN_IMAGE_TOOL_NAME
+  ) {
+    throw new Error("v1J eligible image factory does not match the benchmark runtime mapping");
+  }
+  const expectedRuntimeNames = mappedRuntimeNames
+    .filter((name) => input.imageFactory.eligible || name !== benchmarkImageMapping)
+    .toSorted();
+  return {
+    benchmarkCandidateNames,
+    mappedRuntimeNames,
+    expectedRuntimeNames,
+    benchmarkImageMapping,
+    runtimeBuiltinImageToolName: V1J_RUNTIME_BUILTIN_IMAGE_TOOL_NAME,
+    imageFactoryEligible: input.imageFactory.eligible,
+    imageFactoryConstructed: input.imageFactory.constructed,
+  };
+}
+
+function hashV1JNameSet(names: readonly string[]): string {
+  return createHash("sha256")
+    .update(JSON.stringify([...names].toSorted((left, right) => left.localeCompare(right))))
+    .digest("hex");
+}
 
 const V1J_SCHEMA_CAPTURE_NAME_ARM: Record<V1JSchemaCaptureName, V1JSchemaCaptureArm> = {
   "capture-1": "A",
@@ -441,7 +505,9 @@ function persistV1JSchemaCapture(input: {
   authorizedTools: readonly V1JAuthorizedToolSchema[];
   providerTools: unknown;
   model: string;
-  expectedAuthorizedNames?: readonly string[];
+  surfaceMode: "REAL_EXACT" | "SYNTHETIC";
+  benchmarkCandidateNames: readonly string[];
+  imageFactory?: V1JImageFactoryObservation;
   invocation?: {
     index: number;
     caseId: string;
@@ -548,6 +614,22 @@ function persistV1JSchemaCapture(input: {
     );
     const providerNames = providerTools.map((tool) => providerToolName(tool));
     const authorizedNames = authorizedTools.map((tool) => (tool as V1JAuthorizedToolSchema).name);
+    const imageFactory = input.surfaceMode === "REAL_EXACT" ? input.imageFactory : undefined;
+    if (input.surfaceMode === "REAL_EXACT" && !imageFactory) {
+      throw new Error("v1J REAL_EXACT capture requires observed image-factory state");
+    }
+    const runtimeSurface = imageFactory
+      ? deriveV1JRealExactRuntimeSurface({
+          benchmarkCandidateNames: input.benchmarkCandidateNames,
+          imageFactory,
+        })
+      : undefined;
+    const expectedSurfaceNames =
+      runtimeSurface?.expectedRuntimeNames ??
+      [...new Set(input.benchmarkCandidateNames)].toSorted();
+    const expectedRuntimeNamesSha256 = runtimeSurface
+      ? hashV1JNameSet(runtimeSurface.expectedRuntimeNames)
+      : undefined;
     runOperation(
       "capture-validation",
       "schema-sink-validate-start",
@@ -619,14 +701,21 @@ function persistV1JSchemaCapture(input: {
           .toSorted();
         const missingAuthorizedSchemas = missingSchemas(authorizedTools, authorizedNames, false);
         const missingProviderSchemas = missingSchemas(providerTools, providerNames, true);
-        const expectedAuthorizedNameSet = new Set(input.expectedAuthorizedNames ?? authorizedNames);
-        const authorizedNameSetMatchesExpected =
-          authorizedNameSet.size === expectedAuthorizedNameSet.size &&
-          [...authorizedNameSet].every((name) => expectedAuthorizedNameSet.has(name));
+        const expectedRuntimeNameSet = new Set(expectedSurfaceNames);
+        const authorizedNameSetMatchesExpectedRuntime =
+          authorizedNameSet.size === expectedRuntimeNameSet.size &&
+          [...authorizedNameSet].every((name) => expectedRuntimeNameSet.has(name));
+        const providerNameSetMatchesExpectedRuntime =
+          providerNameSet.size === expectedRuntimeNameSet.size &&
+          [...providerNameSet].every((name) => expectedRuntimeNameSet.has(name));
+        const expectedRuntimeFingerprintMatchesFrozen = runtimeSurface
+          ? expectedRuntimeNamesSha256 === V1J_REAL_EXACT_EXPECTED_RUNTIME_NAME_SET_SHA256
+          : undefined;
         const providerSubsetOfAuthorized = providerOnlyNames.length === 0;
         const validationAudit: V1JSchemaValidationAudit = {
           authorizedCount: authorizedNames.length,
           providerCount: providerNames.length,
+          expectedRuntimeCount: expectedSurfaceNames.length,
           authorizedUniqueCount: authorizedNameSet.size,
           providerUniqueCount: providerNameSet.size,
           authorizedNamesUnique: authorizedNameSet.size === authorizedNames.length,
@@ -640,23 +729,33 @@ function persistV1JSchemaCapture(input: {
           missingAuthorizedSchemas,
           missingProviderSchemas,
           providerSubsetOfAuthorized,
-          complete31ToolAuthorizedSurface:
-            authorizedNames.length === 31 &&
-            authorizedNameSet.size === 31 &&
-            missingAuthorizedSchemas.length === 0,
-          complete31ToolProviderSurface:
-            providerNames.length === 31 &&
-            providerNameSet.size === 31 &&
-            missingProviderSchemas.length === 0,
-          authorizedNameSetMatchesExpected,
+          authorizedNameSetMatchesExpectedRuntime,
+          providerNameSetMatchesExpectedRuntime,
+          expectedRuntimeFingerprintMatchesFrozen,
           validationPredicatesFailed: [
-            ...(providerNames.length === 31 ? [] : ["providerCountIs31"]),
-            ...(authorizedNames.length === 31 ? [] : ["authorizedCountIs31"]),
+            ...(providerNames.length === expectedSurfaceNames.length
+              ? []
+              : ["providerCountMatchesExpectedRuntime"]),
+            ...(authorizedNames.length === expectedSurfaceNames.length
+              ? []
+              : ["authorizedCountMatchesExpectedRuntime"]),
             ...(providerNames.every((name) => Boolean(name)) ? [] : ["providerNamesPresent"]),
             ...(authorizedNames.every((name) => Boolean(name)) ? [] : ["authorizedNamesPresent"]),
-            ...(providerNameSet.size === 31 ? [] : ["providerUniqueCountIs31"]),
-            ...(authorizedNameSet.size === 31 ? [] : ["authorizedUniqueCountIs31"]),
-            ...(providerSubsetOfAuthorized ? [] : ["providerSubsetOfAuthorized"]),
+            ...(providerNameSet.size === providerNames.length ? [] : ["providerNamesUnique"]),
+            ...(authorizedNameSet.size === authorizedNames.length ? [] : ["authorizedNamesUnique"]),
+            ...(authorizedNameSetMatchesExpectedRuntime
+              ? []
+              : ["authorizedNameSetMatchesExpectedRuntime"]),
+            ...(providerNameSetMatchesExpectedRuntime
+              ? []
+              : ["providerNameSetMatchesExpectedRuntime"]),
+            ...(missingAuthorizedSchemas.length === 0 ? [] : ["authorizedSchemasComplete"]),
+            ...(missingProviderSchemas.length === 0 ? [] : ["providerSchemasComplete"]),
+            ...(authorizedOnlyNames.length === 0 ? [] : ["authorizedProviderNameSetEqual"]),
+            ...(providerOnlyNames.length === 0 ? [] : ["providerSubsetOfAuthorized"]),
+            ...(expectedRuntimeFingerprintMatchesFrozen !== false
+              ? []
+              : ["expectedRuntimeNameSetFingerprintMatchesFrozen"]),
           ],
         };
         checkpoint("schema-sink-validation", {
@@ -668,15 +767,25 @@ function persistV1JSchemaCapture(input: {
           throw new Error(`v1J schema capture already exists: ${input.name}`);
         }
         if (
-          providerNames.length !== 31 ||
-          authorizedNames.length !== 31 ||
+          providerNames.length !== expectedSurfaceNames.length ||
+          authorizedNames.length !== expectedSurfaceNames.length ||
           providerNames.some((name) => !name) ||
           authorizedNames.some((name) => !name) ||
-          new Set(providerNames).size !== 31 ||
-          new Set(authorizedNames).size !== 31 ||
-          providerNames.some((name) => !authorizedNames.includes(name!))
+          new Set(providerNames).size !== providerNames.length ||
+          new Set(authorizedNames).size !== authorizedNames.length ||
+          !authorizedNameSetMatchesExpectedRuntime ||
+          !providerNameSetMatchesExpectedRuntime ||
+          authorizedOnlyNames.length > 0 ||
+          providerOnlyNames.length > 0 ||
+          missingAuthorizedSchemas.length > 0 ||
+          missingProviderSchemas.length > 0 ||
+          expectedRuntimeFingerprintMatchesFrozen === false
         ) {
-          throw new Error("v1J schema capture requires matching complete 31-tool surfaces");
+          throw new Error(
+            input.surfaceMode === "REAL_EXACT"
+              ? "v1J schema capture requires matching complete REAL_EXACT runtime surfaces"
+              : "v1J schema capture requires matching complete synthetic benchmark surfaces",
+          );
         }
       },
     );
@@ -698,10 +807,38 @@ function persistV1JSchemaCapture(input: {
             topK: 8,
             activeFilteringEnabled: ACTIVE_FILTERING_ENABLED,
             canonicalizationVersion: "v1j-provider-schema-v1",
+            surfaceMode: input.surfaceMode,
             authorizedToolCount: authorizedNames.length,
             authorizedToolNames: authorizedNames,
             providerToolCount: providerNames.length,
             providerToolNames: providerNames,
+            benchmarkCandidateInventory: {
+              count: new Set(input.benchmarkCandidateNames).size,
+              names: [...new Set(input.benchmarkCandidateNames)].toSorted(),
+            },
+            ...(runtimeSurface
+              ? {
+                  realExactMappedRuntimeNames: {
+                    count: runtimeSurface.mappedRuntimeNames.length,
+                    names: runtimeSurface.mappedRuntimeNames,
+                  },
+                  expectedRealExactRuntimeSurface: {
+                    count: runtimeSurface.expectedRuntimeNames.length,
+                    names: runtimeSurface.expectedRuntimeNames,
+                    nameSetSha256: expectedRuntimeNamesSha256,
+                  },
+                  benchmarkImageMapping: runtimeSurface.benchmarkImageMapping,
+                  runtimeBuiltinImageToolName: runtimeSurface.runtimeBuiltinImageToolName,
+                  imageFactoryEligible: runtimeSurface.imageFactoryEligible,
+                  imageFactoryConstructed: runtimeSurface.imageFactoryConstructed,
+                }
+              : {}),
+            actualAuthorizedProviderSurface: {
+              authorizedCount: authorizedNames.length,
+              authorizedNames,
+              providerCount: providerNames.length,
+              providerNames,
+            },
             modelRequestsSent: 0,
             setupArm: input.arm,
           },
@@ -2645,6 +2782,10 @@ async function runOne(input: {
     schemaCaptureName?: V1JSchemaCaptureName;
     schemaCaptureArm?: V1JSchemaCaptureArm;
     capturePromptInstruction?: string;
+    surfaceMode?: "REAL_EXACT" | "SYNTHETIC";
+    benchmarkCandidateNames?: readonly string[];
+    getImageFactoryObservation?: () => V1JImageFactoryObservation | undefined;
+    onImageFactoryResult?: (observation: V1JImageFactoryObservation) => void;
     onAuthorizedToolsCaptured?: (tools: readonly V1JAuthorizedToolSchema[]) => void;
     onRequestCaptured?: (request: CapturedModelRequest) => void;
     onDelegatedRequest?: () => void;
@@ -2846,6 +2987,16 @@ async function runOne(input: {
     const request = { body, url: "provider-adapter" };
     input.requestCapture?.liveness?.record("provider-tool-projection-complete");
     if (input.requestCapture?.schemaCaptureName) {
+      const surfaceMode = input.requestCapture.surfaceMode;
+      const benchmarkCandidateNames = input.requestCapture.benchmarkCandidateNames;
+      const imageFactory = input.requestCapture.getImageFactoryObservation?.();
+      if (
+        !surfaceMode ||
+        !benchmarkCandidateNames ||
+        (surfaceMode === "REAL_EXACT" && !imageFactory)
+      ) {
+        throw new Error("v1J capture is missing REAL_EXACT surface provenance");
+      }
       const invocation = {
         index: ++schemaSinkInvocationIndex,
         caseId: input.benchmarkCase.id,
@@ -2870,7 +3021,9 @@ async function runOne(input: {
         authorizedTools: authorizedToolSchemas,
         providerTools: body.tools,
         model: runModel,
-        expectedAuthorizedNames: input.authorizedNames,
+        surfaceMode,
+        benchmarkCandidateNames,
+        ...(imageFactory ? { imageFactory } : {}),
         invocation,
         recordCheckpoint: (checkpoint, metadata) =>
           input.requestCapture?.liveness?.record(checkpoint, metadata),
@@ -3020,6 +3173,12 @@ async function runOne(input: {
                       imagePresent: event.imagePresent,
                     };
               input.requestCapture?.liveness?.record(checkpoint, metadata);
+              if (event.stage === "factory") {
+                input.requestCapture?.onImageFactoryResult?.({
+                  eligible: event.imageFactoryCalled,
+                  constructed: event.imageFactoryReturnedTool,
+                });
+              }
               diagnostics.hooks.onImageToolPreparationDiagnostic?.(event);
             },
             onAuthorizedToolsPrepared: (tools) => {
@@ -3376,7 +3535,17 @@ describe("v1I offline request preparation", () => {
   it("persists only authorized and provider tool schemas with safe metadata", () => {
     const workspaceDir = fs.mkdtempSync(path.join(os.tmpdir(), "v1j-schema-capture-test-"));
     const cwd = vi.spyOn(process, "cwd").mockReturnValue(workspaceDir);
-    const names = TOOL_RANKING_HELD_OUT_CASES[0]?.tools.map((tool) => tool.name) ?? [];
+    const benchmarkCandidateNames =
+      TOOL_RANKING_HELD_OUT_CASES[0]?.tools.map((tool) => tool.name) ?? [];
+    const runtimeSurface = deriveV1JRealExactRuntimeSurface({
+      benchmarkCandidateNames,
+      imageFactory: { eligible: false, constructed: false },
+    });
+    const names = runtimeSurface.expectedRuntimeNames;
+    expect(runtimeSurface.benchmarkCandidateNames).toHaveLength(31);
+    expect(runtimeSurface.mappedRuntimeNames).toContain("image");
+    expect(names).toEqual(REAL_RUNTIME_TOOL_NAMES);
+    expect(hashV1JNameSet(names)).toBe(V1J_REAL_EXACT_EXPECTED_RUNTIME_NAME_SET_SHA256);
     const authorizedTools = names.map((name) => ({
       name,
       description: `Capability ${name}`,
@@ -3405,8 +3574,11 @@ describe("v1I offline request preparation", () => {
         name: "capture-1",
         arm: "A",
         model: "qwen/qwen3.5-9b",
+        surfaceMode: "REAL_EXACT",
         authorizedTools,
         providerTools,
+        benchmarkCandidateNames,
+        imageFactory: { eligible: false, constructed: false },
         invocation: {
           index: 1,
           caseId: "test-case",
@@ -3428,6 +3600,46 @@ describe("v1I offline request preparation", () => {
       const metadataText = fs.readFileSync(path.join(root, "capture-1-metadata.json"), "utf8");
       expect(JSON.parse(toolsText)).toEqual({ authorizedTools, providerTools });
       expect(metadataText).toContain('"modelRequestsSent": 0');
+      const metadata = JSON.parse(metadataText) as {
+        benchmarkCandidateInventory: { count: number; names: string[] };
+        realExactMappedRuntimeNames: { count: number; names: string[] };
+        expectedRealExactRuntimeSurface: {
+          count: number;
+          names: string[];
+          nameSetSha256: string;
+        };
+        actualAuthorizedProviderSurface: {
+          authorizedCount: number;
+          providerCount: number;
+        };
+        benchmarkImageMapping: string;
+        runtimeBuiltinImageToolName: string;
+        imageFactoryEligible: boolean;
+        imageFactoryConstructed: boolean;
+      };
+      expect(metadata.benchmarkCandidateInventory).toEqual({
+        count: 31,
+        names: runtimeSurface.benchmarkCandidateNames,
+      });
+      expect(metadata.realExactMappedRuntimeNames).toEqual({
+        count: 16,
+        names: runtimeSurface.mappedRuntimeNames,
+      });
+      expect(metadata.expectedRealExactRuntimeSurface).toEqual({
+        count: 15,
+        names: REAL_RUNTIME_TOOL_NAMES,
+        nameSetSha256: V1J_REAL_EXACT_EXPECTED_RUNTIME_NAME_SET_SHA256,
+      });
+      expect(metadata.actualAuthorizedProviderSurface).toMatchObject({
+        authorizedCount: 15,
+        providerCount: 15,
+      });
+      expect(metadata).toMatchObject({
+        benchmarkImageMapping: "image",
+        runtimeBuiltinImageToolName: "view_image",
+        imageFactoryEligible: false,
+        imageFactoryConstructed: false,
+      });
       expect(metadataText).not.toMatch(/prompt|messages|credential|requestId|conversation/i);
       expect(checkpoints.map(({ checkpoint }) => checkpoint)).toEqual([
         "schema-sink-authorized-copy-start",
@@ -3454,17 +3666,19 @@ describe("v1I offline request preparation", () => {
         ({ checkpoint }) => checkpoint === "schema-sink-validation",
       )?.metadata.validationAudit as V1JSchemaValidationAudit | undefined;
       expect(validAudit).toMatchObject({
-        authorizedCount: 31,
-        providerCount: 31,
-        authorizedUniqueCount: 31,
-        providerUniqueCount: 31,
+        authorizedCount: 15,
+        providerCount: 15,
+        expectedRuntimeCount: 15,
+        authorizedUniqueCount: 15,
+        providerUniqueCount: 15,
         authorizedNamesUnique: true,
         providerNamesUnique: true,
         authorizedOnlyNames: [],
         providerOnlyNames: [],
         providerSubsetOfAuthorized: true,
-        complete31ToolAuthorizedSurface: true,
-        complete31ToolProviderSurface: true,
+        authorizedNameSetMatchesExpectedRuntime: true,
+        providerNameSetMatchesExpectedRuntime: true,
+        expectedRuntimeFingerprintMatchesFrozen: true,
         validationPredicatesFailed: [],
       });
       expect(validAudit?.authorizedNamesSha256).toMatch(/^[a-f0-9]{64}$/);
@@ -3476,9 +3690,11 @@ describe("v1I offline request preparation", () => {
           name: "capture-2",
           arm: "A",
           model: "qwen/qwen3.5-9b",
+          surfaceMode: "REAL_EXACT",
           authorizedTools,
           providerTools: providerTools.slice(1),
-          expectedAuthorizedNames: names,
+          benchmarkCandidateNames,
+          imageFactory: { eligible: false, constructed: false },
           invocation: {
             index: 2,
             caseId: "test-case",
@@ -3487,34 +3703,42 @@ describe("v1I offline request preparation", () => {
             providerRequestPhase: "offline-test",
             callSite: "offline-test",
           },
-          recordCheckpoint: (checkpoint, metadata) => {
-            checkpoints.push({ checkpoint, metadata });
-            liveness.record(checkpoint, metadata);
+          recordCheckpoint: (checkpoint, checkpointMetadata) => {
+            checkpoints.push({ checkpoint, metadata: checkpointMetadata });
+            liveness.record(checkpoint, checkpointMetadata);
           },
         }),
-      ).toThrow("matching complete 31-tool surfaces");
+      ).toThrow("matching complete REAL_EXACT runtime surfaces");
       const projectedAudit = checkpoints.findLast(
         ({ checkpoint }) => checkpoint === "schema-sink-validation",
       )?.metadata.validationAudit as V1JSchemaValidationAudit | undefined;
       expect(projectedAudit).toMatchObject({
-        authorizedCount: 31,
-        providerCount: 30,
+        authorizedCount: 15,
+        providerCount: 14,
+        expectedRuntimeCount: 15,
         providerNamesUnique: true,
         authorizedOnlyNames: [names[0]],
         providerOnlyNames: [],
         providerSubsetOfAuthorized: true,
-        complete31ToolAuthorizedSurface: true,
-        complete31ToolProviderSurface: false,
-        authorizedNameSetMatchesExpected: true,
-        validationPredicatesFailed: ["providerCountIs31", "providerUniqueCountIs31"],
+        authorizedNameSetMatchesExpectedRuntime: true,
+        providerNameSetMatchesExpectedRuntime: false,
+        expectedRuntimeFingerprintMatchesFrozen: true,
+        validationPredicatesFailed: [
+          "providerCountMatchesExpectedRuntime",
+          "providerNameSetMatchesExpectedRuntime",
+          "authorizedProviderNameSetEqual",
+        ],
       });
       expect(() =>
         persistV1JSchemaCapture({
           name: "capture-1",
           arm: "A",
           model: "qwen/qwen3.5-9b",
+          surfaceMode: "REAL_EXACT",
           authorizedTools,
           providerTools,
+          benchmarkCandidateNames,
+          imageFactory: { eligible: false, constructed: false },
           invocation: {
             index: 3,
             caseId: "test-case",
@@ -3523,9 +3747,9 @@ describe("v1I offline request preparation", () => {
             providerRequestPhase: "offline-test",
             callSite: "offline-test",
           },
-          recordCheckpoint: (checkpoint, metadata) => {
-            checkpoints.push({ checkpoint, metadata });
-            liveness.record(checkpoint, metadata);
+          recordCheckpoint: (checkpoint, checkpointMetadata) => {
+            checkpoints.push({ checkpoint, metadata: checkpointMetadata });
+            liveness.record(checkpoint, checkpointMetadata);
           },
         }),
       ).toThrow("already exists");
@@ -3591,6 +3815,9 @@ describe("v1I offline request preparation", () => {
         authorizedTools: [],
         providerTools: [],
         model: "qwen/qwen3.5-9b",
+        surfaceMode: "REAL_EXACT",
+        benchmarkCandidateNames: [],
+        imageFactory: { eligible: false, constructed: false },
       }),
     ).toThrow("name/arm pair is invalid");
     expect(buildV1JSchemaCaptureRequestOptions({ name: "arm-c", arm: "C" })).toMatchObject({
@@ -3850,6 +4077,8 @@ describe("v1I offline request preparation", () => {
         abortSignal: abortController.signal,
         requestCapture: {
           ...buildV1JSchemaCaptureRequestOptions({ name: "capture-1", arm: "A" }),
+          surfaceMode: "SYNTHETIC",
+          benchmarkCandidateNames: benchmarkCase.tools.map((tool) => tool.name),
           onAuthorizedToolsCaptured: (tools) => authorizedSchemas.push(...tools),
           onRequestCaptured: (request) => {
             captured.push(request);
@@ -4002,6 +4231,7 @@ describeV1JSchemaCapture("v1J provider schema capture-only entrypoint", () => {
       let workspaceDir: string | undefined;
       const captured: CapturedModelRequest[] = [];
       const authorizedSchemas: V1JAuthorizedToolSchema[] = [];
+      let imageFactoryObservation: V1JImageFactoryObservation | undefined;
       const abortController = new AbortController();
       let delegatedRequests = 0;
       let providerDispatchAttempts = 0;
@@ -4031,6 +4261,19 @@ describeV1JSchemaCapture("v1J provider schema capture-only entrypoint", () => {
           abortSignal: abortController.signal,
           requestCapture: {
             stopAfterCapture: true,
+            surfaceMode: "REAL_EXACT",
+            benchmarkCandidateNames: benchmarkCase.tools.map((tool) => tool.name),
+            getImageFactoryObservation: () => imageFactoryObservation,
+            onImageFactoryResult: (factoryResult) => {
+              if (
+                imageFactoryObservation &&
+                (imageFactoryObservation.eligible !== factoryResult.eligible ||
+                  imageFactoryObservation.constructed !== factoryResult.constructed)
+              ) {
+                throw new Error("v1J image factory result changed during one capture");
+              }
+              imageFactoryObservation = factoryResult;
+            },
             ...buildV1JSchemaCaptureRequestOptions(captureOptions),
             liveness,
             onProviderDispatchAttempt: (count) => {
@@ -4061,14 +4304,21 @@ describeV1JSchemaCapture("v1J provider schema capture-only entrypoint", () => {
         if (providerDispatchAttempts !== 0) {
           throw new Error("v1J capture recorded a provider dispatch attempt");
         }
+        if (!imageFactoryObservation) {
+          throw new Error("v1J capture did not observe image-factory eligibility");
+        }
+        const expectedSurface = deriveV1JRealExactRuntimeSurface({
+          benchmarkCandidateNames: benchmarkCase.tools.map((tool) => tool.name),
+          imageFactory: imageFactoryObservation,
+        });
         const names = toolNamesFromBody(captured[0]?.body ?? {});
         if (
-          authorizedSchemas.length !== 31 ||
-          names.length !== 31 ||
-          new Set(names).size !== 31 ||
-          !["git_diff", "pytest", "calendar", "email"].every((name) => names.includes(name))
+          authorizedSchemas.length !== expectedSurface.expectedRuntimeNames.length ||
+          names.length !== expectedSurface.expectedRuntimeNames.length ||
+          new Set(names).size !== expectedSurface.expectedRuntimeNames.length ||
+          expectedSurface.expectedRuntimeNames.some((name) => !names.includes(name))
         ) {
-          throw new Error("v1J capture did not observe the expected 31-tool surface");
+          throw new Error("v1J capture did not observe the expected REAL_EXACT runtime surface");
         }
         const root = path.resolve(
           "artifacts/capability-intelligence/v1j-action-initiation/schema-baseline",
@@ -4079,15 +4329,27 @@ describeV1JSchemaCapture("v1J provider schema capture-only entrypoint", () => {
           authorizedTools: V1JAuthorizedToolSchema[];
           providerTools: unknown[];
         };
-        const metadata = fs.readFileSync(metadataPath, "utf8");
+        const metadata = JSON.parse(fs.readFileSync(metadataPath, "utf8")) as Record<
+          string,
+          unknown
+        >;
         if (
-          schemas.authorizedTools.length !== 31 ||
-          schemas.providerTools.length !== 31 ||
-          metadata.includes(benchmarkCase.query) ||
-          /prompt|messages|credential|requestId|conversation/i.test(metadata) ||
+          schemas.authorizedTools.length !== expectedSurface.expectedRuntimeNames.length ||
+          schemas.providerTools.length !== expectedSurface.expectedRuntimeNames.length ||
+          JSON.stringify(metadata).includes(benchmarkCase.query) ||
+          /prompt|messages|credential|requestId|conversation/i.test(JSON.stringify(metadata)) ||
           /apiKey|authorization|bearer\s/i.test(JSON.stringify(schemas))
         ) {
           throw new Error("v1J capture artifact failed safe-content validation");
+        }
+        if (
+          metadata.imageFactoryEligible !== expectedSurface.imageFactoryEligible ||
+          metadata.imageFactoryConstructed !== expectedSurface.imageFactoryConstructed ||
+          metadata.benchmarkImageMapping !== "image" ||
+          metadata.runtimeBuiltinImageToolName !== "view_image" ||
+          metadata.modelRequestsSent !== 0
+        ) {
+          throw new Error("v1J capture metadata does not match the prepared runtime surface");
         }
         liveness.record("capture-entrypoint-complete", {
           providerDispatchAttempts: 0,

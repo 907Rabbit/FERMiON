@@ -123,12 +123,29 @@ export type EmbeddedCapabilityIntelligenceCheckpointStage =
   | "tool-execution-finished"
   | "terminal-observed";
 
+export type EmbeddedCapabilityIntelligenceModelLoopSubstage =
+  | "active-session-prompt-entered"
+  | "active-session-prompt-completed";
+
+export type EmbeddedCapabilityIntelligenceModelLoopHeartbeat = {
+  stage: "active-session-prompt";
+  elapsedMs: number;
+  expectedIntervalMs: number;
+  actualIntervalMs: number;
+  eventLoopDelayMs: number;
+};
+
 export type EmbeddedCapabilityIntelligenceExperimentHooks = {
   onCheckpoint?: (checkpoint: {
     stage: EmbeddedCapabilityIntelligenceCheckpointStage;
     toolCount: number;
     representativeToolNames: readonly string[];
   }) => void;
+  onModelLoopSubstage?: (event: {
+    stage: EmbeddedCapabilityIntelligenceModelLoopSubstage;
+    elapsedMs: number;
+  }) => void;
+  onModelLoopHeartbeat?: (heartbeat: EmbeddedCapabilityIntelligenceModelLoopHeartbeat) => void;
   onPreparedRuntimeAcquisitionHeartbeat?: (heartbeat: PreparedRuntimeAcquisitionHeartbeat) => void;
   onPreparedRuntimePluginDiscoveryInputs?: (inputs: PreparedRuntimePluginDiscoveryInputs) => void;
   onPreparedRuntimePluginTiming?: (timing: PreparedRuntimePluginTiming) => void;

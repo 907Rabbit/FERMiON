@@ -11,7 +11,11 @@ import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { AssistantMessage } from "../../llm/types.js";
 import { applyTestPluginDefaults } from "../../plugins/config-state.js";
 import type { PluginRegistryLoadTraceEvent } from "../../plugins/loader-types.js";
-import type { RunEmbeddedAgentParams } from "../embedded-agent-runner/run/params.js";
+import type {
+  EmbeddedCapabilityIntelligenceModelLoopHeartbeat,
+  EmbeddedCapabilityIntelligenceModelLoopSubstage,
+  RunEmbeddedAgentParams,
+} from "../embedded-agent-runner/run/params.js";
 import type { EmbeddedAgentRunResult } from "../embedded-agent-runner/types.js";
 import {
   createPostResponseLiveness,
@@ -1353,10 +1357,17 @@ describeDiagnosticLive("v1I model-choice diagnostic", () => {
       const postResponseHeartbeats: PostResponseHeartbeat[] = [];
       const postResponseSnapshots: PostResponseSnapshot[] = [];
       const postResponseCounters: PostResponseCounter[] = [];
+      const modelLoopSubstages: Array<{
+        stage: EmbeddedCapabilityIntelligenceModelLoopSubstage;
+        elapsedMs: number;
+      }> = [];
+      const modelLoopHeartbeats: EmbeddedCapabilityIntelligenceModelLoopHeartbeat[] = [];
       const preparationAbortController = new AbortController();
       let preparedRuntimeAcquisitionCompleted = false;
+      let delegatedModelRequests = 0;
       let observation: ExperimentRun | undefined;
       let failure: unknown;
+      const modelLoopDiagnostics = process.env.OPENCLAW_V1I_MODEL_LOOP_DIAGNOSTICS === "1";
       try {
         journal.record("model-discovery-skipped-for-preparation-diagnostic");
         journal.record("workspace-session-prep-start");
@@ -1405,20 +1416,33 @@ describeDiagnosticLive("v1I model-choice diagnostic", () => {
           onPluginPrepTiming: (timing) => pluginPrep.timings.push(timing),
           onPluginPrepRegistryTrace: (event) => pluginPrep.registryTraces.push(event),
           onCheckpoint: (checkpoint) => {
-            if (checkpoint.stage === "prepared-runtime-acquisition-completed") {
+            if (
+              checkpoint.stage === "prepared-runtime-acquisition-completed" &&
+              !modelLoopDiagnostics
+            ) {
               preparedRuntimeAcquisitionCompleted = true;
               preparationAbortController.abort(
                 new Error("v1I preparation diagnostic completed before model request"),
               );
             }
           },
+          modelLoopDiagnostics: modelLoopDiagnostics
+            ? {
+                onSubstage: (event) => modelLoopSubstages.push(event),
+                onHeartbeat: (heartbeat) => modelLoopHeartbeats.push(heartbeat),
+              }
+            : undefined,
           postResponseDiagnostics: true,
           onPostResponseCheckpoint: (checkpoint) => postResponseCheckpoints.push(checkpoint),
           onPostResponseHeartbeat: (heartbeat) => postResponseHeartbeats.push(heartbeat),
           onPostResponseSnapshot: (snapshot) => postResponseSnapshots.push(snapshot),
           onPostResponseCounter: (counter) => postResponseCounters.push(counter),
           requestCapture: {
+            stopAfterCapture: modelLoopDiagnostics,
             onRequestCaptured: (request) => requestBodies.push(request.body),
+            onDelegatedRequest: () => {
+              delegatedModelRequests += 1;
+            },
             onResponseSummary: (summary) => responseSummaries.push(summary),
             onAssistantMessage: (message) => {
               for (const block of message.content) {
@@ -1471,6 +1495,10 @@ describeDiagnosticLive("v1I model-choice diagnostic", () => {
         abortRequested: checkpoints.some((checkpoint) => checkpoint.stage === "abort-requested"),
         abortObserved: checkpoints.some((checkpoint) => checkpoint.stage === "abort-observed"),
         modelRequestSent: requestBodies.length > 0,
+        providerRequestConstructed: requestBodies.length > 0,
+        delegatedModelRequests,
+        modelLoopSubstages,
+        modelLoopHeartbeats,
         providerResponseReceived: checkpoints.some(
           (checkpoint) => checkpoint.stage === "provider-response-received",
         ),
@@ -1518,6 +1546,8 @@ describeDiagnosticLive("v1I model-choice diagnostic", () => {
             (snapshot) => snapshot.kind === "normalized-assistant-message",
           ));
       const evidenceComplete =
+        (modelLoopDiagnostics &&
+          (modelLoopSubstages.length > 0 || requestBodies.length > 0 || failure !== undefined)) ||
         (preparedRuntimeAcquisitionCompleted && requestBodies.length === 0) ||
         (normalizedResponseComplete &&
           terminalObserved &&
@@ -1573,7 +1603,7 @@ describeDiagnosticLive("v1I model-choice diagnostic", () => {
           `v1I diagnostic evidence serialization failed: ${finalization.serializationErrorMessage ?? "unknown error"}`,
         );
       }
-      if (requestBodies.length > 0) {
+      if (requestBodies.length > 0 && delegatedModelRequests > 0) {
         throw new Error("v1I preparation diagnostic sent a model request");
       }
       if (failure) {
@@ -1909,6 +1939,13 @@ async function runOne(input: {
   };
   abortSignal?: AbortSignal;
   timeoutMs?: number;
+  modelLoopDiagnostics?: {
+    onSubstage: (event: {
+      stage: EmbeddedCapabilityIntelligenceModelLoopSubstage;
+      elapsedMs: number;
+    }) => void;
+    onHeartbeat: (heartbeat: EmbeddedCapabilityIntelligenceModelLoopHeartbeat) => void;
+  };
   directRunner?: boolean;
   provider?: string;
   model?: string;
@@ -1962,6 +1999,25 @@ async function runOne(input: {
     );
     input.onCheckpoint?.(checkpoint);
   };
+  if (input.modelLoopDiagnostics) {
+    diagnostics.hooks.onModelLoopSubstage = (event) => {
+      input.attemptCheckpointJournal?.record(`model-loop:${event.stage}`, {
+        elapsedMs: event.elapsedMs,
+        lastSuccessfulCheckpoint: event.stage,
+      });
+      input.modelLoopDiagnostics?.onSubstage(event);
+    };
+    diagnostics.hooks.onModelLoopHeartbeat = (heartbeat) => {
+      input.attemptCheckpointJournal?.record("model-loop-heartbeat", {
+        elapsedMs: heartbeat.elapsedMs,
+        expectedElapsedMs: heartbeat.expectedIntervalMs,
+        eventLoopDelayMs: heartbeat.eventLoopDelayMs,
+        eventLoopDelayDetected: heartbeat.eventLoopDelayMs > 0,
+        lastSuccessfulCheckpoint: "active-session-prompt",
+      });
+      input.modelLoopDiagnostics?.onHeartbeat(heartbeat);
+    };
+  }
   const diagnosticsHeartbeat = diagnostics.hooks.onPreparedRuntimeAcquisitionHeartbeat;
   diagnostics.hooks.onPreparedRuntimeAcquisitionHeartbeat = (heartbeat) => {
     input.attemptCheckpointJournal?.record("prepared-runtime-acquisition-heartbeat", {

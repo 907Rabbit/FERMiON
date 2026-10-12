@@ -345,6 +345,48 @@ describe("runEmbeddedAttemptExecutionPhase", () => {
     expect(mocks.withOwnedSessionTranscriptWrites).toHaveBeenCalledOnce();
   });
 
+  it("emits model-loop liveness events around the active-session prompt", async () => {
+    vi.useFakeTimers();
+    try {
+      const modelLoopSubstages: string[] = [];
+      const modelLoopHeartbeats: number[] = [];
+      const fixture = createFixture();
+      fixture.input.attempt.capabilityIntelligenceExperiment = {
+        onModelLoopSubstage: (event) => {
+          modelLoopSubstages.push(event.stage);
+        },
+        onModelLoopHeartbeat: (heartbeat) => {
+          modelLoopHeartbeats.push(heartbeat.elapsedMs);
+        },
+      };
+      await runEmbeddedAttemptExecutionPhase(fixture.input);
+      let resolvePrompt!: () => void;
+      fixture.activeSession.prompt.mockImplementationOnce(
+        () =>
+          new Promise<undefined>((resolve) => {
+            resolvePrompt = () => {
+              resolve(undefined);
+            };
+          }),
+      );
+      const settledInput = mocks.runSettledPhase.mock.calls[0]?.[0];
+      const promptPromise = settledInput.preparedStreamRuntime.promptActiveSession("hello");
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(modelLoopSubstages).toEqual(["active-session-prompt-entered"]);
+      expect(modelLoopHeartbeats).toHaveLength(1);
+      resolvePrompt();
+      await promptPromise;
+      expect(modelLoopSubstages).toEqual([
+        "active-session-prompt-entered",
+        "active-session-prompt-completed",
+      ]);
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(modelLoopHeartbeats).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("does not start a prompt after external cancellation", async () => {
     const fixture = createFixture();
     await runEmbeddedAttemptExecutionPhase(fixture.input);

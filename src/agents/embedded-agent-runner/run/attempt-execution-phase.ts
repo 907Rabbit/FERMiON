@@ -172,6 +172,7 @@ export async function runEmbeddedAttemptExecutionPhase(
   };
   const abortable = <T>(promise: Promise<T>): Promise<T> =>
     abortableWithSignal(input.runAbortController.signal, promise);
+  const modelLoopHeartbeatIntervalMs = 30_000;
   const promptActiveSession = (
     prompt: string,
     options?: Parameters<typeof activeSession.prompt>[1],
@@ -182,7 +183,43 @@ export async function runEmbeddedAttemptExecutionPhase(
       if (input.runAbortController.signal.aborted) {
         return abortable(Promise.resolve());
       }
-      return abortable(trackPromptSettlePromise(activeSession.prompt(prompt, options)));
+      const modelLoopSubstage = input.attempt.capabilityIntelligenceExperiment?.onModelLoopSubstage;
+      const modelLoopHeartbeat =
+        input.attempt.capabilityIntelligenceExperiment?.onModelLoopHeartbeat;
+      const startedAt = performance.now();
+      let lastHeartbeatAt = startedAt;
+      let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
+      modelLoopSubstage?.({
+        stage: "active-session-prompt-entered",
+        elapsedMs: 0,
+      });
+      if (modelLoopHeartbeat) {
+        heartbeatTimer = setInterval(() => {
+          const now = performance.now();
+          const actualIntervalMs = Math.max(0, Math.round(now - lastHeartbeatAt));
+          lastHeartbeatAt = now;
+          modelLoopHeartbeat({
+            stage: "active-session-prompt",
+            elapsedMs: Math.max(0, Math.round(now - startedAt)),
+            expectedIntervalMs: modelLoopHeartbeatIntervalMs,
+            actualIntervalMs,
+            eventLoopDelayMs: Math.max(0, actualIntervalMs - modelLoopHeartbeatIntervalMs),
+          });
+        }, modelLoopHeartbeatIntervalMs);
+      }
+      // Keep completion in finally so aborts and provider failures cannot leave a live heartbeat.
+      // This hook is observational only; it does not alter prompt cancellation or settlement.
+      try {
+        return await abortable(trackPromptSettlePromise(activeSession.prompt(prompt, options)));
+      } finally {
+        if (heartbeatTimer !== undefined) {
+          clearInterval(heartbeatTimer);
+        }
+        modelLoopSubstage?.({
+          stage: "active-session-prompt-completed",
+          elapsedMs: Math.max(0, Math.round(performance.now() - startedAt)),
+        });
+      }
     });
   const onBlockReply = attempt.onBlockReply
     ? bindOwnedSessionTranscriptWrites(

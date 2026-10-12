@@ -147,6 +147,23 @@ type V1JCaptureCheckpoint =
   | "provider-tool-projection-start"
   | "provider-tool-projection-complete"
   | "schema-sink-start"
+  | "schema-sink-authorized-copy-start"
+  | "schema-sink-authorized-copy-complete"
+  | "schema-sink-provider-copy-start"
+  | "schema-sink-provider-copy-complete"
+  | "schema-sink-canonicalize-start"
+  | "schema-sink-canonicalize-complete"
+  | "schema-sink-validate-start"
+  | "schema-sink-validate-complete"
+  | "schema-sink-mkdir-start"
+  | "schema-sink-mkdir-complete"
+  | "schema-sink-write-tools-start"
+  | "schema-sink-write-tools-complete"
+  | "schema-sink-write-metadata-start"
+  | "schema-sink-write-metadata-complete"
+  | "schema-sink-fsync-or-close-start"
+  | "schema-sink-fsync-or-close-complete"
+  | "schema-sink-error"
   | "schema-sink-complete"
   | "provider-dispatch-guard-reached"
   | "prepared-runtime-heartbeat"
@@ -161,11 +178,12 @@ const V1J_SCHEMA_CAPTURE_NAME_ARM: Record<V1JSchemaCaptureName, V1JSchemaCapture
   "arm-c": "C",
 };
 
-function createV1JCaptureLiveness(name: V1JSchemaCaptureName) {
+function createV1JCaptureLiveness(name: V1JSchemaCaptureName, diagnosticId?: string) {
   const root = path.resolve(
     "artifacts/capability-intelligence/v1j-action-initiation/schema-baseline",
   );
-  const filePath = path.join(root, `${name}-liveness.jsonl`);
+  const suffix = diagnosticId ? `-${diagnosticId}` : "";
+  const filePath = path.join(root, `${name}-liveness${suffix}.jsonl`);
   if (path.relative(root, filePath).startsWith(`..${path.sep}`) || fs.existsSync(filePath)) {
     throw new Error("v1J capture liveness output is unsafe or already exists");
   }
@@ -186,6 +204,17 @@ function createV1JCaptureLiveness(name: V1JSchemaCaptureName) {
         providerDispatchAttempts?: number;
         eventLoopDelayMs?: number;
         errorName?: string;
+        sinkInvocationIndex?: number;
+        captureName?: string;
+        caseId?: string;
+        arm?: string;
+        replicate?: number;
+        providerRequestPhase?: string;
+        callSite?: string;
+        operation?: string;
+        errorCode?: string | number;
+        errorMessage?: string;
+        targetPath?: string;
       } = {},
     ) {
       if (closed) {
@@ -213,6 +242,21 @@ function createV1JCaptureLiveness(name: V1JSchemaCaptureName) {
           ? {}
           : { providerDispatchAttempts: metadata.providerDispatchAttempts }),
         ...(metadata.errorName === undefined ? {} : { errorName: metadata.errorName }),
+        ...(metadata.sinkInvocationIndex === undefined
+          ? {}
+          : { sinkInvocationIndex: metadata.sinkInvocationIndex }),
+        ...(metadata.captureName === undefined ? {} : { captureName: metadata.captureName }),
+        ...(metadata.caseId === undefined ? {} : { caseId: metadata.caseId }),
+        ...(metadata.arm === undefined ? {} : { arm: metadata.arm }),
+        ...(metadata.replicate === undefined ? {} : { replicate: metadata.replicate }),
+        ...(metadata.providerRequestPhase === undefined
+          ? {}
+          : { providerRequestPhase: metadata.providerRequestPhase }),
+        ...(metadata.callSite === undefined ? {} : { callSite: metadata.callSite }),
+        ...(metadata.operation === undefined ? {} : { operation: metadata.operation }),
+        ...(metadata.errorCode === undefined ? {} : { errorCode: metadata.errorCode }),
+        ...(metadata.errorMessage === undefined ? {} : { errorMessage: metadata.errorMessage }),
+        ...(metadata.targetPath === undefined ? {} : { targetPath: metadata.targetPath }),
       };
       fs.writeSync(fd, `${JSON.stringify(row)}\n`);
       fs.fsyncSync(fd);
@@ -350,76 +394,225 @@ function persistV1JSchemaCapture(input: {
   authorizedTools: readonly V1JAuthorizedToolSchema[];
   providerTools: unknown;
   model: string;
+  invocation?: {
+    index: number;
+    caseId: string;
+    arm: V1JSchemaCaptureArm;
+    replicate: number;
+    providerRequestPhase: string;
+    callSite: string;
+  };
+  recordCheckpoint?: (
+    checkpoint: V1JCaptureCheckpoint,
+    metadata: {
+      sinkInvocationIndex?: number;
+      captureName?: string;
+      caseId?: string;
+      arm?: string;
+      replicate?: number;
+      providerRequestPhase?: string;
+      callSite?: string;
+      operation?: string;
+      targetPath?: string;
+      errorName?: string;
+      errorCode?: string | number;
+      errorMessage?: string;
+    },
+  ) => void;
 }): void {
-  if (
-    !Object.hasOwn(V1J_SCHEMA_CAPTURE_NAME_ARM, input.name) ||
-    V1J_SCHEMA_CAPTURE_NAME_ARM[input.name] !== input.arm
-  ) {
-    throw new Error("v1J schema capture name/arm pair is invalid");
-  }
   const root = path.resolve(
     "artifacts/capability-intelligence/v1j-action-initiation/schema-baseline",
   );
-  const providerTools = structuredClone(input.providerTools) as unknown;
-  const authorizedTools = structuredClone(input.authorizedTools) as unknown;
-  if (!Array.isArray(providerTools) || !Array.isArray(authorizedTools)) {
-    throw new Error("v1J schema capture requires both complete tool arrays");
-  }
-  fs.mkdirSync(root, { recursive: true });
   const toolsPath = path.join(root, `${input.name}-provider-tools.json`);
   const metadataPath = path.join(root, `${input.name}-metadata.json`);
-  if (
-    ![toolsPath, metadataPath].every((filePath) => {
-      const relative = path.relative(root, filePath);
-      return relative.length > 0 && !relative.startsWith(`..${path.sep}`) && relative !== "..";
-    })
-  ) {
-    throw new Error("v1J schema capture output path escapes schema-baseline directory");
-  }
-  if (fs.existsSync(toolsPath) || fs.existsSync(metadataPath)) {
-    throw new Error(`v1J schema capture already exists: ${input.name}`);
-  }
-  const providerNames = providerTools.map((tool) => providerToolName(tool));
-  const authorizedNames = authorizedTools.map((tool) => (tool as V1JAuthorizedToolSchema).name);
-  if (
-    providerNames.length !== 31 ||
-    authorizedNames.length !== 31 ||
-    providerNames.some((name) => !name) ||
-    authorizedNames.some((name) => !name) ||
-    new Set(providerNames).size !== 31 ||
-    new Set(authorizedNames).size !== 31 ||
-    providerNames.some((name) => !authorizedNames.includes(name!))
-  ) {
-    throw new Error("v1J schema capture requires matching complete 31-tool surfaces");
-  }
-  fs.writeFileSync(toolsPath, `${JSON.stringify({ authorizedTools, providerTools }, null, 2)}\n`, {
-    flag: "wx",
-  });
-  fs.writeFileSync(
-    metadataPath,
-    `${JSON.stringify(
-      {
-        head: HARNESS_COMMIT,
-        model: input.model,
-        modelConfigHash: hashV1ICanonical(modelConfigIdentity()),
-        provider: PROVIDER,
-        contextLength: CONTEXT_LENGTH,
-        rankerVersion: SHADOW_RANKER_VERSION,
-        topK: 8,
-        activeFilteringEnabled: ACTIVE_FILTERING_ENABLED,
-        canonicalizationVersion: "v1j-provider-schema-v1",
-        authorizedToolCount: authorizedNames.length,
-        authorizedToolNames: authorizedNames,
-        providerToolCount: providerNames.length,
-        providerToolNames: providerNames,
-        modelRequestsSent: 0,
-        setupArm: input.arm,
+  const invocation = input.invocation ?? {
+    index: 1,
+    caseId: "offline-test",
+    arm: input.arm,
+    replicate: 1,
+    providerRequestPhase: "offline-test",
+    callSite: "persistV1JSchemaCapture-test",
+  };
+  const invocationMetadata = {
+    sinkInvocationIndex: invocation.index,
+    captureName: input.name,
+    caseId: invocation.caseId,
+    arm: invocation.arm,
+    replicate: invocation.replicate,
+    providerRequestPhase: invocation.providerRequestPhase,
+    callSite: invocation.callSite,
+  };
+  let operation = "start";
+  let targetPath = "schema-baseline";
+  const checkpoint = (
+    name: V1JCaptureCheckpoint,
+    metadata: { operation?: string; targetPath?: string } = {},
+  ) => input.recordCheckpoint?.(name, { ...invocationMetadata, ...metadata });
+  const runOperation = <T>(
+    operationName: string,
+    start: V1JCaptureCheckpoint,
+    complete: V1JCaptureCheckpoint,
+    pathHint: string,
+    run: () => T,
+  ): T => {
+    operation = operationName;
+    targetPath = pathHint;
+    checkpoint(start, { operation, targetPath });
+    const result = run();
+    checkpoint(complete, { operation, targetPath });
+    return result;
+  };
+  try {
+    if (
+      !Object.hasOwn(V1J_SCHEMA_CAPTURE_NAME_ARM, input.name) ||
+      V1J_SCHEMA_CAPTURE_NAME_ARM[input.name] !== input.arm
+    ) {
+      throw new Error("v1J schema capture name/arm pair is invalid");
+    }
+    const authorizedTools = runOperation(
+      "authorized-tool-copy",
+      "schema-sink-authorized-copy-start",
+      "schema-sink-authorized-copy-complete",
+      "authorized-tools",
+      () => structuredClone(input.authorizedTools) as unknown,
+    );
+    const providerTools = runOperation(
+      "provider-tool-copy",
+      "schema-sink-provider-copy-start",
+      "schema-sink-provider-copy-complete",
+      "provider-tools",
+      () => structuredClone(input.providerTools) as unknown,
+    );
+    if (!Array.isArray(providerTools) || !Array.isArray(authorizedTools)) {
+      throw new Error("v1J schema capture requires both complete tool arrays");
+    }
+    runOperation(
+      "directory-creation",
+      "schema-sink-mkdir-start",
+      "schema-sink-mkdir-complete",
+      "schema-baseline",
+      () => fs.mkdirSync(root, { recursive: true }),
+    );
+    const providerNames = providerTools.map((tool) => providerToolName(tool));
+    const authorizedNames = authorizedTools.map((tool) => (tool as V1JAuthorizedToolSchema).name);
+    runOperation(
+      "capture-validation",
+      "schema-sink-validate-start",
+      "schema-sink-validate-complete",
+      "tool-surfaces-and-output-paths",
+      () => {
+        if (
+          ![toolsPath, metadataPath].every((filePath) => {
+            const relative = path.relative(root, filePath);
+            return (
+              relative.length > 0 && !relative.startsWith(`..${path.sep}`) && relative !== ".."
+            );
+          })
+        ) {
+          throw new Error("v1J schema capture output path escapes schema-baseline directory");
+        }
+        if (fs.existsSync(toolsPath) || fs.existsSync(metadataPath)) {
+          throw new Error(`v1J schema capture already exists: ${input.name}`);
+        }
+        if (
+          providerNames.length !== 31 ||
+          authorizedNames.length !== 31 ||
+          providerNames.some((name) => !name) ||
+          authorizedNames.some((name) => !name) ||
+          new Set(providerNames).size !== 31 ||
+          new Set(authorizedNames).size !== 31 ||
+          providerNames.some((name) => !authorizedNames.includes(name!))
+        ) {
+          throw new Error("v1J schema capture requires matching complete 31-tool surfaces");
+        }
       },
-      null,
-      2,
-    )}\n`,
-    { flag: "wx" },
-  );
+    );
+    const serialized = runOperation(
+      "snapshot-serialization",
+      "schema-sink-canonicalize-start",
+      "schema-sink-canonicalize-complete",
+      "schema-baseline-json-bytes",
+      () => ({
+        tools: `${JSON.stringify({ authorizedTools, providerTools }, null, 2)}\n`,
+        metadata: `${JSON.stringify(
+          {
+            head: HARNESS_COMMIT,
+            model: input.model,
+            modelConfigHash: hashV1ICanonical(modelConfigIdentity()),
+            provider: PROVIDER,
+            contextLength: CONTEXT_LENGTH,
+            rankerVersion: SHADOW_RANKER_VERSION,
+            topK: 8,
+            activeFilteringEnabled: ACTIVE_FILTERING_ENABLED,
+            canonicalizationVersion: "v1j-provider-schema-v1",
+            authorizedToolCount: authorizedNames.length,
+            authorizedToolNames: authorizedNames,
+            providerToolCount: providerNames.length,
+            providerToolNames: providerNames,
+            modelRequestsSent: 0,
+            setupArm: input.arm,
+          },
+          null,
+          2,
+        )}\n`,
+      }),
+    );
+    const writeDurable = (filePath: string, contents: string, label: string) => {
+      const relativePath = path.relative(root, filePath);
+      operation = `${label}-write`;
+      targetPath = relativePath;
+      const fd = fs.openSync(filePath, "wx");
+      try {
+        fs.writeFileSync(fd, contents, "utf8");
+        operation = `${label}-fsync-close`;
+        checkpoint("schema-sink-fsync-or-close-start", {
+          operation: `${label}-fsync`,
+          targetPath: relativePath,
+        });
+        fs.fsyncSync(fd);
+        fs.closeSync(fd);
+        checkpoint("schema-sink-fsync-or-close-complete", {
+          operation: `${label}-fsync-close`,
+          targetPath: relativePath,
+        });
+      } catch (error) {
+        try {
+          fs.closeSync(fd);
+        } catch {
+          // Preserve the operation error; the durable liveness row carries its stage.
+        }
+        throw error;
+      }
+    };
+    runOperation(
+      "tools-file-write",
+      "schema-sink-write-tools-start",
+      "schema-sink-write-tools-complete",
+      path.basename(toolsPath),
+      () => writeDurable(toolsPath, serialized.tools, "tools"),
+    );
+    runOperation(
+      "metadata-file-write",
+      "schema-sink-write-metadata-start",
+      "schema-sink-write-metadata-complete",
+      path.basename(metadataPath),
+      () => writeDurable(metadataPath, serialized.metadata, "metadata"),
+    );
+  } catch (error) {
+    const candidate = error instanceof Error ? error : new Error(String(error));
+    const code = (error as NodeJS.ErrnoException | undefined)?.code;
+    const message = candidate.message
+      .replace(/(?:bearer\s+)[^\s,]+/gi, "Bearer [REDACTED]")
+      .slice(0, 500);
+    checkpoint("schema-sink-error", {
+      operation,
+      targetPath,
+      errorName: candidate.name.slice(0, 100),
+      errorCode: typeof code === "string" || typeof code === "number" ? code : undefined,
+      errorMessage: message,
+    });
+    throw error;
+  }
 }
 
 function providerToolName(tool: unknown): string | undefined {
@@ -2482,6 +2675,7 @@ async function runOne(input: {
       .map((tool) => (typeof tool === "string" ? tool : tool.function.name)),
   });
   const capture = captureModelPayloads(diagnostics.hooks, input.requestCapture);
+  let schemaSinkInvocationIndex = 0;
   const originalAiTransportHost = getAiTransportHost();
   configureAiTransportHost({
     ...originalAiTransportHost,
@@ -2499,15 +2693,35 @@ async function runOne(input: {
     const request = { body, url: "provider-adapter" };
     input.requestCapture?.liveness?.record("provider-tool-projection-complete");
     if (input.requestCapture?.schemaCaptureName) {
-      input.requestCapture.liveness?.record("schema-sink-start");
+      const invocation = {
+        index: ++schemaSinkInvocationIndex,
+        caseId: input.benchmarkCase.id,
+        arm: input.requestCapture.schemaCaptureArm ?? "A",
+        replicate: input.replicate,
+        providerRequestPhase: "provider-request-constructed-before-dispatch",
+        callSite: "runOne.diagnostics.hooks.onProviderRequest",
+      };
+      const sinkMetadata = {
+        sinkInvocationIndex: invocation.index,
+        captureName: input.requestCapture.schemaCaptureName,
+        caseId: invocation.caseId,
+        arm: invocation.arm,
+        replicate: invocation.replicate,
+        providerRequestPhase: invocation.providerRequestPhase,
+        callSite: invocation.callSite,
+      };
+      input.requestCapture.liveness?.record("schema-sink-start", sinkMetadata);
       persistV1JSchemaCapture({
         name: input.requestCapture.schemaCaptureName,
-        arm: input.requestCapture.schemaCaptureArm ?? "A",
+        arm: invocation.arm,
         authorizedTools: authorizedToolSchemas,
         providerTools: body.tools,
         model: runModel,
+        invocation,
+        recordCheckpoint: (checkpoint, metadata) =>
+          input.requestCapture?.liveness?.record(checkpoint, metadata),
       });
-      input.requestCapture.liveness?.record("schema-sink-complete");
+      input.requestCapture.liveness?.record("schema-sink-complete", sinkMetadata);
     }
     capture.recordProviderRequest(request);
     input.requestCapture?.onRequestCaptured?.(request);
@@ -2995,13 +3209,39 @@ describe("v1I offline request preparation", () => {
       type: "function",
       function: tool,
     }));
+    const checkpoints: Array<{
+      checkpoint: V1JCaptureCheckpoint;
+      metadata: Record<string, unknown>;
+    }> = [];
+    const liveness = createV1JCaptureLiveness("capture-1", "sink-test");
     try {
+      liveness.record("schema-sink-start", {
+        sinkInvocationIndex: 1,
+        captureName: "capture-1",
+        caseId: "test-case",
+        arm: "A",
+        replicate: 1,
+        providerRequestPhase: "offline-test",
+        callSite: "offline-test",
+      });
       persistV1JSchemaCapture({
         name: "capture-1",
         arm: "A",
         model: "qwen/qwen3.5-9b",
         authorizedTools,
         providerTools,
+        invocation: {
+          index: 1,
+          caseId: "test-case",
+          arm: "A",
+          replicate: 1,
+          providerRequestPhase: "offline-test",
+          callSite: "offline-test",
+        },
+        recordCheckpoint: (checkpoint, metadata) => {
+          checkpoints.push({ checkpoint, metadata });
+          liveness.record(checkpoint, metadata);
+        },
       });
       const root = path.join(
         workspaceDir,
@@ -3012,6 +3252,26 @@ describe("v1I offline request preparation", () => {
       expect(JSON.parse(toolsText)).toEqual({ authorizedTools, providerTools });
       expect(metadataText).toContain('"modelRequestsSent": 0');
       expect(metadataText).not.toMatch(/prompt|messages|credential|requestId|conversation/i);
+      expect(checkpoints.map(({ checkpoint }) => checkpoint)).toEqual([
+        "schema-sink-authorized-copy-start",
+        "schema-sink-authorized-copy-complete",
+        "schema-sink-provider-copy-start",
+        "schema-sink-provider-copy-complete",
+        "schema-sink-mkdir-start",
+        "schema-sink-mkdir-complete",
+        "schema-sink-validate-start",
+        "schema-sink-validate-complete",
+        "schema-sink-canonicalize-start",
+        "schema-sink-canonicalize-complete",
+        "schema-sink-write-tools-start",
+        "schema-sink-fsync-or-close-start",
+        "schema-sink-fsync-or-close-complete",
+        "schema-sink-write-tools-complete",
+        "schema-sink-write-metadata-start",
+        "schema-sink-fsync-or-close-start",
+        "schema-sink-fsync-or-close-complete",
+        "schema-sink-write-metadata-complete",
+      ]);
       expect(() =>
         persistV1JSchemaCapture({
           name: "capture-1",
@@ -3019,9 +3279,44 @@ describe("v1I offline request preparation", () => {
           model: "qwen/qwen3.5-9b",
           authorizedTools,
           providerTools,
+          invocation: {
+            index: 2,
+            caseId: "test-case",
+            arm: "A",
+            replicate: 1,
+            providerRequestPhase: "offline-test",
+            callSite: "offline-test",
+          },
+          recordCheckpoint: (checkpoint, metadata) => {
+            checkpoints.push({ checkpoint, metadata });
+            liveness.record(checkpoint, metadata);
+          },
         }),
       ).toThrow("already exists");
+      const rows = fs
+        .readFileSync(liveness.filePath, "utf8")
+        .trim()
+        .split("\n")
+        .map((row) => JSON.parse(row) as Record<string, unknown>);
+      expect(rows[0]).toMatchObject({
+        checkpoint: "schema-sink-start",
+        sinkInvocationIndex: 1,
+        captureName: "capture-1",
+        caseId: "test-case",
+        arm: "A",
+        replicate: 1,
+        providerRequestPhase: "offline-test",
+        callSite: "offline-test",
+      });
+      expect(rows.at(-1)).toMatchObject({
+        checkpoint: "schema-sink-error",
+        sinkInvocationIndex: 2,
+        operation: "capture-validation",
+        errorName: "Error",
+        errorMessage: "v1J schema capture already exists: capture-1",
+      });
     } finally {
+      liveness.close();
       cwd.mockRestore();
       fs.rmSync(workspaceDir, { recursive: true, force: true });
     }
@@ -3463,7 +3758,10 @@ describeV1JSchemaCapture("v1J provider schema capture-only entrypoint", () => {
         const realTool = getBenchmarkRealToolMapping(toolName).realTool;
         return realTool ? [realTool] : [];
       });
-      const liveness = createV1JCaptureLiveness(captureOptions.name);
+      const liveness = createV1JCaptureLiveness(
+        captureOptions.name,
+        `sink-diagnostic-${process.pid}-${Date.now()}`,
+      );
       liveness.record("capture-entrypoint-start");
       let workspaceDir: string | undefined;
       const captured: CapturedModelRequest[] = [];

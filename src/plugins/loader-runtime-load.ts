@@ -64,6 +64,31 @@ type InternalPluginLoadOverrides = {
   runtime: Pick<PluginRuntime, "config">;
 };
 
+function resolveRuntimePluginIdSet(params: {
+  requested: readonly string[] | undefined;
+  requiredPluginIdsById: ReadonlyMap<string, readonly string[]>;
+}): ReadonlySet<string> | null {
+  if (params.requested === undefined) {
+    return null;
+  }
+  const runtimePluginIds = new Set(params.requested);
+  const pending = [...runtimePluginIds];
+  while (pending.length > 0) {
+    const pluginId = pending.pop();
+    if (!pluginId) {
+      continue;
+    }
+    for (const requiredPluginId of params.requiredPluginIdsById.get(pluginId) ?? []) {
+      if (runtimePluginIds.has(requiredPluginId)) {
+        continue;
+      }
+      runtimePluginIds.add(requiredPluginId);
+      pending.push(requiredPluginId);
+    }
+  }
+  return runtimePluginIds;
+}
+
 function createDeferredGatewaySubagentRuntime(runtime: PluginRuntime): PluginRuntime["subagent"] {
   return {
     run: (...args) => runtime.subagent.run(...args),
@@ -228,6 +253,20 @@ function loadOpenClawPluginsInternal(
         warningCacheKey: context.cacheKey,
         suppliedManifestRegistry: options.manifestRegistry,
       });
+    const runtimePluginIdSet = resolveRuntimePluginIdSet({
+      requested: context.runtimePluginIds,
+      requiredPluginIdsById: new Map([
+        ...manifestRegistry.plugins.flatMap((record) =>
+          record.requiresPlugins ? [[record.id, record.requiresPlugins] as const] : [],
+        ),
+        ...orderedCandidates.flatMap((candidate) => {
+          const pluginId = manifestBySource.get(candidate.source)?.id;
+          return pluginId && candidate.requiredPluginIds
+            ? [[pluginId, candidate.requiredPluginIds] as const]
+            : [];
+        }),
+      ]),
+    });
     emit("runtime-registry-discovery-completed", {
       ...pluginLoaderCacheState.diagnosticSnapshot(context.cacheKey),
       registryInstanceId: registryInstanceId(registry),
@@ -308,6 +347,7 @@ function loadOpenClawPluginsInternal(
           loadPluginModule,
           logger,
           state,
+          runtimePluginIdSet,
           registryTrace: (event) =>
             emit(event.stage, {
               ...pluginLoaderCacheState.diagnosticSnapshot(context.cacheKey),

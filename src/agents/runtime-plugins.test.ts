@@ -51,6 +51,7 @@ import {
   getPluginRuntimeGatewayRequestScope,
   withPluginRuntimeRegistryScope,
 } from "../plugins/runtime/gateway-request-scope.js";
+import { resolveUserPath } from "../utils.js";
 import {
   createPreparedInboundRegistryLoader,
   prepareWorkspacePluginRegistries,
@@ -193,8 +194,9 @@ describe("agent runtime plugin registries", () => {
     expect(hoisted.loadPluginRegistryHandle).toHaveBeenCalledOnce();
     expect(hoisted.loadPluginRegistryHandle).toHaveBeenCalledWith(
       expect.objectContaining({
-        onlyPluginIds: ["gateway-owned", "selected-provider"],
         preferBuiltPluginArtifacts: true,
+        runtimePluginIds: ["gateway-owned", "selected-provider"],
+        throwOnLoadError: true,
       }),
     );
   });
@@ -260,6 +262,7 @@ describe("agent runtime plugin registries", () => {
     const config = {} as never;
     const env = { OPENCLAW_STATE_DIR: "/tmp/openclaw-state" };
     const selections = [{ provider: "openai", modelId: "gpt-5.5", runtime: "codex" }];
+    const resolvedWorkspaceDir = resolveUserPath("/tmp/workspace");
 
     expect(
       loadAgentRuntimePluginRegistryHandle({
@@ -274,11 +277,11 @@ describe("agent runtime plugin registries", () => {
     expect(hoisted.loadPluginMetadataSnapshot).toHaveBeenCalledWith({
       config,
       env,
-      workspaceDir: "/tmp/workspace",
+      workspaceDir: resolvedWorkspaceDir,
     });
     expect(hoisted.resolveAgentRuntimePluginLoadPlan).toHaveBeenCalledWith({
       config,
-      workspaceDir: "/tmp/workspace",
+      workspaceDir: resolvedWorkspaceDir,
       selections,
       metadataSnapshot,
     });
@@ -290,8 +293,10 @@ describe("agent runtime plugin registries", () => {
       discovery: metadataSnapshot.discovery,
       installRecords: {},
       manifestRegistry: metadataSnapshot.manifestRegistry,
-      workspaceDir: "/tmp/workspace",
+      workspaceDir: resolvedWorkspaceDir,
       runtimeOptions: { allowGatewaySubagentBinding: true },
+      runtimePluginIds: ["codex", "memory-core"],
+      throwOnLoadError: true,
     });
   });
 
@@ -300,6 +305,7 @@ describe("agent runtime plugin registries", () => {
       config: { plugins: { enabled: false } } as never,
       workspaceDir: "/tmp/workspace",
     };
+    const resolvedWorkspaceDir = resolveUserPath(params.workspaceDir);
     expect(loadAgentRuntimePluginRegistryHandle(params)).toEqual({ handle: true });
     expect(hoisted.resolveAgentRuntimePluginLoadPlan).not.toHaveBeenCalled();
     expect(hoisted.loadPluginRegistryHandle).toHaveBeenCalledWith({
@@ -308,7 +314,7 @@ describe("agent runtime plugin registries", () => {
       config: params.config,
       onlyPluginIds: [],
       runtimeOptions: undefined,
-      workspaceDir: "/tmp/workspace",
+      workspaceDir: resolvedWorkspaceDir,
     });
   });
 
@@ -368,6 +374,7 @@ describe("agent runtime plugin registries", () => {
 
   it("lets direct local hosts bound the registry to configured runtime owners", () => {
     const config = {} as never;
+    const resolvedWorkspaceDir = resolveUserPath("/tmp/workspace");
 
     loadAgentRuntimePluginRegistryHandle({
       basePluginIds: [],
@@ -378,7 +385,7 @@ describe("agent runtime plugin registries", () => {
     const metadataSnapshot = hoisted.loadPluginMetadataSnapshot.mock.results[0]?.value;
     expect(hoisted.resolveAgentRuntimePluginLoadPlan).toHaveBeenCalledWith({
       config,
-      workspaceDir: "/tmp/workspace",
+      workspaceDir: resolvedWorkspaceDir,
       basePluginIds: [],
       selections: [],
       metadataSnapshot,
@@ -414,15 +421,17 @@ describe("agent runtime plugin registries", () => {
       env,
       installRecords: {},
       manifestRegistry: snapshot.manifestRegistry,
-      onlyPluginIds: ["codex", "memory-core"],
       preferBuiltPluginArtifacts: true,
+      runtimePluginIds: ["codex", "memory-core"],
       runtimeOptions: undefined,
+      throwOnLoadError: true,
       workspaceDir: snapshot.workspaceDir,
     });
   });
 
   it("owns a scoped registry for direct hosts", async () => {
     const config = {} as never;
+    const resolvedWorkspaceDir = resolveUserPath("/tmp/workspace");
     const pluginRegistry = { handle: true } as never;
     hoisted.loadPluginRegistryHandle.mockReturnValue(pluginRegistry);
 
@@ -437,7 +446,7 @@ describe("agent runtime plugin registries", () => {
     expect(getPluginRuntimeGatewayRequestScope()).toBeUndefined();
     expect(hoisted.resolveAgentRuntimePluginLoadPlan).toHaveBeenCalledWith({
       config,
-      workspaceDir: "/tmp/workspace",
+      workspaceDir: resolvedWorkspaceDir,
       basePluginIds: [],
       selections: [],
       metadataSnapshot: expect.any(Object),

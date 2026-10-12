@@ -85,6 +85,7 @@ export function loadRuntimePluginCandidate(params: {
   loadPluginModule: PluginModuleLoader;
   logger: PluginLogger;
   state: PluginLoadLoopState;
+  runtimePluginIdSet: ReadonlySet<string> | null;
   registryTrace?: (
     event: Pick<PluginRegistryLoadTraceEvent, "stage" | "pluginId" | "pluginOrigin">,
   ) => void;
@@ -350,6 +351,15 @@ export function loadRuntimePluginCandidate(params: {
       `[plugins] ${record.id} invalid config: ${validatedConfig.error.join(", ")}`,
     );
     pushPluginLoadError(`invalid config: ${validatedConfig.error.join(", ")}`);
+    return;
+  }
+  if (params.runtimePluginIdSet && !params.runtimePluginIdSet.has(pluginId)) {
+    // Keep the manifest-backed record visible to control-plane consumers without
+    // evaluating an unselected provider runtime in this prepared generation.
+    applyManifestSnapshotMetadata(record, manifestRecord);
+    record.imported = false;
+    registry.plugins.push(record);
+    state.seenIds.set(pluginId, candidate.origin);
     return;
   }
   if (!context.shouldLoadModules) {

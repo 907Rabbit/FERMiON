@@ -86,6 +86,7 @@ export function writePlugin(params: {
   dir?: string;
   filename?: string;
   configSchema?: Record<string, unknown>;
+  manifest?: Record<string, unknown>;
 }): TempPlugin {
   const dir = params.dir ?? makePluginLoaderTempDir();
   const filename = params.filename ?? `${params.id}.cjs`;
@@ -96,6 +97,7 @@ export function writePlugin(params: {
     path.join(dir, "openclaw.plugin.json"),
     JSON.stringify(
       {
+        ...params.manifest,
         id: params.id,
         configSchema: params.configSchema ?? EMPTY_PLUGIN_SCHEMA,
       },

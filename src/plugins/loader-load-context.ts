@@ -177,6 +177,7 @@ function buildCacheKey(params: {
   env: NodeJS.ProcessEnv;
   devSourceRoot?: string | null;
   onlyPluginIds?: string[];
+  runtimePluginIds?: readonly string[];
   includeSetupOnlyChannelPlugins?: boolean;
   forceSetupOnlyChannelPlugins?: boolean;
   requireSetupEntryForSetupOnlyChannelPlugins?: boolean;
@@ -240,7 +241,9 @@ function buildCacheKey(params: {
       activationMetadataKey: params.activationMetadataKey ?? "",
       allowProcessHomeSessionCatalogs: params.allowProcessHomeSessionCatalogs !== false,
     },
-  )}::${serializePluginIdScope(params.onlyPluginIds)}::${setupOnlyKey}::${setupOnlyModeKey}::${setupOnlyRequirementKey}::${params.channelPluginLoadIntent}::${bundledArtifactMode}::${rawConfigEnvMode}::${moduleLoadMode}::${discoveryMode}::${params.runtimeSubagentMode ?? "default"}::${params.runtimeBindingIdentity ?? "{}"}::${params.pluginSdkResolution ?? "auto"}::${JSON.stringify(params.coreGatewayMethodNames ?? [])}::${activationMode}`;
+  )}::${serializePluginIdScope(params.onlyPluginIds)}::${serializePluginIdScope(
+    params.runtimePluginIds === undefined ? undefined : [...params.runtimePluginIds],
+  )}::${setupOnlyKey}::${setupOnlyModeKey}::${setupOnlyRequirementKey}::${params.channelPluginLoadIntent}::${bundledArtifactMode}::${rawConfigEnvMode}::${moduleLoadMode}::${discoveryMode}::${params.runtimeSubagentMode ?? "default"}::${params.runtimeBindingIdentity ?? "{}"}::${params.pluginSdkResolution ?? "auto"}::${JSON.stringify(params.coreGatewayMethodNames ?? [])}::${activationMode}`;
   return createHash("sha256").update(cacheIdentity).digest("hex");
 }
 
@@ -323,6 +326,9 @@ export function resolvePluginLoadCacheContext(options: PluginLoadOptions = {}) {
     activationSource,
   });
   const onlyPluginIds = normalizePluginIdScope(options.onlyPluginIds);
+  const runtimePluginIds = normalizePluginIdScope(
+    options.runtimePluginIds === undefined ? undefined : [...options.runtimePluginIds],
+  );
   const includeSetupOnlyChannelPlugins = options.includeSetupOnlyChannelPlugins === true;
   const forceSetupOnlyChannelPlugins = options.forceSetupOnlyChannelPlugins === true;
   const requireSetupEntryForSetupOnlyChannelPlugins =
@@ -377,6 +383,7 @@ export function resolvePluginLoadCacheContext(options: PluginLoadOptions = {}) {
     env,
     devSourceRoot,
     onlyPluginIds,
+    runtimePluginIds,
     includeSetupOnlyChannelPlugins,
     forceSetupOnlyChannelPlugins,
     requireSetupEntryForSetupOnlyChannelPlugins,
@@ -401,6 +408,7 @@ export function resolvePluginLoadCacheContext(options: PluginLoadOptions = {}) {
     activationSource,
     autoEnabledReasons: options.autoEnabledReasons ?? {},
     onlyPluginIds,
+    runtimePluginIds,
     includeSetupOnlyChannelPlugins,
     forceSetupOnlyChannelPlugins,
     requireSetupEntryForSetupOnlyChannelPlugins,

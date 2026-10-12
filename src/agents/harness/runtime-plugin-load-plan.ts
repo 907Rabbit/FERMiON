@@ -370,12 +370,9 @@ export function resolveAgentRuntimePluginLoadPlan(params: {
   );
   const activatedConfig =
     withActivatedPluginIds({ config, pluginIds: forceActivatedPluginIds.toSorted() }) ?? config;
-  if (
-    params.basePluginIds === undefined &&
-    (params.config?.plugins?.allow?.length ?? 0) === 0 &&
-    activatedConfig?.plugins
-  ) {
-    // A standalone full load must not turn forced owners into discovery policy.
+  if ((params.config?.plugins?.allow?.length ?? 0) === 0 && activatedConfig?.plugins) {
+    // Forced runtime owners must not turn a prepared generation's discovery policy
+    // into an allowlist; unselected bundled providers remain visible as metadata.
     const plugins = { ...activatedConfig.plugins };
     if (params.config?.plugins?.allow === undefined) {
       delete plugins.allow;

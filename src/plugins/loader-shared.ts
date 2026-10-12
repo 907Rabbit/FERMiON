@@ -175,6 +175,9 @@ export function createPluginCandidatesFromManifestRegistry(
         ...(record.packageManifest !== undefined
           ? { packageManifest: record.packageManifest }
           : {}),
+        ...(record.requiresPlugins !== undefined
+          ? { requiredPluginIds: record.requiresPlugins }
+          : {}),
       },
       installOwner,
       isPluginManifestInstallOwnerAmbiguous(record),

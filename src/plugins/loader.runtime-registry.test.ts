@@ -64,6 +64,124 @@ it("keeps injected instance runtime surfaces independent of the broad runtime mo
   expect(loadPluginModule).not.toHaveBeenCalled();
 });
 
+it("keeps unused runtime modules unevaluated while retaining manifest records", () => {
+  useNoBundledPlugins();
+  const unused = writePlugin({
+    id: "lazy-unused",
+    body: 'throw new Error("unused provider must not be evaluated");',
+  });
+  const selected = writePlugin({
+    id: "lazy-selected",
+    body: 'module.exports = { id: "lazy-selected", register(api) { api.registerProvider({ id: "selected-provider" }); } };',
+  });
+
+  const registry = loadPluginRegistryHandle({
+    cache: false,
+    runtimePluginIds: [selected.id],
+    config: {
+      plugins: {
+        allow: [unused.id, selected.id],
+        load: { paths: [unused.file, selected.file] },
+        slots: { memory: "none" },
+      },
+    },
+  });
+
+  expect(registry.plugins).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({ id: unused.id, status: "loaded", imported: false }),
+      expect.objectContaining({ id: selected.id, status: "loaded" }),
+    ]),
+  );
+  expect(registry.providers).toEqual([
+    expect.objectContaining({
+      pluginId: selected.id,
+      provider: expect.objectContaining({ id: "selected-provider" }),
+    }),
+  ]);
+});
+
+it("loads declared runtime dependencies with the selected provider", () => {
+  useNoBundledPlugins();
+  const dependency = writePlugin({
+    id: "lazy-dependency",
+    body: 'module.exports = { id: "lazy-dependency", register() {} };',
+  });
+  const selected = writePlugin({
+    id: "lazy-selected-with-dependency",
+    body: 'module.exports = { id: "lazy-selected-with-dependency", register() {} };',
+    manifest: { requiresPlugins: [dependency.id] },
+  });
+
+  const registry = loadPluginRegistryHandle({
+    cache: false,
+    runtimePluginIds: [selected.id],
+    config: {
+      plugins: {
+        allow: [dependency.id, selected.id],
+        load: { paths: [dependency.dir, selected.dir] },
+        slots: { memory: "none" },
+      },
+    },
+  });
+
+  expect(registry.plugins).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({ id: dependency.id, status: "loaded" }),
+      expect.objectContaining({ id: selected.id, status: "loaded" }),
+    ]),
+  );
+  expect(registry.plugins.find((plugin) => plugin.id === dependency.id)?.imported).not.toBe(false);
+});
+
+it("fails closed when a selected runtime module cannot load", () => {
+  useNoBundledPlugins();
+  const failed = writePlugin({
+    id: "lazy-required-failure",
+    body: 'throw new Error("selected runtime failed");',
+  });
+
+  expect(() =>
+    loadPluginRegistryHandle({
+      cache: false,
+      throwOnLoadError: true,
+      runtimePluginIds: [failed.id],
+      config: {
+        plugins: {
+          allow: [failed.id],
+          load: { paths: [failed.file] },
+          slots: { memory: "none" },
+        },
+      },
+    }),
+  ).toThrow("selected runtime failed");
+});
+
+it("loads a selected provider through the generic runtime scope", () => {
+  useNoBundledPlugins();
+  const bedrock = writePlugin({
+    id: "amazon-bedrock",
+    body: 'module.exports = { id: "amazon-bedrock", register() {} };',
+    manifest: { providers: ["amazon-bedrock"], enabledByDefault: true },
+  });
+
+  const registry = loadPluginRegistryHandle({
+    cache: false,
+    runtimePluginIds: [bedrock.id],
+    config: {
+      plugins: {
+        allow: [bedrock.id],
+        load: { paths: [bedrock.file] },
+        slots: { memory: "none" },
+      },
+    },
+  });
+
+  expect(registry.plugins).toContainEqual(
+    expect.objectContaining({ id: bedrock.id, status: "loaded" }),
+  );
+});
+
 describe("cached plugin load failures", () => {
   it.each([
     { name: "active root registry", load: loadAndActivateRootPluginRegistry, activates: true },
@@ -228,6 +346,24 @@ describe("resolvePluginLoadCacheContext", () => {
 
     expect(setupKey).not.toBe(fullKey);
     expect(resolvePluginLoadCacheContext({ config: {} }).channelPluginLoadIntent).toBe("full");
+  });
+
+  it("partitions runtime-module eligibility from discovery scope", () => {
+    const allRuntime = resolvePluginLoadCacheContext({ config: {} }).cacheKey;
+    const selectedRuntime = resolvePluginLoadCacheContext({
+      config: {},
+      runtimePluginIds: ["selected-provider"],
+    }).cacheKey;
+    const noRuntime = resolvePluginLoadCacheContext({
+      config: {},
+      runtimePluginIds: [],
+    }).cacheKey;
+
+    expect(selectedRuntime).not.toBe(allRuntime);
+    expect(noRuntime).not.toBe(selectedRuntime);
+    expect(
+      resolvePluginLoadCacheContext({ config: {}, runtimePluginIds: [] }).runtimePluginIds,
+    ).toEqual([]);
   });
 
   it("keys concrete runtime bindings by identity", () => {

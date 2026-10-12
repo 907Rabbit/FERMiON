@@ -227,6 +227,7 @@ export type PluginManifestRecord = {
   packageDescription?: string;
   enabledByDefault?: boolean;
   enabledByDefaultOnPlatforms?: string[];
+  requiresPlugins?: string[];
   autoEnableWhenConfiguredProviders?: string[];
   legacyPluginIds?: string[];
   format?: PluginFormat;
@@ -575,6 +576,7 @@ function buildRecord(params: {
     packageDescription: params.candidate.packageDescription,
     enabledByDefault: params.manifest.enabledByDefault === true ? true : undefined,
     enabledByDefaultOnPlatforms: params.manifest.enabledByDefaultOnPlatforms,
+    requiresPlugins: params.manifest.requiresPlugins,
     autoEnableWhenConfiguredProviders: params.manifest.autoEnableWhenConfiguredProviders,
     legacyPluginIds: params.manifest.legacyPluginIds,
     format: params.candidate.format ?? "openclaw",

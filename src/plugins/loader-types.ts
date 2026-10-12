@@ -85,6 +85,8 @@ export type PluginLoadOptions = {
   cache?: boolean;
   mode?: "full" | "validate";
   onlyPluginIds?: string[];
+  /** Keep manifest records for every discovered plugin, but evaluate modules only for these ids. */
+  runtimePluginIds?: readonly string[];
   includeSetupOnlyChannelPlugins?: boolean;
   forceSetupOnlyChannelPlugins?: boolean;
   requireSetupEntryForSetupOnlyChannelPlugins?: boolean;

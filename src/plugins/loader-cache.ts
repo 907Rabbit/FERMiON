@@ -30,3 +30,7 @@ export function resolvePluginRegistryLoadCacheKey(options: PluginLoadOptions = {
 export function isPluginRegistryLoadInFlight(options: PluginLoadOptions = {}): boolean {
   return pluginLoaderCacheState.isLoadInFlight(resolvePluginRegistryLoadCacheKey(options));
 }
+
+export function inspectPluginRegistryLoadCache(cacheKey: string) {
+  return pluginLoaderCacheState.diagnosticSnapshot(cacheKey);
+}

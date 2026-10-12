@@ -42,7 +42,7 @@ import {
   safeRealpathOrResolve,
   validatePluginConfig,
 } from "./loader-shared.js";
-import type { PluginLoadOptions } from "./loader-types.js";
+import type { PluginLoadOptions, PluginRegistryLoadTraceEvent } from "./loader-types.js";
 import {
   hasExplicitManifestOwnerTrust,
   resolveManifestOwnerBasePolicyBlock,
@@ -85,10 +85,15 @@ export function loadRuntimePluginCandidate(params: {
   loadPluginModule: PluginModuleLoader;
   logger: PluginLogger;
   state: PluginLoadLoopState;
+  registryTrace?: (
+    event: Pick<PluginRegistryLoadTraceEvent, "stage" | "pluginId" | "pluginOrigin">,
+  ) => void;
 }): void {
   const { candidate, manifestRecord, context, state } = params;
   const { registry } = params.registryBuilder;
   const pluginId = manifestRecord.id;
+  const trace = (stage: PluginRegistryLoadTraceEvent["stage"]) =>
+    params.registryTrace?.({ stage, pluginId, pluginOrigin: candidate.origin });
   const policyId = normalizePluginPolicyId(pluginId);
   // Manifest filtering scopes diagnostics; this final guard also blocks imports
   // and registration outside the requested snapshot.
@@ -216,6 +221,7 @@ export function loadRuntimePluginCandidate(params: {
     return;
   }
 
+  trace("runtime-registry-candidate-artifact-resolution-started");
   const runtimeCandidateEntry = resolvePluginRuntimeArtifact({
     pluginId,
     entryKind: "runtime",
@@ -238,6 +244,7 @@ export function loadRuntimePluginCandidate(params: {
         registry,
       })
     : undefined;
+  trace("runtime-registry-candidate-artifact-resolution-completed");
   const scopedSetupOnlyChannelPluginRequested =
     context.includeSetupOnlyChannelPlugins &&
     !params.validateOnly &&
@@ -363,6 +370,7 @@ export function loadRuntimePluginCandidate(params: {
     rootDir: candidate.rootDir,
     env: context.env,
   });
+  trace("runtime-registry-candidate-file-open-started");
   const opened = openRootFileSync({
     absolutePath: moduleLoadSource,
     rootPath: moduleRoot,
@@ -370,6 +378,7 @@ export function loadRuntimePluginCandidate(params: {
     rejectHardlinks,
     skipLexicalRootCheck: true,
   });
+  trace("runtime-registry-candidate-file-open-completed");
   if (!opened.ok) {
     pushPluginLoadError(
       describeRootFileOpenFailure({
@@ -393,12 +402,14 @@ export function loadRuntimePluginCandidate(params: {
     // import attempt before invoking the loader.
     recordImportedPluginId(record.id);
     state.pluginLoadAttemptCount++;
+    trace("runtime-registry-candidate-module-load-started");
     params.logger.debug?.(`[plugins] loading ${record.id} from ${safeSource}`);
     mod = withProfile(
       { pluginId: record.id, source: safeSource },
       registrationPlan.mode,
       () => params.loadPluginModule(safeSource) as OpenClawPluginModule,
     );
+    trace("runtime-registry-candidate-module-load-completed");
   } catch (error) {
     recordPluginError({
       logger: params.logger,
@@ -421,6 +432,7 @@ export function loadRuntimePluginCandidate(params: {
       ["loadFailedCount", moduleLoadFailed ? 1 : 0],
     ]);
   }
+  trace("runtime-registry-candidate-setup-started");
   if (
     loadSetupRuntimeChannelCandidate({
       mod,
@@ -440,8 +452,10 @@ export function loadRuntimePluginCandidate(params: {
       pushPluginLoadError,
     })
   ) {
+    trace("runtime-registry-candidate-setup-completed");
     return;
   }
+  trace("runtime-registry-candidate-setup-completed");
 
   const resolved = resolvePluginModuleExport(mod);
   const { definition, register } = resolved;
@@ -507,6 +521,7 @@ export function loadRuntimePluginCandidate(params: {
     }
     return;
   }
+  trace("runtime-registry-candidate-register-started");
   // Node-host commands register in every load mode: the node host resolves its
   // registry without activation (loadPluginRegistryHandle), and each command is
   // already availability-gated per invocation. Gating them on full activation
@@ -542,6 +557,7 @@ export function loadRuntimePluginCandidate(params: {
       registerPluginDashboardCapabilities({ record, registry });
     }
     registry.plugins.push(record);
+    trace("runtime-registry-candidate-register-completed");
     state.seenIds.set(pluginId, candidate.origin);
     if (clearMismatchedQuarantineAfterLoad) {
       // Plugin ids can intentionally shadow an installed source via load.paths.

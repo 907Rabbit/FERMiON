@@ -14,6 +14,7 @@ import {
 } from "./installed-plugin-index-records.js";
 import { resolvePluginLoadCacheContext } from "./loader-load-context.js";
 import { createLazyPluginRuntime } from "./loader-module-runtime.js";
+import type { PluginRegistryLoadTraceEvent } from "./loader-types.js";
 import {
   clearPluginRegistryLoadCache,
   loadAndActivateRootPluginRegistry,
@@ -116,6 +117,52 @@ describe("cached plugin load failures", () => {
     const cached = loadPluginRegistryHandle(options);
 
     expect(loadPluginRegistryHandle({ ...options, throwOnLoadError: true })).toBe(cached);
+  });
+
+  it("traces cache ownership and candidate boundaries without changing the load result", () => {
+    useNoBundledPlugins();
+    const plugin = writePlugin({
+      id: "registry-trace",
+      body: 'module.exports = { id: "registry-trace", register() {} };',
+    });
+    const events: PluginRegistryLoadTraceEvent[] = [];
+    const options = {
+      config: {
+        plugins: {
+          allow: [plugin.id],
+          load: { paths: [plugin.file] },
+          slots: { memory: "none" },
+        },
+      },
+      registryTrace: { event: (event) => events.push(event) },
+    };
+
+    const first = loadPluginRegistryHandle(options);
+    const firstStages = events.map((event) => event.stage);
+    expect(firstStages).toContain("runtime-registry-cache-miss");
+    expect(firstStages).toContain("runtime-registry-discovery-completed");
+    expect(firstStages).toContain("runtime-registry-candidate-entered");
+    expect(firstStages).toContain("runtime-registry-candidate-completed");
+    expect(firstStages).toContain("runtime-registry-completed");
+    expect(
+      events.find((event) => event.stage === "runtime-registry-candidate-entered"),
+    ).toMatchObject({
+      pluginId: plugin.id,
+    });
+
+    events.length = 0;
+    const second = loadPluginRegistryHandle(options);
+    expect(second).toBe(first);
+    expect(events.map((event) => event.stage)).toEqual([
+      "runtime-registry-entered",
+      "runtime-registry-key-built",
+      "runtime-registry-cache-lookup-entered",
+      "runtime-registry-cache-lookup-complete",
+      "runtime-registry-cache-hit",
+    ]);
+    expect(
+      new Set(events.flatMap((event) => (event.cacheKeyHash ? [event.cacheKeyHash] : []))),
+    ).toHaveLength(1);
   });
 });
 

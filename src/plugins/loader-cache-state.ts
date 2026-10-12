@@ -45,6 +45,26 @@ export class PluginLoaderCacheState<T> {
     return this.#inFlightLoads.has(cacheKey);
   }
 
+  diagnosticSnapshot(cacheKey: string): {
+    cachePresent: boolean;
+    loadInFlight: boolean;
+    activeBuildCount: number;
+    waitingCallers: number;
+    existingPromise: false;
+    promiseAgeMs: null;
+    stateScope: "process-local";
+  } {
+    return {
+      cachePresent: this.#registryCache.get(cacheKey) !== undefined,
+      loadInFlight: this.#inFlightLoads.has(cacheKey),
+      activeBuildCount: this.#inFlightLoads.size,
+      waitingCallers: 0,
+      existingPromise: false,
+      promiseAgeMs: null,
+      stateScope: "process-local",
+    };
+  }
+
   beginLoad(cacheKey: string): void {
     if (this.#inFlightLoads.has(cacheKey)) {
       throw new PluginLoadReentryError(cacheKey);

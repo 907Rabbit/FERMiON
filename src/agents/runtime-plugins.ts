@@ -32,6 +32,7 @@ type AgentRuntimePluginRegistryParams = {
   preferBuiltPluginArtifacts?: boolean;
   metadataSnapshot?: PluginMetadataSnapshot;
   startupTrace?: PluginLoadOptions["startupTrace"];
+  registryTrace?: PluginLoadOptions["registryTrace"];
 };
 
 function resolveAgentRuntimePluginRegistryLoad(params: AgentRuntimePluginRegistryParams) {
@@ -99,6 +100,7 @@ function resolveAgentRuntimePluginRegistryLoad(params: AgentRuntimePluginRegistr
         ? { allowGatewaySubagentBinding: true }
         : undefined,
       ...(params.startupTrace ? { startupTrace: params.startupTrace } : {}),
+      ...(params.registryTrace ? { registryTrace: params.registryTrace } : {}),
     },
   };
 }

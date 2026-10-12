@@ -21,6 +21,7 @@ import type { AssistantMessage, ImageContent } from "../../../llm/types.js";
 import type { MediaFact } from "../../../media/media-facts.js";
 import type { PromptImageOrderEntry } from "../../../media/prompt-image-order.js";
 import type { PluginHookChannelContext } from "../../../plugins/hook-types.js";
+import type { PluginRegistryLoadTraceEvent } from "../../../plugins/loader-types.js";
 import type { RuntimePluginToolGrant } from "../../../plugins/runtime/tool-grant.js";
 import type { CommandQueueEnqueueFn } from "../../../process/command-queue.types.js";
 import type { InputProvenance } from "../../../sessions/input-provenance.js";
@@ -131,6 +132,7 @@ export type EmbeddedCapabilityIntelligenceExperimentHooks = {
   onPreparedRuntimeAcquisitionHeartbeat?: (heartbeat: PreparedRuntimeAcquisitionHeartbeat) => void;
   onPreparedRuntimePluginDiscoveryInputs?: (inputs: PreparedRuntimePluginDiscoveryInputs) => void;
   onPreparedRuntimePluginTiming?: (timing: PreparedRuntimePluginTiming) => void;
+  onPreparedRuntimePluginRegistryTrace?: (event: PluginRegistryLoadTraceEvent) => void;
   onPostResponseCheckpoint?: (checkpoint: PostResponseCheckpoint) => void;
   onPostResponseHeartbeat?: (heartbeat: PostResponseHeartbeat) => void;
   onPostResponseSnapshot?: (snapshot: PostResponseSnapshot) => void;

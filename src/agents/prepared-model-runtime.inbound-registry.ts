@@ -20,6 +20,7 @@ export type PreparedInboundRegistryLoader = (
   input: PreparedModelRuntimeInput,
   metadataSnapshot: PluginMetadataSnapshot,
   startupTrace?: PluginLoadOptions["startupTrace"],
+  registryTrace?: PluginLoadOptions["registryTrace"],
 ) => PluginRegistry;
 
 function inboundRegistryIdentity(input: PreparedModelRuntimeInput): string {
@@ -52,7 +53,7 @@ export function preparedModelRuntimeWorkspaceFactsKey(input: PreparedModelRuntim
 /** Creates one lifecycle-batch loader that shares exact generic registry identities. */
 export function createPreparedInboundRegistryLoader(): PreparedInboundRegistryLoader {
   const registries = new Map<string, PluginRegistry>();
-  return (input, metadataSnapshot, startupTrace) => {
+  return (input, metadataSnapshot, startupTrace, registryTrace) => {
     const key = inboundRegistryIdentity(input);
     const existing = registries.get(key);
     if (existing) {
@@ -89,6 +90,7 @@ export function createPreparedInboundRegistryLoader(): PreparedInboundRegistryLo
         metadataSnapshot,
         preferBuiltPluginArtifacts: true,
         ...(startupTrace ? { startupTrace } : {}),
+        ...(registryTrace ? { registryTrace } : {}),
       });
     registries.set(key, registry);
     return registry;
@@ -97,21 +99,27 @@ export function createPreparedInboundRegistryLoader(): PreparedInboundRegistryLo
 
 function createPluginPreparationStartupTrace(
   observer: PreparedRuntimeAcquisitionObserver | undefined,
-): PluginLoadOptions["startupTrace"] | undefined {
-  if (!observer?.onPluginPrepPluginTiming) {
-    return undefined;
-  }
-  return {
-    detail: (name, metrics) => {
-      const prefix = "plugins.gateway-load.plugin.";
-      if (!name.startsWith(prefix)) {
-        return;
+): Pick<PluginLoadOptions, "startupTrace" | "registryTrace"> {
+  const startupTrace = observer?.onPluginPrepPluginTiming
+    ? {
+        detail: (name: string, metrics: ReadonlyArray<readonly [string, number | string]>) => {
+          const prefix = "plugins.gateway-load.plugin.";
+          if (!name.startsWith(prefix)) {
+            return;
+          }
+          observer.onPluginPrepPluginTiming?.({
+            pluginId: name.slice(prefix.length),
+            metrics,
+          });
+        },
       }
-      observer.onPluginPrepPluginTiming?.({
-        pluginId: name.slice(prefix.length),
-        metrics,
-      });
-    },
+    : undefined;
+  const registryTrace = observer?.onPluginPrepRegistryTrace
+    ? { event: observer.onPluginPrepRegistryTrace }
+    : undefined;
+  return {
+    ...(startupTrace ? { startupTrace } : {}),
+    ...(registryTrace ? { registryTrace } : {}),
   };
 }
 
@@ -132,12 +140,14 @@ export function prepareWorkspacePluginRegistries(
     return {};
   }
   observer?.onPluginPrepCheckpoint?.("plugin-prep-inbound-registry-entered");
+  const traces = createPluginPreparationStartupTrace(observer);
   const inboundPluginRegistry = input.readOnly
     ? undefined
-    : loadInboundRegistry?.(input, metadataSnapshot, createPluginPreparationStartupTrace(observer));
+    : loadInboundRegistry?.(input, metadataSnapshot, traces.startupTrace, traces.registryTrace);
   observer?.onPluginPrepCheckpoint?.("plugin-prep-inbound-registry-complete");
   observer?.onPluginPrepCheckpoint?.("plugin-prep-runtime-registry-entered");
-  const startupTrace = createPluginPreparationStartupTrace(observer);
+  const startupTrace = traces.startupTrace;
+  const registryTrace = traces.registryTrace;
   const runtimePluginRegistry =
     input.runtimePluginSelections || !inboundPluginRegistry
       ? loadAgentRuntimePluginRegistryHandle({
@@ -154,6 +164,7 @@ export function prepareWorkspacePluginRegistries(
           ...(preferBuiltPluginArtifacts ? { preferBuiltPluginArtifacts: true } : {}),
           selections: input.runtimePluginSelections,
           ...(startupTrace ? { startupTrace } : {}),
+          ...(registryTrace ? { registryTrace } : {}),
         })
       : inboundPluginRegistry;
   observer?.onPluginPrepCheckpoint?.("plugin-prep-runtime-registry-complete");

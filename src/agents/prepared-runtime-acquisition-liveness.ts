@@ -1,4 +1,5 @@
 import { performance } from "node:perf_hooks";
+import type { PluginRegistryLoadTraceEvent } from "../plugins/loader-types.js";
 
 export const PREPARED_RUNTIME_ACQUISITION_HEARTBEAT_MS = 30_000;
 export const PREPARED_RUNTIME_ACQUISITION_HARD_TIMEOUT_MS = 10 * 60_000;
@@ -58,6 +59,7 @@ export type PreparedRuntimeAcquisitionObserver = {
   onPluginPrepCheckpoint?: (stage: PreparedRuntimePluginPrepCheckpoint) => void;
   onPluginPrepDiscoveryInputs?: (inputs: PreparedRuntimePluginDiscoveryInputs) => void;
   onPluginPrepPluginTiming?: (timing: PreparedRuntimePluginTiming) => void;
+  onPluginPrepRegistryTrace?: (event: PluginRegistryLoadTraceEvent) => void;
 };
 
 export class PreparedRuntimeAcquisitionTimeoutError extends Error {
@@ -84,6 +86,7 @@ export type PreparedRuntimeAcquisitionLivenessOptions = {
   onPluginPrepCheckpoint?: (stage: PreparedRuntimePluginPrepCheckpoint) => void;
   onPluginPrepDiscoveryInputs?: (inputs: PreparedRuntimePluginDiscoveryInputs) => void;
   onPluginPrepPluginTiming?: (timing: PreparedRuntimePluginTiming) => void;
+  onPluginPrepRegistryTrace?: (event: PluginRegistryLoadTraceEvent) => void;
   onHeartbeat?: (heartbeat: PreparedRuntimeAcquisitionHeartbeat) => void;
   now?: () => number;
   setInterval?: typeof globalThis.setInterval;
@@ -127,6 +130,9 @@ export async function withPreparedRuntimeAcquisitionLiveness<T>(
     },
     onPluginPrepPluginTiming: (timing) => {
       options.onPluginPrepPluginTiming?.(timing);
+    },
+    onPluginPrepRegistryTrace: (event) => {
+      options.onPluginPrepRegistryTrace?.(event);
     },
   };
   const heartbeat = () => {

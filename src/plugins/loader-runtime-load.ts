@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { GatewayRequestHandler } from "../gateway/server-methods/types.js";
 import { normalizeAgentToolResultMiddlewareRuntimeIds } from "./agent-tool-result-middleware.js";
 import {
@@ -29,13 +30,30 @@ import {
   maybeThrowOnPluginLoadError,
   resolveAuthorizedDreamingSidecar,
 } from "./loader-shared.js";
-import type { PluginLoadOptions } from "./loader-types.js";
+import type { PluginLoadOptions, PluginRegistryLoadTraceEvent } from "./loader-types.js";
 import { createPluginIdScopeSet, normalizePluginIdScope } from "./plugin-scope.js";
 import { createEmptyPluginRegistry } from "./registry-empty.js";
 import { getPluginRegistryRuntime } from "./registry-runtime-binding.js";
 import { createPluginRegistry, type PluginRegistry } from "./registry.js";
 import { getActivePluginRegistry } from "./runtime.js";
 import type { PluginRuntime } from "./runtime/types.js";
+
+const registryInstanceIds = new WeakMap<object, string>();
+let nextRegistryInstanceId = 1;
+
+function registryInstanceId(registry: object): string {
+  const existing = registryInstanceIds.get(registry);
+  if (existing) {
+    return existing;
+  }
+  const id = `registry-${nextRegistryInstanceId++}`;
+  registryInstanceIds.set(registry, id);
+  return id;
+}
+
+function cacheKeyHash(cacheKey: string): string {
+  return createHash("sha256").update(cacheKey).digest("hex").slice(0, 16);
+}
 
 type PluginModuleLoaderOverrides = Pick<
   Parameters<typeof createPluginModuleLoader>[0],
@@ -79,6 +97,8 @@ function loadOpenClawPluginsInternal(
   options: PluginLoadOptions,
   overrides?: InternalPluginLoadOverrides,
 ): PluginRegistry {
+  const trace = options.registryTrace?.event;
+  trace?.({ stage: "runtime-registry-entered", stateScope: "process-local" });
   const requestedOnlyPluginIds = normalizePluginIdScope(options.onlyPluginIds);
   const requestedOnlyPluginIdSet = createPluginIdScopeSet(requestedOnlyPluginIds);
   if (requestedOnlyPluginIdSet && requestedOnlyPluginIdSet.size === 0) {
@@ -96,13 +116,31 @@ function loadOpenClawPluginsInternal(
   }
 
   const context = resolvePluginLoadCacheContext(options);
+  const keyHash = cacheKeyHash(context.cacheKey);
+  const emit = (
+    stage: PluginRegistryLoadTraceEvent["stage"],
+    details: Partial<Omit<PluginRegistryLoadTraceEvent, "stage" | "stateScope">> = {},
+  ) => trace?.({ stage, cacheKeyHash: keyHash, ...details, stateScope: "process-local" });
+  emit("runtime-registry-key-built");
   const logger = options.logger ?? createPluginLoaderLogger();
   const validateOnly = options.mode === "validate";
   const onlyPluginIdSet = createPluginIdScopeSet(context.onlyPluginIds);
   const cacheEnabled = options.cache !== false && options.resolveRawConfigEnvVars !== true;
   if (cacheEnabled) {
+    emit(
+      "runtime-registry-cache-lookup-entered",
+      pluginLoaderCacheState.diagnosticSnapshot(context.cacheKey),
+    );
     const cached = getReusableCachedPluginRegistry(context.cacheKey);
+    emit(
+      "runtime-registry-cache-lookup-complete",
+      pluginLoaderCacheState.diagnosticSnapshot(context.cacheKey),
+    );
     if (cached) {
+      emit("runtime-registry-cache-hit", {
+        ...pluginLoaderCacheState.diagnosticSnapshot(context.cacheKey),
+        registryInstanceId: registryInstanceId(cached),
+      });
       maybeThrowOnPluginLoadError(cached, options.throwOnLoadError);
       if (context.shouldActivate) {
         activatePluginRegistry(
@@ -114,8 +152,16 @@ function loadOpenClawPluginsInternal(
       }
       return cached;
     }
+    emit(
+      "runtime-registry-cache-miss",
+      pluginLoaderCacheState.diagnosticSnapshot(context.cacheKey),
+    );
   }
 
+  emit(
+    "runtime-registry-build-started",
+    pluginLoaderCacheState.diagnosticSnapshot(context.cacheKey),
+  );
   pluginLoaderCacheState.beginLoad(context.cacheKey);
   let registryBuilder: ReturnType<typeof createPluginRegistry> | undefined;
   try {
@@ -163,6 +209,14 @@ function loadOpenClawPluginsInternal(
       activateGlobalSideEffects: context.shouldActivate,
     });
     const { registry } = registryBuilder;
+    emit("runtime-registry-builder-created", {
+      ...pluginLoaderCacheState.diagnosticSnapshot(context.cacheKey),
+      registryInstanceId: registryInstanceId(registry),
+    });
+    emit("runtime-registry-discovery-started", {
+      ...pluginLoaderCacheState.diagnosticSnapshot(context.cacheKey),
+      registryInstanceId: registryInstanceId(registry),
+    });
     const { manifestRegistry, orderedCandidates, manifestBySource, provenance } =
       resolvePluginLoadDiscovery({
         options,
@@ -174,6 +228,10 @@ function loadOpenClawPluginsInternal(
         warningCacheKey: context.cacheKey,
         suppliedManifestRegistry: options.manifestRegistry,
       });
+    emit("runtime-registry-discovery-completed", {
+      ...pluginLoaderCacheState.diagnosticSnapshot(context.cacheKey),
+      registryInstanceId: registryInstanceId(registry),
+    });
     const selectedMiddlewareOwnerManifests = new Map<
       string,
       (typeof manifestRegistry.plugins)[number]
@@ -222,25 +280,55 @@ function loadOpenClawPluginsInternal(
       memorySlot,
     });
     const pluginLoadStartMs = performance.now();
+    emit("runtime-registry-registration-started", {
+      ...pluginLoaderCacheState.diagnosticSnapshot(context.cacheKey),
+      registryInstanceId: registryInstanceId(registry),
+    });
     for (const candidate of orderedCandidates) {
       const manifestRecord = manifestBySource.get(candidate.source);
       if (!manifestRecord) {
         continue;
       }
-      loadRuntimePluginCandidate({
-        candidate,
-        manifestRecord,
-        context,
-        options,
-        onlyPluginIdSet,
-        dreamingSidecar,
-        validateOnly,
-        registryBuilder,
-        loadPluginModule,
-        logger,
-        state,
+      emit("runtime-registry-candidate-entered", {
+        ...pluginLoaderCacheState.diagnosticSnapshot(context.cacheKey),
+        registryInstanceId: registryInstanceId(registry),
+        pluginId: manifestRecord.id,
+        pluginOrigin: manifestRecord.origin,
       });
+      try {
+        loadRuntimePluginCandidate({
+          candidate,
+          manifestRecord,
+          context,
+          options,
+          onlyPluginIdSet,
+          dreamingSidecar,
+          validateOnly,
+          registryBuilder,
+          loadPluginModule,
+          logger,
+          state,
+          registryTrace: (event) =>
+            emit(event.stage, {
+              ...pluginLoaderCacheState.diagnosticSnapshot(context.cacheKey),
+              registryInstanceId: registryInstanceId(registry),
+              ...(event.pluginId ? { pluginId: event.pluginId } : {}),
+              ...(event.pluginOrigin ? { pluginOrigin: event.pluginOrigin } : {}),
+            }),
+        });
+      } finally {
+        emit("runtime-registry-candidate-completed", {
+          ...pluginLoaderCacheState.diagnosticSnapshot(context.cacheKey),
+          registryInstanceId: registryInstanceId(registry),
+          pluginId: manifestRecord.id,
+          pluginOrigin: manifestRecord.origin,
+        });
+      }
     }
+    emit("runtime-registry-registration-completed", {
+      ...pluginLoaderCacheState.diagnosticSnapshot(context.cacheKey),
+      registryInstanceId: registryInstanceId(registry),
+    });
     const pluginLoadElapsedMs = performance.now() - pluginLoadStartMs;
     if (state.pluginLoadAttemptCount > 0) {
       logger.debug?.(
@@ -285,6 +373,10 @@ function loadOpenClawPluginsInternal(
       }
     }
     if (context.shouldActivate) {
+      emit("runtime-registry-finalization-started", {
+        ...pluginLoaderCacheState.diagnosticSnapshot(context.cacheKey),
+        registryInstanceId: registryInstanceId(registry),
+      });
       // Install the complete bundle before hook-runner initialization.
       activatePluginRegistry(
         registry,
@@ -292,14 +384,28 @@ function loadOpenClawPluginsInternal(
         context.runtimeSubagentMode,
         options.workspaceDir,
       );
+      emit("runtime-registry-finalization-completed", {
+        ...pluginLoaderCacheState.diagnosticSnapshot(context.cacheKey),
+        registryInstanceId: registryInstanceId(registry),
+      });
     }
     // Publish only complete registries: failed activation restores the prior runtime selection,
     // then the catch below can discard this builder without poisoning a reusable cache value.
     if (cacheEnabled) {
       setCachedPluginRegistry(context.cacheKey, registry);
     }
+    emit("runtime-registry-completed", {
+      ...pluginLoaderCacheState.diagnosticSnapshot(context.cacheKey),
+      registryInstanceId: registryInstanceId(registry),
+    });
     return registry;
   } catch (error) {
+    emit("runtime-registry-failed", {
+      ...pluginLoaderCacheState.diagnosticSnapshot(context.cacheKey),
+      ...(registryBuilder
+        ? { registryInstanceId: registryInstanceId(registryBuilder.registry) }
+        : {}),
+    });
     // Registration failures discard only an inactive builder. Activation is failure-atomic, and
     // any later cache failure must not strip the registry already serving runtime consumers.
     if (context.shouldActivate && registryBuilder?.registry !== getActivePluginRegistry()) {
@@ -312,5 +418,9 @@ function loadOpenClawPluginsInternal(
     throw error;
   } finally {
     pluginLoaderCacheState.finishLoad(context.cacheKey);
+    emit(
+      "runtime-registry-build-finished",
+      pluginLoaderCacheState.diagnosticSnapshot(context.cacheKey),
+    );
   }
 }

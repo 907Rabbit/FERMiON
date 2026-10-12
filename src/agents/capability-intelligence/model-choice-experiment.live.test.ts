@@ -10,6 +10,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { AssistantMessage } from "../../llm/types.js";
 import { applyTestPluginDefaults } from "../../plugins/config-state.js";
+import type { PluginRegistryLoadTraceEvent } from "../../plugins/loader-types.js";
 import type { RunEmbeddedAgentParams } from "../embedded-agent-runner/run/params.js";
 import type { EmbeddedAgentRunResult } from "../embedded-agent-runner/types.js";
 import {
@@ -1269,7 +1270,16 @@ describeDiagnosticLive("v1I model-choice diagnostic", () => {
     "runs one non-formal synthetic diagnostic cell with durable checkpoints",
     { timeout: 600_000 },
     async () => {
-      expect(LIVE_MODE).toBe("synthetic");
+      const diagnosticStyle = process.env.OPENCLAW_V1I_DIAGNOSTIC_STYLE ?? "smoke";
+      if (diagnosticStyle !== "smoke" && diagnosticStyle !== "formal-resume") {
+        throw new Error(`unsupported diagnostic style: ${diagnosticStyle}`);
+      }
+      const diagnosticMode: V1IMode =
+        diagnosticStyle === "formal-resume" ? "real-exact" : "synthetic";
+      const diagnosticAttempt = diagnosticStyle === "formal-resume" ? 2 : 1;
+      if (LIVE_MODE !== diagnosticMode) {
+        throw new Error(`diagnostic mode mismatch: style=${diagnosticStyle} mode=${LIVE_MODE}`);
+      }
       expect(ACTIVE_FILTERING_ENABLED).toBe(false);
       const diagnosticRootValue = process.env.OPENCLAW_V1I_DIAGNOSTIC_ARTIFACT_DIR;
       if (!diagnosticRootValue) {
@@ -1291,11 +1301,17 @@ describeDiagnosticLive("v1I model-choice diagnostic", () => {
       }
       const journal = createV1IAttemptCheckpointJournal({
         root: diagnosticRoot,
-        attemptId: v1IAttemptId("SYNTHETIC", benchmarkCase.id, "B", 3, 1),
+        attemptId: v1IAttemptId(
+          surfaceModeForV1IMode(diagnosticMode),
+          benchmarkCase.id,
+          "B",
+          3,
+          diagnosticAttempt,
+        ),
         caseId: benchmarkCase.id,
         arm: "B",
         replicate: 3,
-        attemptIndex: 1,
+        attemptIndex: diagnosticAttempt,
       });
       journal.record("attempt-initialized");
       fs.writeFileSync(
@@ -1304,10 +1320,11 @@ describeDiagnosticLive("v1I model-choice diagnostic", () => {
           {
             diagnosticOnly: true,
             harnessCommit: HARNESS_COMMIT,
+            diagnosticStyle,
             caseId: benchmarkCase.id,
             arm: "B",
             replicate: 3,
-            attempt: 1,
+            attempt: diagnosticAttempt,
             model: MODEL_ID,
             provider: PROVIDER,
             contextLength: CONTEXT_LENGTH,
@@ -1328,6 +1345,8 @@ describeDiagnosticLive("v1I model-choice diagnostic", () => {
         discoveryInputs: [] as PreparedRuntimePluginDiscoveryInputs[],
         // SAFETY: these arrays collect the typed observer payloads emitted by the prepared-runtime owner.
         timings: [] as PreparedRuntimePluginTiming[],
+        // SAFETY: these events are diagnostic-only and identify the synchronous registry seam.
+        registryTraces: [] as PluginRegistryLoadTraceEvent[],
       };
       const responseSummaries: ProviderResponseSummary[] = [];
       const postResponseCheckpoints: PostResponseCheckpoint[] = [];
@@ -1343,15 +1362,38 @@ describeDiagnosticLive("v1I model-choice diagnostic", () => {
         journal.record("workspace-session-prep-start");
         journal.record("workspace-session-prep-complete");
         observation = await runOne({
-          mode: "synthetic",
-          surfaceMode: "SYNTHETIC",
+          mode: diagnosticMode,
+          surfaceMode: surfaceModeForV1IMode(diagnosticMode),
           benchmarkCase,
-          mappingClass: "SYNTHETIC",
-          authorizedNames: benchmarkCase.tools.map((tool) => tool.name),
-          v1cTop8: rankTop8(benchmarkCase.tools, benchmarkCase.query),
+          mappingClass: diagnosticMode === "synthetic" ? "SYNTHETIC" : "EXACT",
+          authorizedNames:
+            diagnosticMode === "synthetic"
+              ? benchmarkCase.tools.map((tool) => tool.name)
+              : benchmarkCase.tools.flatMap((tool) => {
+                  const mapped = getBenchmarkRealToolMapping(tool.name).realTool;
+                  return mapped ? [mapped] : [];
+                }),
+          v1cTop8: rankTop8(
+            diagnosticMode === "synthetic"
+              ? benchmarkCase.tools
+              : benchmarkCase.tools.flatMap((tool) => {
+                  const mapped = getBenchmarkRealToolMapping(tool.name).realTool;
+                  return mapped
+                    ? [{ name: mapped, description: `OpenClaw ${mapped} capability` }]
+                    : [];
+                }),
+            benchmarkCase.query,
+          ),
+          requiredMappedTools:
+            diagnosticMode === "synthetic"
+              ? []
+              : benchmarkCase.expectedTopTools.flatMap((tool) => {
+                  const mapped = getBenchmarkRealToolMapping(tool).realTool;
+                  return mapped ? [mapped] : [];
+                }),
           arm: "B",
           replicate: 3,
-          attempt: 1,
+          attempt: diagnosticAttempt,
           scheduleSeed: scheduleSeedFor(benchmarkCase.id, 3),
           config,
           workspaceDir,
@@ -1361,6 +1403,7 @@ describeDiagnosticLive("v1I model-choice diagnostic", () => {
           onAcquisitionHeartbeat: (heartbeat) => acquisitionHeartbeats.push(heartbeat),
           onPluginPrepDiscoveryInputs: (inputs) => pluginPrep.discoveryInputs.push(inputs),
           onPluginPrepTiming: (timing) => pluginPrep.timings.push(timing),
+          onPluginPrepRegistryTrace: (event) => pluginPrep.registryTraces.push(event),
           onCheckpoint: (checkpoint) => {
             if (checkpoint.stage === "prepared-runtime-acquisition-completed") {
               preparedRuntimeAcquisitionCompleted = true;
@@ -1444,6 +1487,8 @@ describeDiagnosticLive("v1I model-choice diagnostic", () => {
         preparedRuntimeAcquisitionCompleted,
         pluginDiscoveryInputs: pluginPrep.discoveryInputs,
         pluginTimings: pluginPrep.timings,
+        pluginRegistryTraces: pluginPrep.registryTraces,
+        diagnosticStyle,
         postResponseCheckpoints,
         postResponseHeartbeats,
         postResponseSnapshots,
@@ -1877,6 +1922,7 @@ async function runOne(input: {
   onAcquisitionHeartbeat?: (heartbeat: PreparedRuntimeAcquisitionHeartbeat) => void;
   onPluginPrepDiscoveryInputs?: (inputs: PreparedRuntimePluginDiscoveryInputs) => void;
   onPluginPrepTiming?: (timing: PreparedRuntimePluginTiming) => void;
+  onPluginPrepRegistryTrace?: (event: PluginRegistryLoadTraceEvent) => void;
   postResponseDiagnostics?: boolean;
   onPostResponseCheckpoint?: (checkpoint: PostResponseCheckpoint) => void;
   onPostResponseHeartbeat?: (heartbeat: PostResponseHeartbeat) => void;
@@ -1937,6 +1983,15 @@ async function runOne(input: {
   diagnostics.hooks.onPreparedRuntimePluginTiming = (timing) => {
     diagnosticsPluginTiming?.(timing);
     input.onPluginPrepTiming?.(timing);
+  };
+  const diagnosticsPluginRegistryTrace = diagnostics.hooks.onPreparedRuntimePluginRegistryTrace;
+  diagnostics.hooks.onPreparedRuntimePluginRegistryTrace = (event) => {
+    input.attemptCheckpointJournal?.record(`runtime-registry:${event.stage}`, {
+      registryTrace: event,
+      lastSuccessfulCheckpoint: `runtime-registry:${event.stage}`,
+    });
+    diagnosticsPluginRegistryTrace?.(event);
+    input.onPluginPrepRegistryTrace?.(event);
   };
   const diagnosticsPostResponseCheckpoint = diagnostics.hooks.onPostResponseCheckpoint;
   diagnostics.hooks.onPostResponseCheckpoint = (checkpoint) => {

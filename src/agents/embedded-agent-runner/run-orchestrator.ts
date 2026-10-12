@@ -390,6 +390,10 @@ async function runEmbeddedAgentInternal(
                 ),
               onPluginPrepPluginTiming: (timing) =>
                 params.capabilityIntelligenceExperiment?.onPreparedRuntimePluginTiming?.(timing),
+              onPluginPrepRegistryTrace: (event) =>
+                params.capabilityIntelligenceExperiment?.onPreparedRuntimePluginRegistryTrace?.(
+                  event,
+                ),
               onHeartbeat: (heartbeat) => {
                 emitPreparedRuntimeAcquisitionHeartbeat(heartbeat);
                 params.capabilityIntelligenceExperiment?.onPreparedRuntimeAcquisitionHeartbeat?.(

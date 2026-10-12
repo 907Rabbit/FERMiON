@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
+import type { PluginRegistryLoadTraceEvent } from "../../plugins/loader-types.js";
 import { withEnvAsync } from "../../test-utils/env.js";
 import type { RunEmbeddedAgentParams } from "../embedded-agent-runner/run/params.js";
 import type {
@@ -106,6 +107,7 @@ export type V1IAttemptCheckpointJournal = {
       eventLoopDelayMs?: number;
       eventLoopDelayDetected?: boolean;
       lastSuccessfulCheckpoint?: string | null;
+      registryTrace?: PluginRegistryLoadTraceEvent;
     },
   ) => void;
 };
@@ -179,6 +181,7 @@ export function createV1IAttemptCheckpointJournal(input: {
         ...(details?.lastSuccessfulCheckpoint === undefined
           ? {}
           : { lastSuccessfulCheckpoint: details.lastSuccessfulCheckpoint }),
+        ...(details?.registryTrace === undefined ? {} : { registryTrace: details.registryTrace }),
       };
       try {
         fs.appendFileSync(journalPath, `${JSON.stringify(checkpoint)}\n`);
@@ -344,6 +347,7 @@ export type ExperimentDiagnostics = {
   preparedRuntimeAcquisitionHeartbeats: PreparedRuntimeAcquisitionHeartbeat[];
   preparedRuntimePluginDiscoveryInputs: PreparedRuntimePluginDiscoveryInputs[];
   preparedRuntimePluginTimings: PreparedRuntimePluginTiming[];
+  preparedRuntimePluginRegistryTraces: PluginRegistryLoadTraceEvent[];
   postResponseCheckpoints: PostResponseCheckpoint[];
   postResponseHeartbeats: PostResponseHeartbeat[];
   postResponseSnapshots: PostResponseSnapshot[];
@@ -357,6 +361,7 @@ export function createExperimentDiagnostics(): ExperimentDiagnostics {
   const preparedRuntimeAcquisitionHeartbeats: PreparedRuntimeAcquisitionHeartbeat[] = [];
   const preparedRuntimePluginDiscoveryInputs: PreparedRuntimePluginDiscoveryInputs[] = [];
   const preparedRuntimePluginTimings: PreparedRuntimePluginTiming[] = [];
+  const preparedRuntimePluginRegistryTraces: PluginRegistryLoadTraceEvent[] = [];
   const postResponseCheckpoints: PostResponseCheckpoint[] = [];
   const postResponseHeartbeats: PostResponseHeartbeat[] = [];
   const postResponseSnapshots: PostResponseSnapshot[] = [];
@@ -385,6 +390,9 @@ export function createExperimentDiagnostics(): ExperimentDiagnostics {
     onPreparedRuntimePluginTiming: (timing) => {
       preparedRuntimePluginTimings.push(timing);
     },
+    onPreparedRuntimePluginRegistryTrace: (event) => {
+      preparedRuntimePluginRegistryTraces.push(event);
+    },
     onPostResponseCheckpoint: (checkpoint) => {
       postResponseCheckpoints.push({
         ...checkpoint,
@@ -407,6 +415,7 @@ export function createExperimentDiagnostics(): ExperimentDiagnostics {
     preparedRuntimeAcquisitionHeartbeats,
     preparedRuntimePluginDiscoveryInputs,
     preparedRuntimePluginTimings,
+    preparedRuntimePluginRegistryTraces,
     postResponseCheckpoints,
     postResponseHeartbeats,
     postResponseSnapshots,

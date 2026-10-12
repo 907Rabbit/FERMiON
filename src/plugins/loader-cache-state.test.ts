@@ -45,4 +45,45 @@ describe("PluginLoaderCacheState", () => {
     expect(cache.isLoadInFlight("demo")).toBe(true);
     expect(cache.hasOpenAllowlistWarning("demo-warning")).toBe(false);
   });
+
+  it("reports synchronous cache and in-flight ownership without inventing waiters", () => {
+    const cache = new PluginLoaderCacheState<string>(2);
+
+    expect(cache.diagnosticSnapshot("demo")).toMatchObject({
+      cachePresent: false,
+      loadInFlight: false,
+      activeBuildCount: 0,
+      waitingCallers: 0,
+      existingPromise: false,
+      promiseAgeMs: null,
+      stateScope: "process-local",
+    });
+
+    cache.set("demo", "registry");
+    expect(cache.diagnosticSnapshot("demo")).toMatchObject({
+      cachePresent: true,
+      loadInFlight: false,
+    });
+
+    cache.beginLoad("other");
+    expect(cache.diagnosticSnapshot("other")).toMatchObject({
+      cachePresent: false,
+      loadInFlight: true,
+      activeBuildCount: 1,
+    });
+    expect(cache.diagnosticSnapshot("demo").activeBuildCount).toBe(1);
+    cache.finishLoad("other");
+  });
+
+  it("rejects a second synchronous builder for the same cache key", () => {
+    const cache = new PluginLoaderCacheState<string>(2);
+
+    cache.beginLoad("demo");
+    expect(() => cache.beginLoad("demo")).toThrow(/reentry detected/);
+    expect(cache.diagnosticSnapshot("demo")).toMatchObject({
+      loadInFlight: true,
+      activeBuildCount: 1,
+    });
+    cache.finishLoad("demo");
+  });
 });

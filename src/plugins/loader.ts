@@ -3,6 +3,7 @@ import { loadOpenClawPlugins } from "./loader-runtime-load.js";
 import type { PluginLoadOptions } from "./loader-types.js";
 export {
   clearPluginRegistryLoadCache,
+  inspectPluginRegistryLoadCache,
   isPluginRegistryLoadInFlight,
   resolvePluginRegistryLoadCacheKey,
 } from "./loader-cache.js";

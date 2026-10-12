@@ -364,6 +364,18 @@ export async function runEmbeddedAttempt(
       toolSearch,
       toolSearchRunPlan,
     } = preparedToolCatalog;
+    params.capabilityIntelligenceExperiment?.onAuthorizedToolsPrepared?.([
+      ...effectiveTools.map((tool) => ({
+        name: tool.name,
+        description: tool.description,
+        parameters: tool.parameters,
+      })),
+      ...(clientTools ?? []).map((tool) => ({
+        name: tool.function.name,
+        description: tool.function.description,
+        parameters: tool.function.parameters,
+      })),
+    ]);
     toolSearchCatalogApplied = toolSearch.catalogRegistered;
     params.capabilityIntelligenceExperiment?.onCheckpoint?.({
       stage: "attempt-system-prompt-entered",

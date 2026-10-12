@@ -164,6 +164,13 @@ export type EmbeddedCapabilityIntelligenceExperimentHooks = {
     toolCount: number;
     representativeToolNames: readonly string[];
   }) => void;
+  onAuthorizedToolsPrepared?: (
+    tools: readonly {
+      name: string;
+      description?: string;
+      parameters: unknown;
+    }[],
+  ) => void;
   onModelLoopSubstage?: (event: {
     stage: EmbeddedCapabilityIntelligenceModelLoopSubstage;
     elapsedMs: number;

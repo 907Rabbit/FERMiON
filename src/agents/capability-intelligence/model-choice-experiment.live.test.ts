@@ -126,6 +126,79 @@ type CapturedModelRequest = {
   url: string;
 };
 
+type V1JSchemaCaptureName = "capture-1" | "capture-2" | "arm-a" | "arm-c";
+type V1JAuthorizedToolSchema = { name: string; description?: string; parameters: unknown };
+
+function persistV1JSchemaCapture(input: {
+  name: V1JSchemaCaptureName;
+  authorizedTools: readonly V1JAuthorizedToolSchema[];
+  providerTools: unknown;
+  model: string;
+}): void {
+  const root = path.resolve(
+    "artifacts/capability-intelligence/v1j-action-initiation/schema-baseline",
+  );
+  const providerTools = structuredClone(input.providerTools) as unknown;
+  const authorizedTools = structuredClone(input.authorizedTools) as unknown;
+  if (!Array.isArray(providerTools) || !Array.isArray(authorizedTools)) {
+    throw new Error("v1J schema capture requires both complete tool arrays");
+  }
+  fs.mkdirSync(root, { recursive: true });
+  const toolsPath = path.join(root, `${input.name}-provider-tools.json`);
+  const metadataPath = path.join(root, `${input.name}-metadata.json`);
+  if (fs.existsSync(toolsPath) || fs.existsSync(metadataPath)) {
+    throw new Error(`v1J schema capture already exists: ${input.name}`);
+  }
+  const providerNames = providerTools.map((tool) => providerToolName(tool));
+  const authorizedNames = authorizedTools.map((tool) => (tool as V1JAuthorizedToolSchema).name);
+  if (providerNames.some((name) => !name) || authorizedNames.some((name) => !name)) {
+    throw new Error("v1J schema capture contains an unnamed tool");
+  }
+  fs.writeFileSync(toolsPath, `${JSON.stringify({ authorizedTools, providerTools }, null, 2)}\n`, {
+    flag: "wx",
+  });
+  fs.writeFileSync(
+    metadataPath,
+    `${JSON.stringify(
+      {
+        head: HARNESS_COMMIT,
+        model: input.model,
+        modelConfigHash: hashV1ICanonical(modelConfigIdentity()),
+        provider: PROVIDER,
+        contextLength: CONTEXT_LENGTH,
+        rankerVersion: SHADOW_RANKER_VERSION,
+        topK: 8,
+        activeFilteringEnabled: ACTIVE_FILTERING_ENABLED,
+        canonicalizationVersion: "v1j-provider-schema-v1",
+        authorizedToolCount: authorizedNames.length,
+        authorizedToolNames: authorizedNames,
+        providerToolCount: providerNames.length,
+        providerToolNames: providerNames,
+        modelRequestsSent: 0,
+      },
+      null,
+      2,
+    )}\n`,
+    { flag: "wx" },
+  );
+}
+
+function providerToolName(tool: unknown): string | undefined {
+  if (!tool || typeof tool !== "object" || Array.isArray(tool)) {
+    return undefined;
+  }
+  const record = tool as Record<string, unknown>;
+  if (typeof record.name === "string") {
+    return record.name;
+  }
+  const fn = record.function;
+  return fn && typeof fn === "object" && !Array.isArray(fn)
+    ? typeof (fn as Record<string, unknown>).name === "string"
+      ? ((fn as Record<string, unknown>).name as string)
+      : undefined
+    : undefined;
+}
+
 type ProviderResponseSummary = {
   responseClass: string;
   responseObjectType: string | null;
@@ -1932,6 +2005,8 @@ async function runOne(input: {
   requestCapture?: {
     stopAfterCapture?: boolean;
     holdAfterCapture?: boolean;
+    schemaCaptureName?: V1JSchemaCaptureName;
+    onAuthorizedToolsCaptured?: (tools: readonly V1JAuthorizedToolSchema[]) => void;
     onRequestCaptured?: (request: CapturedModelRequest) => void;
     onDelegatedRequest?: () => void;
     onResponseSummary?: (summary: ProviderResponseSummary) => void;
@@ -1986,6 +2061,7 @@ async function runOne(input: {
       })
     : undefined;
   const semanticToolCalls: CorrelationToolCall[] = [];
+  let authorizedToolSchemas: readonly V1JAuthorizedToolSchema[] = [];
   const rawExecutionRecords: CorrelationExecution[] = [];
   const diagnosticsCheckpoint = diagnostics.hooks.onCheckpoint;
   diagnostics.hooks.onCheckpoint = (checkpoint) => {
@@ -2117,6 +2193,14 @@ async function runOne(input: {
         : {};
     const request = { body, url: "provider-adapter" };
     capture.recordProviderRequest(request);
+    if (input.requestCapture?.schemaCaptureName) {
+      persistV1JSchemaCapture({
+        name: input.requestCapture.schemaCaptureName,
+        authorizedTools: authorizedToolSchemas,
+        providerTools: body.tools,
+        model: runModel,
+      });
+    }
     input.requestCapture?.onRequestCaptured?.(request);
     const toolNames = toolNamesFromBody(body);
     diagnostics.hooks.onCheckpoint?.({
@@ -2229,7 +2313,14 @@ async function runOne(input: {
           ...params,
           ...(harness ? buildSyntheticRunnerOverrides(harness) : {}),
           ...(input.arm === "B" ? { extraSystemPrompt: ARM_B_INSTRUCTION } : {}),
-          capabilityIntelligenceExperiment: diagnostics.hooks,
+          capabilityIntelligenceExperiment: {
+            ...diagnostics.hooks,
+            onAuthorizedToolsPrepared: (tools) => {
+              authorizedToolSchemas = tools;
+              input.requestCapture?.onAuthorizedToolsCaptured?.(tools);
+              diagnostics.hooks.onAuthorizedToolsPrepared?.(tools);
+            },
+          },
           ...(runAbortSignal ? { abortSignal: runAbortSignal } : {}),
           onEmbeddedReplayFact: (fact) => {
             if (fact.kind === "ranking") {
@@ -2575,6 +2666,53 @@ function buildOfflineRequestConfig(workspaceDir: string): OpenClawConfig {
 }
 
 describe("v1I offline request preparation", () => {
+  it("persists only authorized and provider tool schemas with safe metadata", () => {
+    const workspaceDir = fs.mkdtempSync(path.join(os.tmpdir(), "v1j-schema-capture-test-"));
+    const cwd = vi.spyOn(process, "cwd").mockReturnValue(workspaceDir);
+    try {
+      persistV1JSchemaCapture({
+        name: "capture-1",
+        model: "qwen/qwen3.5-9b",
+        authorizedTools: [
+          { name: "read", description: "Read a file", parameters: { type: "object" } },
+        ],
+        providerTools: [
+          {
+            type: "function",
+            function: {
+              name: "read",
+              description: "Read a file",
+              parameters: { type: "object" },
+            },
+          },
+        ],
+      });
+      const root = path.join(
+        workspaceDir,
+        "artifacts/capability-intelligence/v1j-action-initiation/schema-baseline",
+      );
+      const toolsText = fs.readFileSync(path.join(root, "capture-1-provider-tools.json"), "utf8");
+      const metadataText = fs.readFileSync(path.join(root, "capture-1-metadata.json"), "utf8");
+      expect(JSON.parse(toolsText)).toMatchObject({
+        authorizedTools: [{ name: "read", parameters: { type: "object" } }],
+        providerTools: [{ function: { name: "read", parameters: { type: "object" } } }],
+      });
+      expect(metadataText).toContain('"modelRequestsSent": 0');
+      expect(metadataText).not.toMatch(/prompt|messages|credential|requestId|conversation/i);
+      expect(() =>
+        persistV1JSchemaCapture({
+          name: "capture-1",
+          model: "qwen/qwen3.5-9b",
+          authorizedTools: [],
+          providerTools: [],
+        }),
+      ).toThrow("already exists");
+    } finally {
+      cwd.mockRestore();
+      fs.rmSync(workspaceDir, { recursive: true, force: true });
+    }
+  });
+
   it("preserves the production default memory slot in the live harness", () => {
     const workspaceDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-v1i-memory-slot-"));
     try {
@@ -2799,6 +2937,7 @@ describe("v1I offline request preparation", () => {
     }
     const workspaceDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-v1i-request-boundary-"));
     const captured: CapturedModelRequest[] = [];
+    const authorizedSchemas: V1JAuthorizedToolSchema[] = [];
     const abortController = new AbortController();
     let delegatedRequests = 0;
     try {
@@ -2822,6 +2961,7 @@ describe("v1I offline request preparation", () => {
         abortSignal: abortController.signal,
         requestCapture: {
           stopAfterCapture: true,
+          onAuthorizedToolsCaptured: (tools) => authorizedSchemas.push(...tools),
           onRequestCaptured: (request) => {
             captured.push(request);
             abortController.abort(new V1IProviderRequestCapturedError());
@@ -2840,6 +2980,9 @@ describe("v1I offline request preparation", () => {
       expect(names).toHaveLength(31);
       expect(new Set(names)).toHaveLength(31);
       expect(new Set(names)).toEqual(new Set(benchmarkCase.tools.map((tool) => tool.name)));
+      expect(authorizedSchemas).toHaveLength(31);
+      expect(new Set(authorizedSchemas.map((tool) => tool.name))).toEqual(new Set(names));
+      expect(authorizedSchemas.every((tool) => tool.parameters !== undefined)).toBe(true);
       expect(names).toEqual(expect.arrayContaining(["git_diff", "pytest", "calendar", "email"]));
       expect(checkpoint("client-preparation-completed")?.toolCount).toBe(31);
       expect(checkpoint("attempt-bundle-completed")?.toolCount).toBeGreaterThan(0);

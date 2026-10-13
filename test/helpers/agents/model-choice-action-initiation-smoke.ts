@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { canonicalizeV1IValue } from "../../../src/agents/capability-intelligence/model-choice-experiment-evidence.js";
 import { isV1IProvenanceAmendment } from "../../../src/agents/capability-intelligence/model-choice-experiment-provenance.js";
 import {
   V1J_PREREGISTRATION_SHA256,
@@ -56,6 +57,99 @@ export type V1JPreflightCounterName =
 
 export type V1JPreflightCounters = Record<V1JPreflightCounterName, number>;
 
+export type V1JPreflightRequestObservation = {
+  arm: "A" | "C";
+  armInstructionSha256: string;
+  modelId: string | null;
+  modelConfigSha256: string;
+  requestUrlSha256: string;
+  requestBodySha256: string;
+  systemPromptSha256: string;
+  authorizedToolCount: number;
+  authorizedToolNameSha256: string;
+  authorizedToolSchemaSha256: string;
+  providerToolCount: number;
+  providerToolNameSha256: string;
+  providerToolSchemaSha256: string;
+};
+
+export type V1JPreflightObservationSummary = {
+  rawCallbackCount: number;
+  uniqueCanonicalObservations: number;
+  duplicateEquivalentCallbacks: number;
+  differingFields: string[];
+  allCapturedObservationsEquivalent: boolean;
+  canonicalObservation: V1JPreflightRequestObservation | null;
+};
+
+export function summarizeV1JPreflightObservations(
+  observations: readonly V1JPreflightRequestObservation[],
+): V1JPreflightObservationSummary {
+  const unique = new Map<string, V1JPreflightRequestObservation>();
+  for (const observation of observations) {
+    unique.set(canonicalizeV1IValue(observation), observation);
+  }
+  const equivalent = observations.length > 0 && unique.size === 1;
+  const first = observations[0];
+  const differingFields = first
+    ? Object.keys(first)
+        .filter((field) => {
+          const firstValue = first[field as keyof V1JPreflightRequestObservation];
+          return observations.some(
+            (observation) =>
+              canonicalizeV1IValue(observation[field as keyof V1JPreflightRequestObservation]) !==
+              canonicalizeV1IValue(firstValue),
+          );
+        })
+        .toSorted()
+    : [];
+  return {
+    rawCallbackCount: observations.length,
+    uniqueCanonicalObservations: unique.size,
+    duplicateEquivalentCallbacks: observations.length - unique.size,
+    differingFields,
+    allCapturedObservationsEquivalent: equivalent,
+    canonicalObservation: equivalent ? observations[0]! : null,
+  };
+}
+
+export function evaluateV1JPreflightStop(input: {
+  counters: V1JPreflightCounters;
+  requestObserverCount: number;
+  capturedRequestCount: number;
+  delegatedRequestCount: number;
+  providerDispatchAttempts: number;
+  observations: readonly V1JPreflightRequestObservation[];
+}): { observationSummary: V1JPreflightObservationSummary; predicates: Record<string, boolean> } {
+  const observationSummary = summarizeV1JPreflightObservations(input.observations);
+  const predicates = {
+    requestHookInvocationsAtLeastOne: input.counters.providerRequestHookInvocations >= 1,
+    requestObserverInvocationsAtLeastOne: input.counters.requestObserverInvocations >= 1,
+    requestObserverCounterMatches:
+      input.counters.requestObserverInvocations === input.requestObserverCount,
+    requestObserverCountMatchesCapturedRequests:
+      input.requestObserverCount === input.capturedRequestCount,
+    providerRequestHookCountMatchesCapturedRequests:
+      input.counters.providerRequestHookInvocations === input.capturedRequestCount,
+    capturedObservationCountMatchesRequests:
+      observationSummary.rawCallbackCount === input.capturedRequestCount,
+    allCapturedObservationsEquivalent: observationSummary.allCapturedObservationsEquivalent,
+    uniqueCanonicalObservationIsOne: observationSummary.uniqueCanonicalObservations === 1,
+    providerCallbackCountIsZero: input.counters.providerCallbackInvocations === 0,
+    dispatchAttemptsIsZero:
+      input.counters.providerDispatchAttempts === 0 && input.providerDispatchAttempts === 0,
+    modelRequestCountIsZero: input.counters.modelRequestCounter === 0,
+    stopSignalsMatchCapturedRequests:
+      input.counters.preflightStopSignalRaised === input.capturedRequestCount &&
+      input.capturedRequestCount > 0,
+    stopSignalCaught: input.counters.preflightStopSignalCaught === 1,
+    schemaCaptureNotEntered:
+      input.counters.schemaCaptureStarts === 0 && input.counters.schemaCaptureCompletes === 0,
+    delegatedRequestCountIsZero: input.delegatedRequestCount === 0,
+  };
+  return { observationSummary, predicates };
+}
+
 export type V1JPreflightDiagnosticJournal = {
   filePath: string;
   arm: "A" | "C";
@@ -71,6 +165,8 @@ export type V1JPreflightDiagnosticJournal = {
     capturedRequestCount: number;
     delegatedRequestCount: number;
     providerDispatchAttempts: number;
+    observations: readonly V1JPreflightRequestObservation[];
+    requestBodyDifferingPaths?: readonly string[];
   }) => Record<string, boolean>;
   close: () => void;
 };
@@ -280,26 +376,23 @@ function createV1JPreflightDiagnosticJournalAtPath(
       capturedRequestCount,
       delegatedRequestCount,
       providerDispatchAttempts,
+      observations,
+      requestBodyDifferingPaths,
     }) => {
-      const predicates = {
-        requestObserverCountIsOne: requestObserverCount === 1,
-        requestObserverCounterMatches: counters.requestObserverInvocations === requestObserverCount,
-        providerRequestHookCountIsOne: counters.providerRequestHookInvocations === 1,
-        providerCallbackCountIsZero: counters.providerCallbackInvocations === 0,
-        dispatchAttemptsIsZero:
-          counters.providerDispatchAttempts === 0 && providerDispatchAttempts === 0,
-        modelRequestCountIsZero: counters.modelRequestCounter === 0,
-        stopSignalRaised: counters.preflightStopSignalRaised === 1,
-        stopSignalCaught: counters.preflightStopSignalCaught === 1,
-        schemaCaptureNotEntered:
-          counters.schemaCaptureStarts === 0 && counters.schemaCaptureCompletes === 0,
-        capturedRequestCountIsOne: capturedRequestCount === 1,
-        delegatedRequestCountIsZero: delegatedRequestCount === 0,
-      };
+      const { observationSummary, predicates } = evaluateV1JPreflightStop({
+        counters,
+        requestObserverCount,
+        capturedRequestCount,
+        delegatedRequestCount,
+        providerDispatchAttempts,
+        observations,
+      });
       record("preflight-stop-assertion-evaluated", {
         requestObserverCount,
         capturedRequestCount,
         delegatedRequestCount,
+        observationSummary,
+        ...(requestBodyDifferingPaths ? { requestBodyDifferingPaths } : {}),
         predicates,
         passed: Object.values(predicates).every(Boolean),
       });

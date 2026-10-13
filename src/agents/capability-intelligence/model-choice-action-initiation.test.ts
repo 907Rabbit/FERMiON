@@ -16,6 +16,7 @@ import {
   runV1JSmokeSchedule,
   V1J_FORMAL_ARTIFACT_RELATIVE_PATH,
   type V1JSmokeRecord,
+  type V1JPreflightRequestObservation,
 } from "../../../test/helpers/agents/model-choice-action-initiation-smoke.js";
 import {
   appendV1JInvalidAttempt,
@@ -204,6 +205,27 @@ function observation(
 
 function toolsNames(protocol: V1JProtocol): string[] {
   return [...protocol.schemaBaseline.expectedRuntimeNames];
+}
+
+function preflightRequestObservation(
+  overrides: Partial<V1JPreflightRequestObservation> = {},
+): V1JPreflightRequestObservation {
+  return {
+    arm: "C",
+    armInstructionSha256: "a".repeat(64),
+    modelId: "qwen/qwen3.5-9b",
+    modelConfigSha256: "b".repeat(64),
+    requestUrlSha256: "c".repeat(64),
+    requestBodySha256: "d".repeat(64),
+    systemPromptSha256: "e".repeat(64),
+    authorizedToolCount: 15,
+    authorizedToolNameSha256: "f".repeat(64),
+    authorizedToolSchemaSha256: "1".repeat(64),
+    providerToolCount: 15,
+    providerToolNameSha256: "2".repeat(64),
+    providerToolSchemaSha256: "3".repeat(64),
+    ...overrides,
+  };
 }
 
 describe("v1J action-initiation protocol and offline harness", () => {
@@ -754,6 +776,7 @@ describe("v1J action-initiation protocol and offline harness", () => {
         capturedRequestCount: 1,
         delegatedRequestCount: 0,
         providerDispatchAttempts: 0,
+        observations: [preflightRequestObservation()],
       });
       expect(Object.values(predicates).every(Boolean)).toBe(true);
       const completedArms: ("A" | "C")[] = ["A"];
@@ -790,7 +813,7 @@ describe("v1J action-initiation protocol and offline harness", () => {
           providerCallbackCountIsZero: true,
           dispatchAttemptsIsZero: true,
           modelRequestCountIsZero: true,
-          stopSignalRaised: true,
+          stopSignalsMatchCapturedRequests: true,
           stopSignalCaught: true,
         },
       });

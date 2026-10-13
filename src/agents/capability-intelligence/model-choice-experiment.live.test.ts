@@ -19,9 +19,11 @@ import {
   resolveV1JSmokeRoot,
   runV1JArmCPreflightOnly,
   runV1JSmokeSchedule,
+  summarizeV1JPreflightObservations,
   V1J_FORMAL_ARTIFACT_RELATIVE_PATH,
   V1J_SMOKE_PROVENANCE_PATH,
   type V1JPreflightDiagnosticJournal,
+  type V1JPreflightRequestObservation,
   type V1JSmokeCell,
 } from "../../../test/helpers/agents/model-choice-action-initiation-smoke.js";
 import {
@@ -1602,6 +1604,7 @@ async function captureV1JPreflightSurface(
   const workspaceDir = fs.mkdtempSync(path.join(os.tmpdir(), `v1j-preflight-${arm}-`));
   const authorizedTools: V1JAuthorizedToolSchema[] = [];
   const requests: CapturedModelRequest[] = [];
+  const requestObservations: V1JPreflightRequestObservation[] = [];
   let observation: ExperimentRun | undefined;
   let dispatchAttempts = 0;
   let delegatedRequests = 0;
@@ -1632,7 +1635,33 @@ async function captureV1JPreflightSurface(
         capturePromptInstruction: v1jInstructionForArm(protocol, arm),
         onAuthorizedToolsCaptured: (tools) =>
           authorizedTools.splice(0, authorizedTools.length, ...tools),
-        onRequestCaptured: (request) => requests.push(request),
+        onRequestCaptured: (request) => {
+          requests.push(request);
+          const surface = fingerprintV1JToolSurface({
+            authorizedTools,
+            providerTools: Array.isArray(request.body.tools) ? request.body.tools : [],
+          });
+          const requestObservation: V1JPreflightRequestObservation = {
+            arm,
+            armInstructionSha256: sha256V1J(v1jInstructionForArm(protocol, arm)),
+            modelId: typeof request.body.model === "string" ? request.body.model : null,
+            modelConfigSha256: hashV1ICanonical(modelConfigIdentity()),
+            requestUrlSha256: sha256V1J(request.url),
+            requestBodySha256: hashV1ICanonical(request.body),
+            systemPromptSha256: sha256V1J(v1jSystemMessageText(request.body)),
+            authorizedToolCount: surface.authorizedToolCount,
+            authorizedToolNameSha256: surface.authorizedToolNameSha256,
+            authorizedToolSchemaSha256: surface.authorizedToolSchemaSha256,
+            providerToolCount: surface.providerToolCount,
+            providerToolNameSha256: surface.providerToolNameSha256,
+            providerToolSchemaSha256: surface.providerToolSchemaSha256,
+          };
+          requestObservations.push(requestObservation);
+          preflightDiagnostics?.record(`arm-${arm.toLowerCase()}-request-observation-captured`, {
+            observationIndex: requestObservations.length,
+            observation: requestObservation,
+          });
+        },
         onProviderDispatchAttempt: (count) => {
           dispatchAttempts = count;
         },
@@ -1680,11 +1709,17 @@ async function captureV1JPreflightSurface(
       // Prepared agent stores may remain open until this test process exits on Windows.
     }
   }
+  const observationSummary = summarizeV1JPreflightObservations(requestObservations);
+  const requestBodyDifferingPaths = differingV1JRequestBodyPaths(
+    requests.map((request) => request.body),
+  );
   const predicates = preflightDiagnostics?.evaluateStop({
     requestObserverCount: requests.length,
     capturedRequestCount: requests.length,
     delegatedRequestCount: delegatedRequests,
     providerDispatchAttempts: dispatchAttempts,
+    observations: requestObservations,
+    requestBodyDifferingPaths,
   });
   const stopFailureName = observation?.requestPreparationDiagnostics?.failure?.errorName;
   if (stopFailureName === V1IProviderRequestCapturedError.name && preflightDiagnostics) {
@@ -1693,7 +1728,10 @@ async function captureV1JPreflightSurface(
     });
   }
   const passed =
-    requests.length === 1 &&
+    requests.length > 0 &&
+    requestObservations.length === requests.length &&
+    observationSummary.allCapturedObservationsEquivalent &&
+    observationSummary.uniqueCanonicalObservations === 1 &&
     dispatchAttempts === 0 &&
     delegatedRequests === 0 &&
     (!predicates || Object.values(predicates).every(Boolean));
@@ -1717,12 +1755,23 @@ async function captureV1JPreflightSurface(
         preflightStopSignalRaised: preflightDiagnostics?.counters().preflightStopSignalRaised,
         preflightStopSignalCaught: preflightDiagnostics?.counters().preflightStopSignalCaught,
         preflightCompleted: preflightDiagnostics?.counters().preflightCompleted,
+        observationSummary,
+        requestBodyDifferingPaths,
         predicates,
       })}`,
     );
   }
+  preflightDiagnostics?.record(`arm-${arm.toLowerCase()}-preflight-observations-equivalent`, {
+    rawCallbackCount: observationSummary.rawCallbackCount,
+    uniqueCanonicalObservations: observationSummary.uniqueCanonicalObservations,
+    duplicateEquivalentCallbacks: observationSummary.duplicateEquivalentCallbacks,
+    allCapturedObservationsEquivalent: observationSummary.allCapturedObservationsEquivalent,
+    canonicalObservation: observationSummary.canonicalObservation,
+  });
+  // Select the first request only after every callback has matched its frozen-field fingerprint.
+  const canonicalRequest = requests[0]!;
   const actionInstruction = v1jInstructionForArm(protocol, "C");
-  const systemText = v1jSystemMessageText(requests[0]!.body);
+  const systemText = v1jSystemMessageText(canonicalRequest.body);
   if (
     (arm === "C" && !systemText.includes(actionInstruction)) ||
     (arm === "A" && systemText.includes(actionInstruction))
@@ -1731,22 +1780,22 @@ async function captureV1JPreflightSurface(
   }
   const actual = fingerprintV1JToolSurface({
     authorizedTools,
-    providerTools: Array.isArray(requests[0]?.body.tools) ? requests[0].body.tools : [],
+    providerTools: Array.isArray(canonicalRequest.body.tools) ? canonicalRequest.body.tools : [],
   });
   const expectedNames = [...protocol.schemaBaseline.expectedRuntimeNames].toSorted();
   if (
     canonicalV1JToolNames(authorizedTools).join("\n") !== expectedNames.join("\n") ||
     canonicalV1JToolNames(
-      Array.isArray(requests[0]?.body.tools) ? requests[0].body.tools : [],
+      Array.isArray(canonicalRequest.body.tools) ? canonicalRequest.body.tools : [],
     ).join("\n") !== expectedNames.join("\n")
   ) {
     throw new Error("v1J preflight runtime tool names differ from the frozen exact set");
   }
   assertV1JRuntimeGate(protocol, {
-    modelId: protocol.model.id,
+    modelId: observationSummary.canonicalObservation?.modelId ?? "",
     provider: protocol.model.provider,
     contextLength: protocol.model.contextLength,
-    modelConfigHash: hashV1ICanonical(modelConfigIdentity()),
+    modelConfigHash: observationSummary.canonicalObservation?.modelConfigSha256 ?? "",
     rankerVersion: SHADOW_RANKER_VERSION,
     topK: 8,
     activeFilteringEnabled: ACTIVE_FILTERING_ENABLED,
@@ -2114,6 +2163,74 @@ function v1jSystemMessageText(body: Record<string, unknown>): string {
     .join("\n");
 }
 
+function differingV1JRequestBodyPaths(bodies: readonly unknown[]): string[] {
+  if (bodies.length < 2) {
+    return [];
+  }
+  const paths = new Set<string>();
+  const compare = (values: readonly unknown[], currentPath: string) => {
+    const first = values[0];
+    if (
+      values.every(
+        (value) =>
+          Object.is(value, first) ||
+          (value !== undefined &&
+            first !== undefined &&
+            canonicalizeV1IValue(value) === canonicalizeV1IValue(first)),
+      )
+    ) {
+      return;
+    }
+    if (
+      values.every((value) => value !== null && typeof value === "object" && !Array.isArray(value))
+    ) {
+      const keys = new Set(values.flatMap((value) => Object.keys(value)));
+      for (const key of keys) {
+        compare(
+          values.map((value) => (value as Record<string, unknown>)[key]),
+          `${currentPath}.${key}`,
+        );
+      }
+      return;
+    }
+    if (values.every((value) => Array.isArray(value))) {
+      const arrays = values as readonly unknown[][];
+      const maxLength = Math.max(...arrays.map((array) => array.length));
+      for (let index = 0; index < maxLength; index += 1) {
+        compare(
+          arrays.map((array) => array[index]),
+          `${currentPath}[${index}]`,
+        );
+      }
+      return;
+    }
+    paths.add(currentPath || "$request");
+  };
+  compare(bodies, "");
+  return [...paths].toSorted();
+}
+
+function testV1JPreflightObservation(
+  overrides: Partial<V1JPreflightRequestObservation> = {},
+): V1JPreflightRequestObservation {
+  return {
+    arm: "C",
+    armInstructionSha256: "a".repeat(64),
+    modelId: MODEL_ID,
+    modelConfigSha256: "b".repeat(64),
+    requestUrlSha256: "c".repeat(64),
+    requestBodySha256: "d".repeat(64),
+    systemPromptSha256: "e".repeat(64),
+    authorizedToolCount: 15,
+    authorizedToolNameSha256: "f".repeat(64),
+    authorizedToolSchemaSha256: "1".repeat(64),
+    providerToolCount: 15,
+    providerToolNameSha256: "2".repeat(64),
+    providerToolSchemaSha256: "3".repeat(64),
+    ...overrides,
+  };
+}
+
 describe("v1I diagnostic resource resolution", () => {
   it("resolves the production state schema independently of CWD and artifact location", async () => {
     const previousArtifactDir = process.env.OPENCLAW_V1I_DIAGNOSTIC_ARTIFACT_DIR;
@@ -2155,7 +2272,7 @@ describe("v1I diagnostic resource resolution", () => {
 });
 
 describe("v1J schema-capture dispatch guard", () => {
-  it("records repeated Arm C preflight callbacks and keeps the smoke schedule closed", async () => {
+  it("hard-stops when repeated Arm C preflight requests are not equivalent", async () => {
     const protocol = readV1JPreregistration();
     const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), "v1j-preflight-path-test-"));
     const cwd = vi.spyOn(process, "cwd").mockReturnValue(repoRoot);
@@ -2172,14 +2289,9 @@ describe("v1J schema-capture dispatch guard", () => {
     });
     try {
       await installOfflinePreparedRuntimeMock();
-      let preflightError: unknown;
-      try {
-        await captureV1JPreflightSurface(protocol, "C", head, journal);
-      } catch (error) {
-        preflightError = error;
-      }
-      expect(preflightError).toBeInstanceOf(Error);
-      expect((preflightError as Error).message).toContain('"requestObserverInvocations":4');
+      await expect(captureV1JPreflightSurface(protocol, "C", head, journal)).rejects.toThrow(
+        /v1J schema preflight failed/,
+      );
       expect(journal.counters()).toMatchObject({
         requestObserverInvocations: 4,
         providerRequestHookInvocations: 4,
@@ -2203,9 +2315,40 @@ describe("v1J schema-capture dispatch guard", () => {
       expect(events).toContain("arm-c-runtime-ready");
       expect(events).toContain("arm-c-request-observer-enter");
       expect(events).not.toContain("arm-c-schema-validated");
+      expect(events).not.toContain("arm-c-preflight-complete");
+      expect(events).not.toContain("arm-c-preflight-observations-equivalent");
       expect(events).toContain("arm-c-stop-before-dispatch-signal");
       expect(events).toContain("arm-c-preflight-stop-signal-caught");
-      expect(events).not.toContain("arm-c-preflight-complete");
+      expect(events.some((event) => event.startsWith("arm-a-"))).toBe(false);
+      expect(events.some((event) => event.includes("smoke-schedule"))).toBe(false);
+      const observationRows = rows.filter(
+        (row) => row.event === "arm-c-request-observation-captured",
+      );
+      expect(observationRows).toHaveLength(4);
+      expect(new Set(observationRows.map((row) => JSON.stringify(row.observation))).size).toBe(2);
+      expect(JSON.stringify(observationRows)).not.toContain("## Tool use");
+      expect(JSON.stringify(observationRows)).not.toContain(
+        protocol.arms.C.experimentalInstruction,
+      );
+      expect(rows.find((row) => row.event === "preflight-stop-assertion-evaluated")).toMatchObject({
+        passed: false,
+        requestBodyDifferingPaths: [".messages[2]"],
+        observationSummary: {
+          rawCallbackCount: 4,
+          uniqueCanonicalObservations: 2,
+          duplicateEquivalentCallbacks: 2,
+          differingFields: ["requestBodySha256"],
+          allCapturedObservationsEquivalent: false,
+          canonicalObservation: null,
+        },
+        predicates: {
+          allCapturedObservationsEquivalent: false,
+          uniqueCanonicalObservationIsOne: false,
+          providerCallbackCountIsZero: true,
+          dispatchAttemptsIsZero: true,
+          modelRequestCountIsZero: true,
+        },
+      });
       const hookRows = rows.filter((row) => row.event === "arm-c-provider-request-hook-enter");
       expect(hookRows.map((row) => row.invocationIndex)).toEqual([1, 2, 3, 4]);
       expect(
@@ -2214,14 +2357,15 @@ describe("v1J schema-capture dispatch guard", () => {
       expect(rows.find((row) => row.event === "preflight-stop-assertion-evaluated")).toMatchObject({
         passed: false,
         predicates: {
-          requestObserverCountIsOne: false,
-          providerRequestHookCountIsOne: false,
+          requestHookInvocationsAtLeastOne: true,
+          requestObserverInvocationsAtLeastOne: true,
+          allCapturedObservationsEquivalent: false,
+          uniqueCanonicalObservationIsOne: false,
           providerCallbackCountIsZero: true,
           dispatchAttemptsIsZero: true,
           modelRequestCountIsZero: true,
-          stopSignalRaised: false,
+          stopSignalsMatchCapturedRequests: true,
           stopSignalCaught: true,
-          capturedRequestCountIsOne: false,
         },
       });
     } finally {
@@ -2272,6 +2416,7 @@ describe("v1J schema-capture dispatch guard", () => {
         capturedRequestCount: blockedFetch.requests.length,
         delegatedRequestCount: blockedFetch.delegatedRequests,
         providerDispatchAttempts: blockedFetch.providerDispatchAttempts,
+        observations: [testV1JPreflightObservation()],
       });
       expect(Object.values(blockedPredicates).every(Boolean)).toBe(true);
       expect(blockedProviderCallbackCalls).toBe(0);
@@ -2324,6 +2469,7 @@ describe("v1J schema-capture dispatch guard", () => {
         capturedRequestCount: dispatchFetch.requests.length,
         delegatedRequestCount: dispatchFetch.delegatedRequests,
         providerDispatchAttempts: dispatchFetch.providerDispatchAttempts,
+        observations: [testV1JPreflightObservation()],
       });
       expect(dispatchPredicates.providerCallbackCountIsZero).toBe(false);
       expect(dispatchPredicates.dispatchAttemptsIsZero).toBe(false);

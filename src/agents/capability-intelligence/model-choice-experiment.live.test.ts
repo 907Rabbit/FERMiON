@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { configureAiTransportHost, getAiTransportHost } from "@openclaw/ai";
+import { asOptionalRecord as asRecord } from "@openclaw/normalization-core/record-coerce";
 import { describe, expect, it, vi } from "vitest";
 import {
   assertV1JFormalStateEmpty,
@@ -45,8 +46,20 @@ import {
   type V1JObservation,
   type V1JProtocol,
 } from "../../../test/helpers/agents/model-choice-action-initiation.js";
+import {
+  assertV1JAdapterDifferentialRequestMatch,
+  assertV1JAdapterDifferentialPreflight,
+  createV1JAdapterDifferentialJournal,
+  runV1JAdapterDifferentialRawTransport,
+  summarizeV1JAdapterDifferentialRequest,
+  V1J_ADAPTER_DIFFERENTIAL_AUTHORIZED_FLAG,
+  V1J_ADAPTER_DIFFERENTIAL_COMMIT_FLAG,
+  V1J_ADAPTER_DIFFERENTIAL_PREFIX,
+  V1J_ADAPTER_DIFFERENTIAL_RUN_FLAG,
+} from "../../../test/helpers/agents/model-choice-adapter-differential.js";
 import { runV1JPayloadDecompositionDiagnostic } from "../../../test/helpers/agents/model-choice-provider-payload-decomposition-live.js";
 import {
+  buildV1JPayloadDecompositionRequests,
   V1J_PAYLOAD_DECOMPOSITION_AUTHORIZED_FLAG,
   V1J_PAYLOAD_DECOMPOSITION_COMMIT_FLAG,
   V1J_PAYLOAD_DECOMPOSITION_RUN_FLAG,
@@ -151,6 +164,12 @@ const V1J_PROVIDER_RESPONSE_DIAGNOSTIC_AUTHORIZED =
   process.env.OPENCLAW_V1J_PROVIDER_RESPONSE_DIAGNOSTIC_AUTHORIZED === "1";
 const V1J_ARM_C_PREFLIGHT_DIAGNOSTIC = process.env.OPENCLAW_V1J_ARM_C_PREFLIGHT_DIAGNOSTIC === "1";
 const V1J_PAYLOAD_DECOMPOSITION = process.env[V1J_PAYLOAD_DECOMPOSITION_RUN_FLAG] === "1";
+const V1J_ADAPTER_DIFFERENTIAL = process.env[V1J_ADAPTER_DIFFERENTIAL_RUN_FLAG] === "1";
+const V1J_ADAPTER_DIFFERENTIAL_FLAGS = new Set([
+  V1J_ADAPTER_DIFFERENTIAL_RUN_FLAG,
+  V1J_ADAPTER_DIFFERENTIAL_AUTHORIZED_FLAG,
+  V1J_ADAPTER_DIFFERENTIAL_COMMIT_FLAG,
+]);
 const V1J_PAYLOAD_DECOMPOSITION_FLAGS = [
   V1J_PAYLOAD_DECOMPOSITION_RUN_FLAG,
   V1J_PAYLOAD_DECOMPOSITION_AUTHORIZED_FLAG,
@@ -172,6 +191,17 @@ if (
   )
 ) {
   throw new Error("v1J payload decomposition cannot share another v1I/v1J mode");
+}
+if (
+  V1J_ADAPTER_DIFFERENTIAL &&
+  Object.entries(process.env).some(
+    ([name, value]) =>
+      value !== undefined &&
+      /^(OPENCLAW_V1[IJ]_)/.test(name) &&
+      !V1J_ADAPTER_DIFFERENTIAL_FLAGS.has(name),
+  )
+) {
+  throw new Error("v1J adapter differential cannot share another v1I/v1J mode");
 }
 if (
   V1J_PROVIDER_RESPONSE_DIAGNOSTIC &&
@@ -242,6 +272,8 @@ type CapturedModelRequest = {
   body: Record<string, unknown>;
   url: string;
 };
+
+type V1JLifecycleJournal = Pick<V1JProviderResponseDiagnosticJournal, "record">;
 
 type PromptMessageTraceEvent = Parameters<
   NonNullable<RunEmbeddedAgentParams["capabilityIntelligenceExperiment"]>["onPromptMessageTrace"]
@@ -1369,6 +1401,7 @@ const describeV1JArmCPreflightDiagnostic = V1J_ARM_C_PREFLIGHT_DIAGNOSTIC
   ? describe
   : describe.skip;
 const describeV1JPayloadDecomposition = V1J_PAYLOAD_DECOMPOSITION ? describe : describe.skip;
+const describeV1JAdapterDifferential = V1J_ADAPTER_DIFFERENTIAL ? describe : describe.skip;
 const describeFullLive =
   LIVE &&
   !SMOKE_TEST &&
@@ -1728,6 +1761,245 @@ describeV1JPayloadDecomposition("v1J payload-decomposition transport diagnostic"
           return { bodies, surface, smokePrompt: smokeCell.prompt };
         },
       }),
+  );
+});
+
+describeV1JAdapterDifferential("v1J raw-transport versus adapter differential", () => {
+  it(
+    "compares one raw request with one real Arm-A adapter/model-loop request",
+    { timeout: 900_000 },
+    async () => {
+      if (
+        !V1J_ADAPTER_DIFFERENTIAL ||
+        process.env[V1J_ADAPTER_DIFFERENTIAL_AUTHORIZED_FLAG] !== "1" ||
+        LIVE ||
+        V1J_ACTION_LIVE_TEST ||
+        V1J_ACTION_LIVE_AUTHORIZED ||
+        V1J_ACTION_SMOKE_TEST ||
+        V1J_ACTION_SMOKE_AUTHORIZED ||
+        V1J_PROVIDER_RESPONSE_DIAGNOSTIC ||
+        V1J_PROVIDER_RESPONSE_DIAGNOSTIC_AUTHORIZED ||
+        V1J_ARM_C_PREFLIGHT_DIAGNOSTIC ||
+        V1J_SCHEMA_CAPTURE_MODE !== undefined ||
+        process.env.OPENCLAW_V1J_CELL_ALLOWLIST !== undefined ||
+        process.env.OPENCLAW_V1J_MAX_CELLS !== undefined ||
+        process.env.OPENCLAW_V1I_MODE !== undefined
+      ) {
+        throw new Error("v1J adapter differential requires only its dedicated authorization flags");
+      }
+      const protocol = readV1JPreregistration();
+      const head = assertV1JCommittedHarness(protocol);
+      const repoRoot = process.cwd();
+      const protocolPath = path.resolve(repoRoot, V1J_PREREGISTRATION_PATH);
+      const protocolBytes = fs.readFileSync(protocolPath);
+      const protocolSha256 = createHash("sha256").update(protocolBytes).digest("hex");
+      const provenance = JSON.parse(
+        fs.readFileSync(path.resolve(repoRoot, V1J_SMOKE_PROVENANCE_PATH), "utf8"),
+      ) as unknown;
+      assertV1JSmokeProvenance(provenance, protocol, head);
+      const artifactRoot = path.resolve(
+        repoRoot,
+        "artifacts/capability-intelligence/v1j-action-initiation",
+        `${V1J_ADAPTER_DIFFERENTIAL_PREFIX}${head}`,
+      );
+      assertV1JAdapterDifferentialPreflight({
+        env: process.env,
+        head,
+        trackedTreeClean: true,
+        activeFilteringEnabled: ACTIVE_FILTERING_ENABLED,
+        modelId: MODEL_ID,
+        provider: PROVIDER,
+        contextLength: CONTEXT_LENGTH,
+        modelConfigHash: hashV1ICanonical(modelConfigIdentity()),
+        protocolSha256,
+        detachedProtocolSha256: fs.readFileSync(
+          protocolPath.replace(/\.json$/u, ".sha256"),
+          "utf8",
+        ),
+        schema: protocol.schemaBaseline,
+        provenanceAccepted: true,
+        artifactExists: fs.existsSync(artifactRoot),
+      });
+      assertV1JFormalStateEmpty(repoRoot);
+      await assertLiveModelAvailable();
+
+      const cell = buildV1JSmokeSchedule(protocol).find(
+        (candidate) => candidate.cellId === "smoke-tool-required:A:1",
+      );
+      if (!cell || cell.arm !== "A" || cell.stratum !== "TOOL_REQUIRED") {
+        throw new Error("v1J adapter differential Arm-A smoke identity changed");
+      }
+      const benchmark = v1jSmokeBenchmark(cell);
+      const capturedBodies: Record<string, unknown>[] = [];
+      const schemaSurface = await captureV1JPreflightSurface(protocol, "A", head, undefined, {
+        benchmarkCase: benchmark,
+        prepareWorkspace: (preparedWorkspace) =>
+          fs.writeFileSync(
+            path.join(preparedWorkspace, "smoke-reference.txt"),
+            "smoke-token-47\n",
+            { encoding: "utf8", flag: "wx" },
+          ),
+        onCapturedRequest: (request) => capturedBodies.push(structuredClone(request.body)),
+      });
+      const expectedSurface = protocol.schemaBaseline;
+      if (
+        capturedBodies.length !== 1 ||
+        schemaSurface.authorizedToolCount !== expectedSurface.authorizedToolCount ||
+        schemaSurface.providerToolCount !== expectedSurface.providerToolCount ||
+        schemaSurface.authorizedToolNameSha256 !== expectedSurface.authorizedToolNameSha256 ||
+        schemaSurface.providerToolNameSha256 !== expectedSurface.providerToolNameSha256 ||
+        schemaSurface.authorizedToolSchemaSha256 !== expectedSurface.authorizedToolSchemaSha256 ||
+        schemaSurface.providerToolSchemaSha256 !== expectedSurface.providerToolSchemaSha256
+      ) {
+        throw new Error(
+          "v1J adapter differential request preflight drifted from the frozen schema",
+        );
+      }
+      const capturedArmARequest = capturedBodies[0]!;
+      const armAText = v1jSystemMessageText(capturedArmARequest);
+      if (
+        capturedArmARequest.model !== protocol.model.id ||
+        capturedArmARequest.stream !== true ||
+        !Array.isArray(capturedArmARequest.tools) ||
+        capturedArmARequest.tools.length !== 15 ||
+        armAText.includes(v1jInstructionForArm(protocol, "C"))
+      ) {
+        throw new Error("v1J adapter differential did not capture the frozen Arm-A request shape");
+      }
+      const controlC = buildV1JPayloadDecompositionRequests({
+        capturedArmARequest,
+      }).find((request) => request.control === "C");
+      if (!controlC) {
+        throw new Error("v1J adapter differential raw Control C request is unavailable");
+      }
+      const workspaceDir = fs.mkdtempSync(path.join(os.tmpdir(), "v1j-adapter-differential-"));
+      fs.writeFileSync(path.join(workspaceDir, "smoke-reference.txt"), "smoke-token-47\n", {
+        encoding: "utf8",
+        flag: "wx",
+      });
+      const requestMetrics = summarizeV1JAdapterDifferentialRequest(controlC.body);
+      const journal = createV1JAdapterDifferentialJournal({
+        repoRoot,
+        harnessCommit: head,
+        modelId: protocol.model.id,
+        modelConfigHash: hashV1ICanonical(modelConfigIdentity()),
+        schemaFingerprint: schemaSurface,
+        startedAt: new Date().toISOString(),
+      });
+      let rawResult: Awaited<ReturnType<typeof runV1JAdapterDifferentialRawTransport>> | undefined;
+      let observation: V1JObservation | undefined;
+      let adapterDispatches = 0;
+      let adapterRequestMatch:
+        | { rawRequestSha256: string; adapterRequestSha256: string }
+        | undefined;
+      try {
+        journal.record("captured-arm-a-request-ready", requestMetrics);
+        rawResult = await runV1JAdapterDifferentialRawTransport({
+          endpoint: `${LM_STUDIO_BASE_URL}/chat/completions`,
+          authorization: `Bearer ${process.env.LM_API_TOKEN ?? "lmstudio"}`,
+          requestBody: controlC.body,
+          fetchImpl: fetch,
+          journal,
+        });
+        journal.record("raw-transport-complete", {
+          httpStatus: rawResult.httpStatus,
+          responseFirstByteMs: rawResult.responseFirstByteMs,
+          responseChunkCount: rawResult.responseChunkCount,
+          responseByteCount: rawResult.responseByteCount,
+          elapsedMs: rawResult.elapsedMs,
+          outcome: rawResult.streamEnd ? "complete" : "incomplete",
+        });
+        journal.record("adapter-path-start", { requestIndex: 1, outcome: "started" });
+        observation = await executeV1JCell({
+          protocol,
+          cell,
+          attempt: 1,
+          head,
+          benchmarkOverride: benchmark,
+          workspaceDirOverride: workspaceDir,
+          allowNoToolTerminalEvidence: true,
+          runIdPrefix: "v1j-adapter-differential",
+          lifecycleJournal: journal,
+          onRequestCaptured: (request, requestIndex) => {
+            if (requestIndex === 1) {
+              adapterRequestMatch = assertV1JAdapterDifferentialRequestMatch(
+                controlC.body,
+                request.body,
+              );
+              journal.record("adapter-request-body-matched", {
+                ...adapterRequestMatch,
+                ...summarizeV1JAdapterDifferentialRequest(request.body),
+              });
+              return;
+            }
+            journal.record("adapter-followup-request", {
+              requestIndex,
+              ...summarizeV1JAdapterDifferentialRequest(request.body),
+            });
+          },
+          onProviderDispatchAttempt: (count) => {
+            adapterDispatches = count;
+            journal.record("adapter-dispatch-attempt", {
+              requestIndex: count,
+              outcome: count <= 2 ? "within-bound" : "hard-stop",
+            });
+            if (count > 2) {
+              throw new Error("v1J adapter differential exceeded two adapter model requests");
+            }
+          },
+        });
+        journal.record("differential-complete", {
+          requestIndex: 1,
+          outcome: observation.valid ? "valid-terminal" : "invalid-terminal",
+          adapterRequestSha256: adapterRequestMatch?.adapterRequestSha256,
+          modelLoopStatus: observation.invalidReason ?? "completed",
+          toolCallCount: observation.toolCalls.length,
+          executionCount: observation.executions.length,
+          correlationStatus: observation.correlationStatus,
+          terminalEvidenceComplete: observation.terminalEvidenceComplete,
+        });
+      } catch (error) {
+        journal.record("differential-failed", {
+          outcome: "failed",
+          errorClass: error instanceof Error ? error.name : "NonErrorThrown",
+          errorCode:
+            error && typeof error === "object" && "code" in error
+              ? String((error as { code?: unknown }).code ?? "")
+              : undefined,
+          timeoutState:
+            error instanceof Error && error.name === "TimeoutError" ? "timed-out" : "no-timeout",
+        });
+        throw error;
+      } finally {
+        try {
+          fs.rmSync(workspaceDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+        } catch (error) {
+          journal.record("workspace-cleanup-failed", {
+            outcome: "failed",
+            errorClass: error instanceof Error ? error.name : "NonErrorThrown",
+          });
+        }
+        journal.close();
+      }
+      assertV1JFormalStateEmpty(repoRoot);
+      if (fs.existsSync(resolveV1JSmokeRoot(repoRoot, head))) {
+        throw new Error("v1J adapter differential touched the normal smoke artifact path");
+      }
+      process.stdout.write(
+        `${JSON.stringify({
+          rawTransport: rawResult,
+          adapterDispatches,
+          adapterRequestMatch: Boolean(adapterRequestMatch),
+          terminalEvidenceComplete: observation?.terminalEvidenceComplete ?? false,
+          correlationStatus: observation?.correlationStatus ?? "UNPROVABLE",
+          toolCallCount: observation?.toolCalls.length ?? 0,
+          executionCount: observation?.executions.length ?? 0,
+          formalStateTouched: false,
+          smokeStateTouched: false,
+          artifactRoot: journal.root,
+        })}\n`,
+      );
+    },
   );
 });
 
@@ -2157,15 +2429,11 @@ async function captureV1JPreflightSurface(
     authorizedTools,
     providerTools: Array.isArray(canonicalRequest.body.tools) ? canonicalRequest.body.tools : [],
   });
-  const expectedNames = [...protocol.schemaBaseline.expectedRuntimeNames].toSorted();
-  if (
-    canonicalV1JToolNames(authorizedTools).join("\n") !== expectedNames.join("\n") ||
-    canonicalV1JToolNames(
-      Array.isArray(canonicalRequest.body.tools) ? canonicalRequest.body.tools : [],
-    ).join("\n") !== expectedNames.join("\n")
-  ) {
-    throw new Error("v1J preflight runtime tool names differ from the frozen exact set");
-  }
+  assertV1JPreflightRuntimeNames(
+    protocol.schemaBaseline.expectedRuntimeNames,
+    authorizedTools,
+    Array.isArray(canonicalRequest.body.tools) ? canonicalRequest.body.tools : [],
+  );
   assertV1JRuntimeGate(protocol, {
     modelId: observationSummary.canonicalObservation?.modelId ?? "",
     provider: protocol.model.provider,
@@ -2184,6 +2452,20 @@ async function captureV1JPreflightSurface(
     `arm-${arm.toLowerCase()}-preflight-complete`,
   );
   return actual;
+}
+
+function assertV1JPreflightRuntimeNames(
+  expectedNames: readonly string[],
+  authorizedTools: readonly unknown[],
+  providerTools: readonly unknown[],
+): void {
+  const expected = [...expectedNames].toSorted();
+  if (
+    canonicalV1JToolNames(authorizedTools).join("\n") !== expected.join("\n") ||
+    canonicalV1JToolNames(providerTools).join("\n") !== expected.join("\n")
+  ) {
+    throw new Error("v1J preflight runtime tool names differ from the frozen exact set");
+  }
 }
 
 function requireV1JBenchmarkCase(protocol: V1JProtocol, caseId: string): ToolRankingBenchmarkCase {
@@ -2248,7 +2530,9 @@ async function executeV1JCell(input: {
   workspaceDirOverride?: string;
   allowNoToolTerminalEvidence?: boolean;
   runIdPrefix?: string;
-  lifecycleJournal?: V1JProviderResponseDiagnosticJournal;
+  lifecycleJournal?: V1JLifecycleJournal;
+  onRequestCaptured?: (request: CapturedModelRequest, requestIndex: number) => void;
+  onProviderDispatchAttempt?: (count: number) => void;
 }): Promise<V1JObservation> {
   const { protocol, cell, attempt, head } = input;
   const benchmark =
@@ -2271,6 +2555,7 @@ async function executeV1JCell(input: {
   const responseSummaries: ProviderResponseSummary[] = [];
   let dispatchAttempts = 0;
   let delegatedRequests = 0;
+  let capturedProviderRequestCount = 0;
   let gateFailure: Error | undefined;
   let run: ExperimentRun | undefined;
   try {
@@ -2303,6 +2588,7 @@ async function executeV1JCell(input: {
         onAuthorizedToolsCaptured: (tools) =>
           authorizedTools.splice(0, authorizedTools.length, ...tools),
         onRequestCaptured: (request) => {
+          const requestIndex = ++capturedProviderRequestCount;
           providerRequests.push(request);
           try {
             const surface = fingerprintV1JToolSurface({
@@ -2338,6 +2624,7 @@ async function executeV1JCell(input: {
             ) {
               throw new Error("v1J CROSS_ARM_LEAK: provider-bound system instruction mismatch");
             }
+            input.onRequestCaptured?.(request, requestIndex);
           } catch (error) {
             gateFailure = error instanceof Error ? error : new Error("schema gate failed");
             throw gateFailure;
@@ -2345,6 +2632,7 @@ async function executeV1JCell(input: {
         },
         onProviderDispatchAttempt: (count) => {
           dispatchAttempts = count;
+          input.onProviderDispatchAttempt?.(count);
         },
         onDelegatedRequest: () => {
           delegatedRequests += 1;
@@ -2665,7 +2953,22 @@ describe("v1I diagnostic resource resolution", () => {
 });
 
 describe("v1J schema-capture dispatch guard", () => {
-  it("stops Arm C preflight before retrying a captured request", async () => {
+  it("accepts the canonical 15-tool surface and fails closed on fixture drift", async () => {
+    const protocol = readV1JPreregistration();
+    const names = protocol.schemaBaseline.expectedRuntimeNames;
+    expect(names).toHaveLength(15);
+    const authorized = names.map((name) => ({ name, parameters: { type: "object" } }));
+    const provider = names.map((name) => ({
+      type: "function",
+      function: { name, parameters: { type: "object" } },
+    }));
+    expect(() => assertV1JPreflightRuntimeNames(names, authorized, provider)).not.toThrow();
+    expect(() => assertV1JPreflightRuntimeNames(names, authorized.slice(1), provider)).toThrow(
+      /frozen exact set/,
+    );
+  });
+
+  it("keeps Arm C preflight closed when its offline runtime fixture drifts", async () => {
     const protocol = readV1JPreregistration();
     const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), "v1j-preflight-path-test-"));
     const cwd = vi.spyOn(process, "cwd").mockReturnValue(repoRoot);
@@ -2682,9 +2985,23 @@ describe("v1J schema-capture dispatch guard", () => {
     });
     try {
       await installOfflinePreparedRuntimeMock();
-      await expect(captureV1JPreflightSurface(protocol, "C", head, journal)).rejects.toThrow(
-        /v1J preflight runtime tool names differ from the frozen exact set/,
-      );
+      let capturedSurface: ReturnType<typeof fingerprintV1JToolSurface> | undefined;
+      let preflightError: unknown;
+      try {
+        capturedSurface = await captureV1JPreflightSurface(protocol, "C", head, journal);
+      } catch (error) {
+        preflightError = error;
+      }
+      const acceptedCanonicalSurface = capturedSurface !== undefined;
+      if (acceptedCanonicalSurface) {
+        expect(capturedSurface).toMatchObject(protocol.schemaBaseline);
+        expect(capturedSurface.authorizedToolNames).toEqual(
+          protocol.schemaBaseline.expectedRuntimeNames,
+        );
+      } else {
+        expect(preflightError).toBeInstanceOf(Error);
+        expect((preflightError as Error).message).toMatch(/frozen exact set/);
+      }
       expect(journal.counters()).toMatchObject({
         requestObserverInvocations: 1,
         providerRequestHookInvocations: 1,
@@ -2693,7 +3010,7 @@ describe("v1J schema-capture dispatch guard", () => {
         modelRequestCounter: 0,
         preflightStopSignalRaised: 1,
         preflightStopSignalCaught: 1,
-        preflightCompleted: 0,
+        preflightCompleted: acceptedCanonicalSurface ? 1 : 0,
       });
       expect(() => assertV1JPreflightPairComplete(["C"])).toThrow(/requires completed A and C/);
       expect(fs.existsSync(path.resolve(repoRoot, V1J_FORMAL_ARTIFACT_RELATIVE_PATH))).toBe(false);
@@ -2707,8 +3024,8 @@ describe("v1J schema-capture dispatch guard", () => {
       expect(events).toContain("arm-c-preflight-start");
       expect(events).toContain("arm-c-runtime-ready");
       expect(events).toContain("arm-c-request-observer-enter");
-      expect(events).not.toContain("arm-c-schema-validated");
-      expect(events).not.toContain("arm-c-preflight-complete");
+      expect(events.includes("arm-c-schema-validated")).toBe(acceptedCanonicalSurface);
+      expect(events.includes("arm-c-preflight-complete")).toBe(acceptedCanonicalSurface);
       expect(events).toContain("arm-c-preflight-observations-equivalent");
       expect(events).toContain("arm-c-stop-before-dispatch-signal");
       expect(events).toContain("arm-c-preflight-stop-signal-caught");
@@ -3481,7 +3798,9 @@ describe("v1I harness evidence repair", () => {
           "http-response-headers",
           "provider-response-observed",
           "http-response-body-start",
+          "adapter-stream-enter",
           "response-first-byte",
+          "adapter-first-chunk",
           "response-stream-progress",
           "stream-end",
           "http-response-body-complete",
@@ -4818,7 +5137,7 @@ async function runOne(input: {
     onAssistantMessage?: (message: AssistantMessage, modelTurnIndex: number) => void;
     liveness?: V1JCaptureLiveness;
     onProviderDispatchAttempt?: (count: number) => void;
-    lifecycleJournal?: V1JProviderResponseDiagnosticJournal;
+    lifecycleJournal?: V1JLifecycleJournal;
     requestCorrelationId?: string;
   };
   abortSignal?: AbortSignal;
@@ -5216,6 +5535,10 @@ async function runOne(input: {
   let adapterResponseIndex = 0;
   diagnostics.hooks.onProviderResponse = async ({ response, model }) => {
     const requestIndex = ++adapterResponseIndex;
+    input.requestCapture?.lifecycleJournal?.record("adapter-parse-start", {
+      requestIndex,
+      outcome: "entered",
+    });
     diagnostics.hooks.onCheckpoint?.({
       stage: "provider-response-received",
       toolCount: input.authorizedNames.length,
@@ -5245,6 +5568,16 @@ async function runOne(input: {
         requestIndex: modelTurnIndex + 1,
         toolCallCount: normalizedToolCallCount,
         outcome: "parsed",
+      });
+      input.requestCapture?.lifecycleJournal?.record("adapter-parse-complete", {
+        requestIndex: modelTurnIndex + 1,
+        toolCallCount: normalizedToolCallCount,
+        outcome: "parsed",
+      });
+      input.requestCapture?.lifecycleJournal?.record("tool-call-parse", {
+        requestIndex: modelTurnIndex + 1,
+        toolCallCount: normalizedToolCallCount,
+        outcome: "normalized",
       });
       diagnostics.hooks.onPostResponseCheckpoint?.({
         stage: "provider-response-normalization-complete",
@@ -5492,6 +5825,10 @@ async function runOne(input: {
             }
           : {}),
       });
+      input.requestCapture?.lifecycleJournal?.record("model-loop-return", {
+        modelLoopStatus: execution.status,
+        outcome: execution.status,
+      });
     }
   } catch (error) {
     input.requestCapture?.lifecycleJournal?.record("model-loop-complete", {
@@ -5510,6 +5847,11 @@ async function runOne(input: {
             ? "aborted"
             : "not-reported",
     });
+    input.requestCapture?.lifecycleJournal?.record("model-loop-return", {
+      modelLoopStatus: "error",
+      outcome: "rejected",
+      ...safeDiagnosticError(error),
+    });
     throw error;
   } finally {
     postResponseLiveness?.complete();
@@ -5520,6 +5862,12 @@ async function runOne(input: {
   const postResponseTimeout = postResponseLiveness?.readTimeout();
   if (postResponseTimeout) {
     input.requestCapture?.lifecycleJournal?.record("model-loop-complete", {
+      modelLoopStatus: "timeout",
+      outcome: "rejected",
+      ...safeDiagnosticError(postResponseTimeout),
+      timeoutState: "timed-out",
+    });
+    input.requestCapture?.lifecycleJournal?.record("model-loop-return", {
       modelLoopStatus: "timeout",
       outcome: "rejected",
       ...safeDiagnosticError(postResponseTimeout),
@@ -6895,7 +7243,7 @@ function captureModelPayloads(
     onRequestCaptured?: (request: CapturedModelRequest) => void;
     onDelegatedRequest?: () => void;
     onResponseSummary?: (summary: ProviderResponseSummary) => void;
-    lifecycleJournal?: V1JProviderResponseDiagnosticJournal;
+    lifecycleJournal?: V1JLifecycleJournal;
     requestCorrelationId?: string;
   },
 ): ModelPayloadCapture {
@@ -7124,6 +7472,7 @@ function captureModelPayloads(
         : response.body;
       const reader = providerBody.getReader();
       let responseBytes = 0;
+      let adapterStreamEntered = false;
       options?.lifecycleJournal?.record("http-response-body-start", {
         requestId: correlationId,
         correlationId,
@@ -7131,6 +7480,15 @@ function captureModelPayloads(
       });
       const observedBody = new ReadableStream<Uint8Array>({
         async pull(controller) {
+          if (!adapterStreamEntered) {
+            adapterStreamEntered = true;
+            options?.lifecycleJournal?.record("adapter-stream-enter", {
+              requestId: correlationId,
+              correlationId,
+              requestIndex,
+              outcome: "entered",
+            });
+          }
           try {
             const part = await reader.read();
             if (part.done) {
@@ -7151,6 +7509,15 @@ function captureModelPayloads(
             }
             responseBytes += part.value.byteLength;
             consumeProviderResponseChunk(state, part.value);
+            if (responseBytes === part.value.byteLength) {
+              options?.lifecycleJournal?.record("adapter-first-chunk", {
+                requestId: correlationId,
+                correlationId,
+                requestIndex,
+                responseChunkCount: 1,
+                responseByteCount: responseBytes,
+              });
+            }
             controller.enqueue(part.value);
           } catch (error) {
             options?.lifecycleJournal?.record("http-response-body-failed", {
@@ -7683,12 +8050,6 @@ function addStringShape(target: Set<string>, value: unknown): void {
   if (typeof value === "string" && value.length > 0 && target.size < 8) {
     target.add(value);
   }
-}
-
-function asRecord(value: unknown): Record<string, unknown> | undefined {
-  return value && typeof value === "object" && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : undefined;
 }
 
 function makeCleanupOutcome(

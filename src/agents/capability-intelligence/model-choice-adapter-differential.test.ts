@@ -263,9 +263,12 @@ describe("v1J adapter differential diagnostics", () => {
         fetchImpl: async (_request, init) => {
           calls += 1;
           expect(init?.method).toBe("POST");
-          return new Response('data: {"choices":[]}\n\n', {
-            headers: { "content-type": "text/event-stream" },
-          });
+          return new Response(
+            'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-raw-only","function":{"name":"exec","arguments":"{}"}}]}}]}\n\n',
+            {
+              headers: { "content-type": "text/event-stream" },
+            },
+          );
         },
         timeoutMs: 1_000,
         heartbeatMs: 1_000,
@@ -283,6 +286,7 @@ describe("v1J adapter differential diagnostics", () => {
       const events = fs.readFileSync(journal.filePath, "utf8");
       expect(events).toContain("raw-response-first-byte");
       expect(events).toContain("raw-control-complete");
+      expect(events).not.toContain("adapter-tool-execution-guard");
       expect(events).not.toContain("safe fixture prompt");
       expect(events).not.toContain("tool_0");
     } finally {

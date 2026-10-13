@@ -45,6 +45,12 @@ import {
   type V1JObservation,
   type V1JProtocol,
 } from "../../../test/helpers/agents/model-choice-action-initiation.js";
+import { runV1JPayloadDecompositionDiagnostic } from "../../../test/helpers/agents/model-choice-provider-payload-decomposition-live.js";
+import {
+  V1J_PAYLOAD_DECOMPOSITION_AUTHORIZED_FLAG,
+  V1J_PAYLOAD_DECOMPOSITION_COMMIT_FLAG,
+  V1J_PAYLOAD_DECOMPOSITION_RUN_FLAG,
+} from "../../../test/helpers/agents/model-choice-provider-payload-decomposition.js";
 import {
   createV1JProviderResponseDiagnosticJournal,
   isV1JCleanupFailureSecondary,
@@ -144,6 +150,29 @@ const V1J_PROVIDER_RESPONSE_DIAGNOSTIC =
 const V1J_PROVIDER_RESPONSE_DIAGNOSTIC_AUTHORIZED =
   process.env.OPENCLAW_V1J_PROVIDER_RESPONSE_DIAGNOSTIC_AUTHORIZED === "1";
 const V1J_ARM_C_PREFLIGHT_DIAGNOSTIC = process.env.OPENCLAW_V1J_ARM_C_PREFLIGHT_DIAGNOSTIC === "1";
+const V1J_PAYLOAD_DECOMPOSITION = process.env[V1J_PAYLOAD_DECOMPOSITION_RUN_FLAG] === "1";
+const V1J_PAYLOAD_DECOMPOSITION_FLAGS = [
+  V1J_PAYLOAD_DECOMPOSITION_RUN_FLAG,
+  V1J_PAYLOAD_DECOMPOSITION_AUTHORIZED_FLAG,
+  V1J_PAYLOAD_DECOMPOSITION_COMMIT_FLAG,
+];
+const anyV1JPayloadDecompositionFlag = V1J_PAYLOAD_DECOMPOSITION_FLAGS.some(
+  (name) => process.env[name] !== undefined,
+);
+if (anyV1JPayloadDecompositionFlag && !V1J_PAYLOAD_DECOMPOSITION) {
+  throw new Error("v1J payload decomposition requires its dedicated run flag");
+}
+if (
+  V1J_PAYLOAD_DECOMPOSITION &&
+  Object.entries(process.env).some(
+    ([name, value]) =>
+      value !== undefined &&
+      /^(OPENCLAW_V1[IJ]_)/.test(name) &&
+      !V1J_PAYLOAD_DECOMPOSITION_FLAGS.includes(name),
+  )
+) {
+  throw new Error("v1J payload decomposition cannot share another v1I/v1J mode");
+}
 if (
   V1J_PROVIDER_RESPONSE_DIAGNOSTIC &&
   (LIVE ||
@@ -1339,6 +1368,7 @@ const describeV1JProviderResponseDiagnostic =
 const describeV1JArmCPreflightDiagnostic = V1J_ARM_C_PREFLIGHT_DIAGNOSTIC
   ? describe
   : describe.skip;
+const describeV1JPayloadDecomposition = V1J_PAYLOAD_DECOMPOSITION ? describe : describe.skip;
 const describeFullLive =
   LIVE &&
   !SMOKE_TEST &&
@@ -1665,6 +1695,42 @@ describeV1JProviderResponseDiagnostic("v1J provider-response first-cell diagnost
   );
 });
 
+describeV1JPayloadDecomposition("v1J payload-decomposition transport diagnostic", () => {
+  it(
+    "sends only the three commit-bound transport controls without executing tools",
+    { timeout: 900_000 },
+    async () =>
+      runV1JPayloadDecompositionDiagnostic({
+        repoRoot: process.cwd(),
+        env: process.env,
+        protocol: readV1JPreregistration(),
+        head: assertV1JCommittedHarness(readV1JPreregistration()),
+        trackedTreeClean: true,
+        modelId: MODEL_ID,
+        modelConfigHash: hashV1ICanonical(modelConfigIdentity()),
+        provider: PROVIDER,
+        contextLength: CONTEXT_LENGTH,
+        activeFilteringEnabled: ACTIVE_FILTERING_ENABLED,
+        endpoint: `${LM_STUDIO_BASE_URL}/chat/completions`,
+        authorization: `Bearer ${process.env.LM_API_TOKEN ?? "lmstudio"}`,
+        fetchImpl: fetch,
+        captureArmARequest: async ({ protocol, head, smokeCell }) => {
+          const bodies: Record<string, unknown>[] = [];
+          const surface = await captureV1JPreflightSurface(protocol, "A", head, undefined, {
+            benchmarkCase: v1jSmokeBenchmark(smokeCell),
+            prepareWorkspace: (workspaceDir) =>
+              fs.writeFileSync(path.join(workspaceDir, "smoke-reference.txt"), "smoke-token-47\n", {
+                encoding: "utf8",
+                flag: "wx",
+              }),
+            onCapturedRequest: (request) => bodies.push(structuredClone(request.body)),
+          });
+          return { bodies, surface, smokePrompt: smokeCell.prompt };
+        },
+      }),
+  );
+});
+
 describeV1JActionSmoke("v1J isolated live operational smoke", () => {
   it(
     "captures four smoke-only cells without touching formal v1J state",
@@ -1892,11 +1958,18 @@ async function captureV1JPreflightSurface(
   arm: "A" | "C",
   head: string,
   preflightDiagnostics?: V1JPreflightDiagnosticJournal,
+  options?: {
+    benchmarkCase?: ToolRankingBenchmarkCase;
+    prepareWorkspace?: (workspaceDir: string) => void;
+    onCapturedRequest?: (request: CapturedModelRequest) => void;
+  },
 ): Promise<ReturnType<typeof fingerprintV1JToolSurface>> {
-  const benchmarkCase = requireV1JBenchmarkCase(
-    protocol,
-    protocol.design.cells.find((entry) => entry.stratum === "TOOL_REQUIRED")?.caseId ?? "",
-  );
+  const benchmarkCase =
+    options?.benchmarkCase ??
+    requireV1JBenchmarkCase(
+      protocol,
+      protocol.design.cells.find((entry) => entry.stratum === "TOOL_REQUIRED")?.caseId ?? "",
+    );
   const workspaceDir = fs.mkdtempSync(path.join(os.tmpdir(), `v1j-preflight-${arm}-`));
   const preflightStopController = new AbortController();
   const authorizedTools: V1JAuthorizedToolSchema[] = [];
@@ -1907,6 +1980,7 @@ async function captureV1JPreflightSurface(
   let delegatedRequests = 0;
   let runtimeReadyRecorded = false;
   try {
+    options?.prepareWorkspace?.(workspaceDir);
     observation = await runOne({
       mode: "real-exact",
       surfaceMode: "REAL_EXACT_ONLY",
@@ -1935,6 +2009,7 @@ async function captureV1JPreflightSurface(
           authorizedTools.splice(0, authorizedTools.length, ...tools),
         onRequestCaptured: (request) => {
           requests.push(request);
+          options?.onCapturedRequest?.(request);
           const surface = fingerprintV1JToolSurface({
             authorizedTools,
             providerTools: Array.isArray(request.body.tools) ? request.body.tools : [],

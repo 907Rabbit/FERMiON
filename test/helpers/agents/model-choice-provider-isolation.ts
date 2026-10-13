@@ -24,7 +24,12 @@ export const V1J_PROVIDER_CONTROL_SCHEMA_BASELINE = {
   providerToolSchemaSha256: "e87b23c436597f65b0a76c5f91a49b53440178731718efdbc70a7a048cbf39b2",
 } as const;
 
-export type V1JProviderControlMode = "stream-false" | "stream-true";
+export type V1JProviderControlMode = "stream-false" | "stream-true" | "A" | "B" | "C";
+
+export type V1JProviderControlRequest = {
+  mode: V1JProviderControlMode;
+  requestObject: Record<string, unknown>;
+};
 
 export type V1JProviderControlMetrics = {
   model: string;
@@ -33,8 +38,8 @@ export type V1JProviderControlMetrics = {
   requestJsonBytes: number;
   messageCount: number;
   totalMessageContentBytes: number;
-  toolCount: 0;
-  toolSchemaJsonBytes: 0;
+  toolCount: number;
+  toolSchemaJsonBytes: number;
 };
 
 export type V1JProviderControlResult = V1JProviderControlMetrics & {
@@ -206,6 +211,7 @@ export async function runV1JProviderTransportControls(input: {
   model: string;
   authorization: string;
   fetchImpl: V1JProviderControlFetch;
+  requests?: readonly V1JProviderControlRequest[];
   timeoutMs?: number;
   heartbeatMs?: number;
   now?: () => number;
@@ -214,14 +220,19 @@ export async function runV1JProviderTransportControls(input: {
   record: (event: V1JProviderControlEvent) => void;
 }): Promise<V1JProviderControlResult[]> {
   const results: V1JProviderControlResult[] = [];
-  for (const stream of [false, true]) {
-    const mode: V1JProviderControlMode = stream ? "stream-true" : "stream-false";
-    const requestObject = {
-      model: input.model,
-      messages: [{ role: "user", content: V1J_PROVIDER_CONTROL_PROMPT }],
-      max_tokens: V1J_PROVIDER_CONTROL_MAX_TOKENS,
-      stream,
-    };
+  const requests =
+    input.requests ??
+    ([false, true] as const).map((stream) => ({
+      mode: stream ? ("stream-true" as const) : ("stream-false" as const),
+      requestObject: {
+        model: input.model,
+        messages: [{ role: "user", content: V1J_PROVIDER_CONTROL_PROMPT }],
+        max_tokens: V1J_PROVIDER_CONTROL_MAX_TOKENS,
+        stream,
+      },
+    }));
+  for (const { mode, requestObject } of requests) {
+    const stream = requestObject.stream === true;
     const requestBody = JSON.stringify(requestObject);
     const startedAtMs = (input.now ?? Date.now)();
     const startedAt = (input.wallNow ?? (() => new Date().toISOString()))();
@@ -229,15 +240,30 @@ export async function runV1JProviderTransportControls(input: {
     const timeoutMs = input.timeoutMs ?? V1J_PROVIDER_CONTROL_TIMEOUT_MS;
     const heartbeatMs = input.heartbeatMs ?? V1J_PROVIDER_CONTROL_HEARTBEAT_MS;
     const result: V1JProviderControlResult = {
-      model: input.model,
-      maxTokens: requestObject.max_tokens,
+      model: typeof requestObject.model === "string" ? requestObject.model : input.model,
+      maxTokens:
+        typeof requestObject.max_tokens === "number"
+          ? requestObject.max_tokens
+          : V1J_PROVIDER_CONTROL_MAX_TOKENS,
       stream,
       mode,
       requestJsonBytes: Buffer.byteLength(requestBody, "utf8"),
-      messageCount: requestObject.messages.length,
-      totalMessageContentBytes: Buffer.byteLength(requestObject.messages[0]!.content, "utf8"),
-      toolCount: 0,
-      toolSchemaJsonBytes: 0,
+      messageCount: Array.isArray(requestObject.messages) ? requestObject.messages.length : 0,
+      totalMessageContentBytes: Array.isArray(requestObject.messages)
+        ? requestObject.messages.reduce((total, message) => {
+            if (!message || typeof message !== "object" || !("content" in message)) {
+              return total;
+            }
+            const content = (message as { content?: unknown }).content;
+            const serialized =
+              typeof content === "string" ? content : JSON.stringify(content ?? null);
+            return total + Buffer.byteLength(serialized, "utf8");
+          }, 0)
+        : 0,
+      toolCount: Array.isArray(requestObject.tools) ? requestObject.tools.length : 0,
+      toolSchemaJsonBytes: Array.isArray(requestObject.tools)
+        ? Buffer.byteLength(JSON.stringify(requestObject.tools), "utf8")
+        : 0,
       startedAt,
       elapsedMs: 0,
       requestDispatchStarted: false,

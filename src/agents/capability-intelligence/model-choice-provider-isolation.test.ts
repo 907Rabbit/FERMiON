@@ -15,6 +15,18 @@ import {
   V1J_PROVIDER_CONTROL_RUN_FLAG,
   V1J_PROVIDER_CONTROL_SCHEMA_BASELINE,
 } from "../../../test/helpers/agents/model-choice-provider-isolation.js";
+import {
+  assertV1JPayloadDecompositionPreflight,
+  buildV1JPayloadDecompositionRequests,
+  createV1JPayloadDecompositionJournal,
+  runV1JPayloadDecompositionControls,
+  V1J_PAYLOAD_DECOMPOSITION_AUTHORIZED_FLAG,
+  V1J_PAYLOAD_DECOMPOSITION_COMMIT_FLAG,
+  V1J_PAYLOAD_DECOMPOSITION_MINIMAL_PROMPT,
+  V1J_PAYLOAD_DECOMPOSITION_PREFIX,
+  V1J_PAYLOAD_DECOMPOSITION_PROTOCOL_SHA256,
+  V1J_PAYLOAD_DECOMPOSITION_RUN_FLAG,
+} from "../../../test/helpers/agents/model-choice-provider-payload-decomposition.js";
 
 const head = "a".repeat(40);
 const preflightInput = () => ({
@@ -262,5 +274,193 @@ describe("v1J LM Studio provider transport controls", () => {
     expect(sha256V1JProviderControl("ok")).toBe(
       "2689367b205c16ce32ed4200942b8b8b1e262dfc70d9bc9fbc77c49699a4f1df",
     );
+  });
+});
+
+describe("v1J payload-decomposition transport diagnostic", () => {
+  it("constructs only the preregistered one-dimension A/B/C request variants", () => {
+    const tools = Array.from({ length: 15 }, (_, index) => ({
+      type: "function",
+      function: { name: `tool_${index}`, parameters: { type: "object", properties: {} } },
+    }));
+    const captured = {
+      model: "qwen/qwen3.5-9b",
+      messages: [
+        { role: "system", content: "frozen Arm A system context" },
+        { role: "user", content: "the full Arm-A smoke request prompt" },
+      ],
+      tools,
+      tool_choice: "auto",
+      parallel_tool_calls: true,
+      temperature: 0,
+    };
+    const requests = buildV1JPayloadDecompositionRequests({ capturedArmARequest: captured });
+    expect(requests.map((request) => request.control)).toEqual(["A", "B", "C"]);
+    expect(requests.every((request) => request.body.stream === true)).toBe(true);
+    expect(requests[0]!.body.messages).toEqual([
+      { role: "user", content: V1J_PAYLOAD_DECOMPOSITION_MINIMAL_PROMPT },
+    ]);
+    expect(requests[0]!.body.tools).toEqual(tools);
+    expect(requests[1]!.body.messages).toEqual(captured.messages);
+    expect(requests[1]!.body).not.toHaveProperty("tools");
+    expect(requests[1]!.body).not.toHaveProperty("tool_choice");
+    expect(requests[1]!.body).not.toHaveProperty("parallel_tool_calls");
+    expect(requests[2]!.body.messages).toEqual(captured.messages);
+    expect(requests[2]!.body.tools).toEqual(tools);
+    expect(requests[2]!.body.tool_choice).toBe("auto");
+    expect(captured.stream).toBeUndefined();
+    expect(captured.messages[1]!.content).toBe("the full Arm-A smoke request prompt");
+  });
+
+  it("rejects a captured request that cannot prove the frozen 15-tool surface", () => {
+    expect(() =>
+      buildV1JPayloadDecompositionRequests({
+        capturedArmARequest: { model: "model", messages: [], tools: [] },
+      }),
+    ).toThrow(/captured 15-tool Arm A request/);
+  });
+
+  it("requires exact commit-bound authorization and frozen runtime identity", () => {
+    const input = {
+      env: {
+        [V1J_PAYLOAD_DECOMPOSITION_RUN_FLAG]: "1",
+        [V1J_PAYLOAD_DECOMPOSITION_AUTHORIZED_FLAG]: "1",
+        [V1J_PAYLOAD_DECOMPOSITION_COMMIT_FLAG]: head,
+      },
+      head,
+      trackedTreeClean: true,
+      activeFilteringEnabled: false,
+      modelId: "qwen/qwen3.5-9b",
+      modelConfigHash: "2a219399da63b03057ceaf46a9dd1d74e76be20ead626f07af2b8ba45f37c529",
+      protocolHash: V1J_PAYLOAD_DECOMPOSITION_PROTOCOL_SHA256,
+      detachedProtocolHash: `${V1J_PAYLOAD_DECOMPOSITION_PROTOCOL_SHA256} preregistration-v2.json`,
+      provenanceAccepted: true,
+      artifactExists: false,
+    };
+    expect(() => assertV1JPayloadDecompositionPreflight(input)).not.toThrow();
+    expect(() =>
+      assertV1JPayloadDecompositionPreflight({
+        ...input,
+        env: { ...input.env, OPENCLAW_V1J_LIVE_SMOKE: "1" },
+      }),
+    ).toThrow(/cannot share live modes/);
+    expect(() =>
+      assertV1JPayloadDecompositionPreflight({
+        ...input,
+        env: { ...input.env, [V1J_PAYLOAD_DECOMPOSITION_COMMIT_FLAG]: "b".repeat(40) },
+      }),
+    ).toThrow(/exact commit-bound/);
+    expect(() =>
+      assertV1JPayloadDecompositionPreflight({ ...input, activeFilteringEnabled: true }),
+    ).toThrow(/filtering/);
+  });
+
+  it("records transport metrics without persisting prompts, response bytes, or credentials", async () => {
+    const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), "v1j-payload-decomposition-"));
+    const headCommit = "c".repeat(40);
+    const tools = Array.from({ length: 15 }, (_, index) => ({
+      type: "function",
+      function: { name: `tool_${index}`, parameters: { type: "object", properties: {} } },
+    }));
+    const requests = buildV1JPayloadDecompositionRequests({
+      capturedArmARequest: {
+        model: "qwen/qwen3.5-9b",
+        messages: [
+          { role: "system", content: "secret full system prompt" },
+          { role: "user", content: "secret full Arm-A user prompt" },
+        ],
+        tools,
+      },
+    });
+    const journal = createV1JPayloadDecompositionJournal({
+      repoRoot,
+      harnessCommit: headCommit,
+      modelId: "qwen/qwen3.5-9b",
+      modelConfigHash: "d".repeat(64),
+      provider: "lmstudio",
+      contextLength: 262_144,
+      schemaFingerprint: { providerToolCount: 15 },
+      startedAt: "2026-10-13T00:00:00.000Z",
+    });
+    const sentBodies: Record<string, unknown>[] = [];
+    try {
+      const results = await runV1JPayloadDecompositionControls({
+        endpoint: "http://127.0.0.1:1234/v1/chat/completions",
+        authorization: "Bearer do-not-persist-this-token",
+        requests,
+        fetchImpl: async (_url, init) => {
+          sentBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+          return new Response("sensitive model response", {
+            status: 200,
+            headers: { "content-type": "text/event-stream" },
+          });
+        },
+        record: journal.record,
+        timeoutMs: 5_000,
+        heartbeatMs: 60_000,
+      });
+      expect(results).toHaveLength(3);
+      expect(results.map((result) => result.control)).toEqual(["A", "B", "C"]);
+      expect(results.map((result) => result.toolCount)).toEqual([15, 0, 15]);
+      expect(results.every((result) => result.requestDispatchStarted && result.bodyCompleted)).toBe(
+        true,
+      );
+      expect(sentBodies).toHaveLength(3);
+      expect(sentBodies.map((body) => body.stream)).toEqual([true, true, true]);
+      expect(sentBodies[0]!.tools).toEqual(tools);
+      expect(sentBodies[1]!.tools).toBeUndefined();
+      expect(sentBodies[2]!.tools).toEqual(tools);
+      expect(sentBodies[1]!.messages).toEqual(sentBodies[2]!.messages);
+      journal.close();
+      const artifactText = [
+        fs.readFileSync(path.join(journal.artifactRoot, "manifest.json"), "utf8"),
+        fs.readFileSync(path.join(journal.artifactRoot, "transport-events.jsonl"), "utf8"),
+      ].join("\n");
+      expect(artifactText).not.toContain("secret full system prompt");
+      expect(artifactText).not.toContain("secret full Arm-A user prompt");
+      expect(artifactText).not.toContain("sensitive model response");
+      expect(artifactText).not.toContain("do-not-persist-this-token");
+      expect(journal.artifactRoot).toContain(`${V1J_PAYLOAD_DECOMPOSITION_PREFIX}${headCommit}`);
+    } finally {
+      journal.close();
+      fs.rmSync(repoRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses to create diagnostics over existing formal or same-commit smoke state", () => {
+    const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), "v1j-payload-path-guard-"));
+    const headCommit = "e".repeat(40);
+    const parent = path.join(repoRoot, "artifacts/capability-intelligence/v1j-action-initiation");
+    fs.mkdirSync(path.join(parent, "real-exact-run1"), { recursive: true });
+    try {
+      expect(() =>
+        createV1JPayloadDecompositionJournal({
+          repoRoot,
+          harnessCommit: headCommit,
+          modelId: "qwen/qwen3.5-9b",
+          modelConfigHash: "f".repeat(64),
+          provider: "lmstudio",
+          contextLength: 262_144,
+          schemaFingerprint: {},
+          startedAt: "2026-10-13T00:00:00.000Z",
+        }),
+      ).toThrow(/existing formal or smoke state/);
+      fs.rmSync(path.join(parent, "real-exact-run1"), { recursive: true, force: true });
+      fs.mkdirSync(path.join(parent, `smoke-${headCommit}`));
+      expect(() =>
+        createV1JPayloadDecompositionJournal({
+          repoRoot,
+          harnessCommit: headCommit,
+          modelId: "qwen/qwen3.5-9b",
+          modelConfigHash: "f".repeat(64),
+          provider: "lmstudio",
+          contextLength: 262_144,
+          schemaFingerprint: {},
+          startedAt: "2026-10-13T00:00:00.000Z",
+        }),
+      ).toThrow(/existing formal or smoke state/);
+    } finally {
+      fs.rmSync(repoRoot, { recursive: true, force: true });
+    }
   });
 });

@@ -116,13 +116,21 @@ export function createV1JArmCOnlyPreflightDiagnosticJournal(input: {
   if (!/^[0-9a-f]{40}$/i.test(input.harnessCommit)) {
     throw new Error("v1J Arm C diagnostics require the actual full harness SHA");
   }
-  const root = path.resolve(
-    input.repoRoot,
-    V1J_SMOKE_ARTIFACT_PARENT,
+  const repoRoot = fs.realpathSync(input.repoRoot);
+  const artifactParent = path.resolve(repoRoot, V1J_SMOKE_ARTIFACT_PARENT);
+  fs.mkdirSync(artifactParent, { recursive: true });
+  const realArtifactParent = fs.realpathSync(artifactParent);
+  if (realArtifactParent !== artifactParent) {
+    throw new Error("v1J Arm C diagnostics refuse an aliased artifact parent");
+  }
+  const root = path.join(
+    realArtifactParent,
     `${V1J_ARM_C_PREFLIGHT_ARTIFACT_PREFIX}${input.harnessCommit}`,
   );
-  const formalRoot = path.resolve(input.repoRoot, V1J_FORMAL_ARTIFACT_RELATIVE_PATH);
-  const smokeRoot = resolveV1JSmokeRoot(input.repoRoot, input.harnessCommit);
+  const formalRoot = resolveV1JPhysicalPath(
+    path.resolve(repoRoot, V1J_FORMAL_ARTIFACT_RELATIVE_PATH),
+  );
+  const smokeRoot = resolveV1JPhysicalPath(resolveV1JSmokeRoot(repoRoot, input.harnessCommit));
   if (pathsOverlap(root, formalRoot) || pathsOverlap(root, smokeRoot)) {
     throw new Error("v1J Arm C diagnostics path overlaps formal or smoke artifacts");
   }
@@ -131,6 +139,9 @@ export function createV1JArmCOnlyPreflightDiagnosticJournal(input: {
   assertV1JDiagnosticFilePath(input.repoRoot, root, filePath);
   fs.mkdirSync(parent, { recursive: true });
   fs.mkdirSync(root, { recursive: false });
+  if (fs.realpathSync(root) !== root) {
+    throw new Error("v1J Arm C diagnostics refuse an aliased diagnostic root");
+  }
   return createV1JPreflightDiagnosticJournalAtPath({ ...input, arm: "C" }, root, filePath, {
     rootAlreadyCreated: true,
     checkFormalStateEmpty: false,
@@ -141,6 +152,20 @@ export function createV1JArmCOnlyPreflightDiagnosticJournal(input: {
       normalSmokeArtifactTouched: false,
     },
   });
+}
+
+function resolveV1JPhysicalPath(targetPath: string): string {
+  let existing = path.resolve(targetPath);
+  const suffix: string[] = [];
+  while (!fs.existsSync(existing)) {
+    const parent = path.dirname(existing);
+    if (parent === existing) {
+      throw new Error("v1J diagnostics path has no existing filesystem ancestor");
+    }
+    suffix.unshift(path.basename(existing));
+    existing = parent;
+  }
+  return path.resolve(fs.realpathSync(existing), ...suffix);
 }
 
 function assertV1JDiagnosticFilePath(repoRoot: string, root: string, filePath: string): void {

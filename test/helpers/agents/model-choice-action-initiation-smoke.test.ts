@@ -10,6 +10,38 @@ import {
 } from "./model-choice-action-initiation-smoke.js";
 
 describe("v1J Arm C preflight-only diagnostic", () => {
+  it("rejects an aliased artifact parent before creating diagnostic files", () => {
+    const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), "v1j-arm-c-alias-test-"));
+    const artifactParent = path.join(
+      repoRoot,
+      "artifacts",
+      "capability-intelligence",
+      "v1j-action-initiation",
+    );
+    const redirectedParent = path.join(repoRoot, "redirect-target");
+    fs.mkdirSync(path.dirname(artifactParent), { recursive: true });
+    fs.mkdirSync(redirectedParent);
+    fs.symlinkSync(
+      redirectedParent,
+      artifactParent,
+      process.platform === "win32" ? "junction" : "dir",
+    );
+    try {
+      expect(() =>
+        createV1JArmCOnlyPreflightDiagnosticJournal({
+          repoRoot,
+          harnessCommit: "8".repeat(40),
+          caseId: "offline-arm-c-case",
+          preflightId: "offline-arm-c-alias",
+          pid: process.pid,
+        }),
+      ).toThrow();
+      expect(fs.readdirSync(redirectedParent)).toEqual([]);
+    } finally {
+      fs.rmSync(repoRoot, { recursive: true, force: true });
+    }
+  });
+
   it("terminates after successful Arm C preflight without touching formal or smoke artifacts", async () => {
     const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), "v1j-arm-c-only-path-test-"));
     const head = "9".repeat(40);

@@ -7,6 +7,24 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { configureAiTransportHost, getAiTransportHost } from "@openclaw/ai";
 import { describe, expect, it, vi } from "vitest";
+import {
+  assertV1JRuntimeGate,
+  buildV1JSchedule,
+  canonicalV1JToolNames,
+  createV1JManifest,
+  fingerprintV1JToolSurface,
+  openV1JArtifactState,
+  readV1JPreregistration,
+  runV1JCellBatch,
+  summarizeV1JObservations,
+  v1jInstructionForArm,
+  sha256 as sha256V1J,
+  writeV1JSummary,
+  V1JSerializationFailureError,
+  type V1JCell,
+  type V1JObservation,
+  type V1JProtocol,
+} from "../../../test/helpers/agents/model-choice-action-initiation.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { AssistantMessage } from "../../llm/types.js";
 import { applyTestPluginDefaults } from "../../plugins/config-state.js";
@@ -89,6 +107,8 @@ import {
 
 const LIVE = process.env.OPENCLAW_V1I_LIVE_TEST === "1";
 const V1J_SCHEMA_CAPTURE_MODE = process.env.OPENCLAW_V1J_SCHEMA_CAPTURE;
+const V1J_ACTION_LIVE_TEST = process.env.OPENCLAW_V1J_LIVE_TEST === "1";
+const V1J_ACTION_LIVE_AUTHORIZED = process.env.OPENCLAW_V1J_LIVE_EXECUTION_AUTHORIZED === "1";
 import {
   ARM_B_INSTRUCTION,
   CONTEXT_LENGTH,
@@ -736,6 +756,9 @@ function persistV1JSchemaCapture(input: {
       operation?: string;
       targetPath?: string;
       validationAudit?: V1JSchemaValidationAudit;
+      errorName?: string;
+      errorCode?: string | number;
+      errorMessage?: string;
     } = {},
   ) => input.recordCheckpoint?.(name, { ...invocationMetadata, ...metadata });
   const runOperation = <T>(
@@ -1170,13 +1193,498 @@ class V1ISmokeEvidenceError extends Error {
 const SMOKE_TEST = LIVE && process.env.OPENCLAW_V1I_SMOKE_TEST === "1";
 const DIAGNOSTIC_TEST = LIVE && process.env.OPENCLAW_V1I_DIAGNOSTIC_TEST === "1";
 const describeV1JSchemaCapture = V1J_SCHEMA_CAPTURE_MODE === undefined ? describe.skip : describe;
+const describeV1JActionLive =
+  V1J_ACTION_LIVE_TEST && V1J_ACTION_LIVE_AUTHORIZED && V1J_SCHEMA_CAPTURE_MODE === undefined
+    ? describe
+    : describe.skip;
 const describeFullLive =
-  LIVE && !SMOKE_TEST && !DIAGNOSTIC_TEST && V1J_SCHEMA_CAPTURE_MODE === undefined
+  LIVE &&
+  !SMOKE_TEST &&
+  !DIAGNOSTIC_TEST &&
+  V1J_SCHEMA_CAPTURE_MODE === undefined &&
+  !V1J_ACTION_LIVE_TEST
     ? describe
     : describe.skip;
 const describeSmokeLive = SMOKE_TEST ? describe : describe.skip;
 const describeDiagnosticLive = DIAGNOSTIC_TEST ? describe : describe.skip;
 const LIVE_MODE = resolveV1IMode(LIVE, process.env.OPENCLAW_V1I_MODE);
+
+describeV1JActionLive("v1J action-initiation experiment live", () => {
+  it(
+    "runs only the preregistered A/C cells after no-dispatch schema preflight",
+    { timeout: 3_600_000 },
+    async () => {
+      const protocol = readV1JPreregistration();
+      const head = assertV1JCommittedHarness(protocol);
+      expect(ACTIVE_FILTERING_ENABLED).toBe(false);
+      await assertLiveModelAvailable();
+      const schedule = buildV1JSchedule(protocol);
+      const surfaceA = await captureV1JPreflightSurface(protocol, "A", head);
+      const surfaceC = await captureV1JPreflightSurface(protocol, "C", head);
+      expect(surfaceA).toEqual(surfaceC);
+
+      const root = path.resolve(
+        "artifacts/capability-intelligence/v1j-action-initiation/real-exact-run1",
+      );
+      const manifest = createV1JManifest({
+        protocol,
+        harnessCommit: head,
+        modelConfigHash: hashV1ICanonical(modelConfigIdentity()),
+        startedAt: new Date().toISOString(),
+      });
+      const allowlist = process.env.OPENCLAW_V1J_CELL_ALLOWLIST?.split(",").filter(Boolean);
+      const maxCells = parseV1JMaxCells(process.env.OPENCLAW_V1J_MAX_CELLS);
+      let batch: Awaited<ReturnType<typeof runV1JCellBatch>>;
+      try {
+        batch = await runV1JCellBatch({
+          root,
+          manifest,
+          protocol,
+          schedule,
+          ...(allowlist ? { allowlist } : {}),
+          ...(maxCells === undefined ? {} : { maxCells }),
+          executeCell: (cell, attempt) => executeV1JCell({ protocol, cell, attempt, head }),
+        });
+      } catch (error) {
+        if (error instanceof V1JSerializationFailureError) {
+          const state = openV1JArtifactState(root, manifest);
+          writeV1JSummary(
+            root,
+            summarizeV1JObservations({
+              protocol,
+              schedule,
+              observations: state.observations,
+              invalidAttempts: state.invalidAttempts,
+              expectedHarnessCommit: head,
+              resultSerializationFailures: 1,
+            }),
+          );
+        }
+        throw error;
+      }
+      const state = openV1JArtifactState(root, manifest);
+      const summary = summarizeV1JObservations({
+        protocol,
+        schedule,
+        observations: state.observations,
+        invalidAttempts: state.invalidAttempts,
+        expectedHarnessCommit: head,
+      });
+      writeV1JSummary(root, summary);
+      if (batch.integrityStop) {
+        throw new Error(`v1J hard stop: ${batch.integrityStop}`);
+      }
+    },
+  );
+});
+
+function assertV1JCommittedHarness(protocol: V1JProtocol): string {
+  if (process.env.OPENCLAW_V1I_HARNESS_COMMIT) {
+    throw new Error("v1J refuses an explicit harness-commit override");
+  }
+  const head = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+  const sourceStatus = execFileSync(
+    "git",
+    ["status", "--porcelain=v1", "--untracked-files=all", "--", "src"],
+    { encoding: "utf8" },
+  ).trim();
+  if (!/^[0-9a-f]{40}$/i.test(head) || sourceStatus || HARNESS_COMMIT !== head) {
+    throw new Error("v1J requires a clean, committed harness at the actual HEAD");
+  }
+  execFileSync("git", ["merge-base", "--is-ancestor", protocol.base.head, head], {
+    stdio: "ignore",
+  });
+  return head;
+}
+
+async function captureV1JPreflightSurface(
+  protocol: V1JProtocol,
+  arm: "A" | "C",
+  head: string,
+): Promise<ReturnType<typeof fingerprintV1JToolSurface>> {
+  const benchmarkCase = requireV1JBenchmarkCase(
+    protocol,
+    protocol.design.cells.find((entry) => entry.stratum === "TOOL_REQUIRED")?.caseId ?? "",
+  );
+  const workspaceDir = fs.mkdtempSync(path.join(os.tmpdir(), `v1j-preflight-${arm}-`));
+  const authorizedTools: V1JAuthorizedToolSchema[] = [];
+  const requests: CapturedModelRequest[] = [];
+  let dispatchAttempts = 0;
+  let delegatedRequests = 0;
+  try {
+    await runOne({
+      mode: "real-exact",
+      surfaceMode: "REAL_EXACT_ONLY",
+      benchmarkCase,
+      mappingClass: "EXACT",
+      authorizedNames: protocol.schemaBaseline.expectedRuntimeNames,
+      v1cTop8: rankTop8(benchmarkCase.tools, benchmarkCase.query),
+      requiredMappedTools: [],
+      preferredToolOverride: null,
+      arm: "A",
+      replicate: 1,
+      attempt: 1,
+      scheduleSeed: protocol.schedule.seed,
+      config: buildLiveConfig(workspaceDir),
+      workspaceDir,
+      provider: protocol.model.provider,
+      model: protocol.model.id,
+      runIdOverride: `v1j-preflight-${arm}-${head.slice(0, 8)}-${process.pid}`,
+      requestCapture: {
+        stopAfterCapture: true,
+        capturePromptInstruction: v1jInstructionForArm(protocol, arm),
+        onAuthorizedToolsCaptured: (tools) =>
+          authorizedTools.splice(0, authorizedTools.length, ...tools),
+        onRequestCaptured: (request) => requests.push(request),
+        onProviderDispatchAttempt: (count) => {
+          dispatchAttempts = count;
+        },
+        onDelegatedRequest: () => {
+          delegatedRequests += 1;
+        },
+      },
+    });
+  } finally {
+    try {
+      fs.rmSync(workspaceDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+    } catch {
+      // Prepared agent stores may remain open until this test process exits on Windows.
+    }
+  }
+  if (requests.length !== 1 || dispatchAttempts !== 0 || delegatedRequests !== 0) {
+    throw new Error("v1J schema preflight did not stop before provider dispatch");
+  }
+  const actionInstruction = v1jInstructionForArm(protocol, "C");
+  const systemText = v1jSystemMessageText(requests[0]!.body);
+  if (
+    (arm === "C" && !systemText.includes(actionInstruction)) ||
+    (arm === "A" && systemText.includes(actionInstruction))
+  ) {
+    throw new Error("v1J preflight observed an Arm A/C prompt-isolation failure");
+  }
+  const actual = fingerprintV1JToolSurface({
+    authorizedTools,
+    providerTools: Array.isArray(requests[0]?.body.tools) ? requests[0].body.tools : [],
+  });
+  const expectedNames = [...protocol.schemaBaseline.expectedRuntimeNames].toSorted();
+  if (
+    canonicalV1JToolNames(authorizedTools).join("\n") !== expectedNames.join("\n") ||
+    canonicalV1JToolNames(
+      Array.isArray(requests[0]?.body.tools) ? requests[0].body.tools : [],
+    ).join("\n") !== expectedNames.join("\n")
+  ) {
+    throw new Error("v1J preflight runtime tool names differ from the frozen exact set");
+  }
+  assertV1JRuntimeGate(protocol, {
+    modelId: protocol.model.id,
+    provider: protocol.model.provider,
+    contextLength: protocol.model.contextLength,
+    modelConfigHash: hashV1ICanonical(modelConfigIdentity()),
+    rankerVersion: SHADOW_RANKER_VERSION,
+    topK: 8,
+    activeFilteringEnabled: ACTIVE_FILTERING_ENABLED,
+    surface: actual,
+  });
+  return actual;
+}
+
+function requireV1JBenchmarkCase(protocol: V1JProtocol, caseId: string): ToolRankingBenchmarkCase {
+  const specification = protocol.design.cells.find((entry) => entry.caseId === caseId);
+  if (!specification) {
+    throw new Error(`v1J preregistration is missing case ${caseId}`);
+  }
+  const benchmark = TOOL_RANKING_HELD_OUT_CASES.find((entry) => entry.id === caseId);
+  if (!benchmark || benchmark.query !== specification.prompt) {
+    throw new Error(`v1J required case no longer matches frozen benchmark: ${caseId}`);
+  }
+  const mapped = benchmark.expectedTopTools.map(
+    (name) => getBenchmarkRealToolMapping(name).realTool,
+  );
+  if (
+    specification.stratum !== "TOOL_REQUIRED" ||
+    mapped.length !== specification.requiredTools.length ||
+    mapped.some((name, index) => name !== specification.requiredTools[index]) ||
+    specification.preferredTool !== mapped[0]
+  ) {
+    throw new Error(`v1J case mapping differs from frozen REAL_EXACT mapping: ${caseId}`);
+  }
+  return benchmark;
+}
+
+function parseV1JMaxCells(value: string | undefined): number | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (!/^\d+$/.test(value) || Number(value) < 1 || !Number.isSafeInteger(Number(value))) {
+    throw new Error("OPENCLAW_V1J_MAX_CELLS must be a positive integer");
+  }
+  return Number(value);
+}
+
+async function executeV1JCell(input: {
+  protocol: V1JProtocol;
+  cell: V1JCell;
+  attempt: number;
+  head: string;
+}): Promise<V1JObservation> {
+  const { protocol, cell, attempt, head } = input;
+  const benchmark =
+    cell.stratum === "TOOL_REQUIRED"
+      ? requireV1JBenchmarkCase(protocol, cell.caseId)
+      : {
+          id: cell.caseId,
+          category: "mixed" as const,
+          split: "held-out" as const,
+          query: cell.prompt,
+          tools: [],
+          expectedTopTools: [],
+          topK: 8,
+        };
+  const workspaceDir = fs.mkdtempSync(path.join(os.tmpdir(), "v1j-cell-"));
+  const authorizedTools: V1JAuthorizedToolSchema[] = [];
+  const providerRequests: CapturedModelRequest[] = [];
+  const responseSummaries: ProviderResponseSummary[] = [];
+  let dispatchAttempts = 0;
+  let delegatedRequests = 0;
+  let gateFailure: Error | undefined;
+  let run: ExperimentRun | undefined;
+  try {
+    run = await runOne({
+      mode: "real-exact",
+      surfaceMode: "REAL_EXACT_ONLY",
+      benchmarkCase: { ...benchmark, query: cell.prompt },
+      mappingClass: "EXACT",
+      authorizedNames: protocol.schemaBaseline.expectedRuntimeNames,
+      v1cTop8: rankTop8(benchmark.tools, cell.prompt),
+      requiredMappedTools: [...cell.requiredTools],
+      preferredToolOverride: cell.preferredTool,
+      arm: "A",
+      replicate: cell.replicate,
+      attempt,
+      scheduleSeed: protocol.schedule.seed,
+      config: buildLiveConfig(workspaceDir),
+      workspaceDir,
+      provider: protocol.model.provider,
+      model: protocol.model.id,
+      runIdOverride: `v1j-${head.slice(0, 8)}-${cell.cellId}-attempt-${attempt}`,
+      requestCapture: {
+        capturePromptInstruction: v1jInstructionForArm(protocol, cell.arm),
+        onAuthorizedToolsCaptured: (tools) =>
+          authorizedTools.splice(0, authorizedTools.length, ...tools),
+        onRequestCaptured: (request) => {
+          providerRequests.push(request);
+          try {
+            const surface = fingerprintV1JToolSurface({
+              authorizedTools,
+              providerTools: Array.isArray(request.body.tools) ? request.body.tools : [],
+            });
+            assertV1JRuntimeGate(protocol, {
+              modelId: protocol.model.id,
+              provider: protocol.model.provider,
+              contextLength: protocol.model.contextLength,
+              modelConfigHash: hashV1ICanonical(modelConfigIdentity()),
+              rankerVersion: SHADOW_RANKER_VERSION,
+              topK: 8,
+              activeFilteringEnabled: ACTIVE_FILTERING_ENABLED,
+              surface,
+            });
+            const expectedNames = [...protocol.schemaBaseline.expectedRuntimeNames].toSorted();
+            if (canonicalV1JToolNames(authorizedTools).join("\n") !== expectedNames.join("\n")) {
+              throw new Error("v1J AUTHORIZED_SURFACE_DRIFT: frozen tool name set drift");
+            }
+            if (
+              canonicalV1JToolNames(
+                Array.isArray(request.body.tools) ? request.body.tools : [],
+              ).join("\n") !== expectedNames.join("\n")
+            ) {
+              throw new Error("v1J PROVIDER_SURFACE_DRIFT: frozen tool name set drift");
+            }
+            const systemText = v1jSystemMessageText(request.body);
+            const actionInstruction = v1jInstructionForArm(protocol, "C");
+            if (
+              (cell.arm === "C" && !systemText.includes(actionInstruction)) ||
+              (cell.arm === "A" && systemText.includes(actionInstruction))
+            ) {
+              throw new Error("v1J CROSS_ARM_LEAK: provider-bound system instruction mismatch");
+            }
+          } catch (error) {
+            gateFailure = error instanceof Error ? error : new Error("schema gate failed");
+            throw gateFailure;
+          }
+        },
+        onProviderDispatchAttempt: (count) => {
+          dispatchAttempts = count;
+        },
+        onDelegatedRequest: () => {
+          delegatedRequests += 1;
+        },
+        onResponseSummary: (summary) => responseSummaries.push(summary),
+      },
+    });
+  } catch (error) {
+    if (!gateFailure) {
+      gateFailure = error instanceof Error ? error : new Error("harness threw");
+    }
+  } finally {
+    try {
+      fs.rmSync(workspaceDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+    } catch {
+      // Agent-local SQLite handles may outlive terminal evidence on Windows.
+    }
+  }
+
+  const baseline = protocol.schemaBaseline;
+  const surface =
+    providerRequests.length > 0 && authorizedTools.length > 0
+      ? fingerprintV1JToolSurface({
+          authorizedTools,
+          providerTools: Array.isArray(providerRequests.at(-1)?.body.tools)
+            ? (providerRequests.at(-1)!.body.tools as unknown[])
+            : [],
+        })
+      : baseline;
+  const providerResponseObserved = responseSummaries.some(
+    (summary) => summary.parserOutcome !== "body-pending",
+  );
+  const reason = gateFailure
+    ? v1jHardStopReason(gateFailure)
+    : run?.executions?.some(
+          (execution) => !protocol.schemaBaseline.expectedRuntimeNames.includes(execution.toolName),
+        )
+      ? "AUTHORIZATION_DRIFT"
+      : run?.valid && dispatchAttempts > 0 && providerResponseObserved && delegatedRequests > 0
+        ? null
+        : (run?.invalidReason ??
+          (dispatchAttempts === 0 ? "REQUEST_PREPARATION_ERROR" : "INCOMPLETE_TERMINAL_EVIDENCE"));
+  const hardStop =
+    reason !== null &&
+    !["MODEL_ERROR", "HARNESS_ERROR", "REQUEST_PREPARATION_ERROR", "NOT_CAPTURED"].includes(reason);
+  const row: V1JObservation = {
+    cellId: cell.cellId,
+    caseId: cell.caseId,
+    stratum: cell.stratum,
+    arm: cell.arm,
+    replicate: cell.replicate,
+    attempt,
+    harnessCommit: head,
+    modelId: protocol.model.id,
+    provider: protocol.model.provider,
+    contextLength: protocol.model.contextLength,
+    modelConfigHash: hashV1ICanonical(modelConfigIdentity()),
+    rankerVersion: SHADOW_RANKER_VERSION,
+    topK: 8,
+    activeFilteringEnabled: ACTIVE_FILTERING_ENABLED,
+    modelRequestsSent: dispatchAttempts,
+    providerResponseObserved,
+    experimentalInstructionHash: sha256V1J(v1jInstructionForArm(protocol, cell.arm)),
+    authorizedToolNameSha256: surface.authorizedToolNameSha256,
+    authorizedToolNames: authorizedTools.length > 0 ? canonicalV1JToolNames(authorizedTools) : [],
+    providerToolNameSha256: surface.providerToolNameSha256,
+    authorizedToolSchemaSha256: surface.authorizedToolSchemaSha256,
+    providerToolSchemaSha256: surface.providerToolSchemaSha256,
+    v1cTop8: run?.v1cTop8 ?? [],
+    firstExecutedTool: run?.firstExecutedTool ?? null,
+    executedToolSequence: run?.executedToolSequence ?? [],
+    terminalSuccess: run?.terminalSuccess ?? false,
+    rankingEpoch: run?.rankingEpoch ?? null,
+    terminalEvidenceComplete: Boolean(
+      run?.valid && dispatchAttempts > 0 && providerResponseObserved && delegatedRequests > 0,
+    ),
+    correlationStatus: run?.correlationStatus ?? "UNPROVABLE",
+    toolCalls: run?.toolCalls ?? [],
+    executions: run?.executions ?? [],
+    substituteTool: run?.substituteTool ?? null,
+    fallbackAfterPreferredFailure: run?.fallbackAfterPreferredFailure ?? false,
+    semanticSubstitution: Boolean(run?.substituteTool),
+    valid: reason === null,
+    invalidReason: reason,
+    ...(reason === null
+      ? {}
+      : {
+          invalidClass: hardStop
+            ? ("INTEGRITY_FAILURE" as const)
+            : ("INFRASTRUCTURE_RETRY_ELIGIBLE" as const),
+        }),
+    ...(gateFailure ? { integrity: v1jIntegrityForReason(reason) } : {}),
+  };
+  return row;
+}
+
+function v1jHardStopReason(error: Error): string {
+  const message = error.message;
+  if (message.includes("CROSS_ARM_LEAK")) {
+    return "CROSS_ARM_LEAK";
+  }
+  if (message.includes("AUTHORIZED_SURFACE_DRIFT")) {
+    return "AUTHORIZED_SURFACE_DRIFT";
+  }
+  if (message.includes("PROVIDER_SURFACE_DRIFT")) {
+    return "PROVIDER_SURFACE_DRIFT";
+  }
+  if (message.includes("tool name set drift")) {
+    return "AUTHORIZED_SURFACE_DRIFT";
+  }
+  if (message.includes("model/runtime configuration")) {
+    return "CONFIG_DRIFT";
+  }
+  if (message.includes("authorizedTool")) {
+    return "AUTHORIZED_SURFACE_DRIFT";
+  }
+  if (message.includes("providerTool")) {
+    return "PROVIDER_SURFACE_DRIFT";
+  }
+  return "V1J_RUNTIME_GATE_FAILURE";
+}
+
+function v1jIntegrityForReason(
+  reason: string | null,
+): Partial<NonNullable<V1JObservation["integrity"]>> {
+  if (reason === "CROSS_ARM_LEAK") {
+    return { crossArmLeaks: 1 };
+  }
+  if (reason === "AUTHORIZATION_DRIFT") {
+    return { authorizedSurfaceDrift: 1, newEvidenceDefects: 1 };
+  }
+  if (reason === "CONFIG_DRIFT") {
+    return { configDrift: 1, modelHashDrift: 1 };
+  }
+  if (reason === "AUTHORIZED_SURFACE_DRIFT") {
+    return { authorizedSurfaceDrift: 1 };
+  }
+  if (reason === "PROVIDER_SURFACE_DRIFT") {
+    return { providerSurfaceDrift: 1 };
+  }
+  return { newEvidenceDefects: 1 };
+}
+
+function v1jSystemMessageText(body: Record<string, unknown>): string {
+  if (!Array.isArray(body.messages)) {
+    return "";
+  }
+  return body.messages
+    .filter(
+      (message): message is Record<string, unknown> =>
+        Boolean(message && typeof message === "object" && !Array.isArray(message)) &&
+        (message as Record<string, unknown>).role === "system",
+    )
+    .map((message) => {
+      const content = message.content;
+      if (typeof content === "string") {
+        return content;
+      }
+      if (!Array.isArray(content)) {
+        return "";
+      }
+      return content
+        .filter((part) => Boolean(part && typeof part === "object" && !Array.isArray(part)))
+        .map((part) => {
+          const text = (part as Record<string, unknown>).text;
+          return typeof text === "string" ? text : "";
+        })
+        .join("\n");
+    })
+    .join("\n");
+}
 
 describe("v1I diagnostic resource resolution", () => {
   it("resolves the production state schema independently of CWD and artifact location", async () => {
@@ -1680,7 +2188,9 @@ describe("v1I harness evidence repair", () => {
         const mapped = getBenchmarkRealToolMapping(tool).realTool;
         return mapped ? [mapped] : [];
       });
-      expect(requiredTools.every((tool) => new Set(REAL_RUNTIME_TOOL_NAMES).has(tool))).toBe(true);
+      expect(
+        requiredTools.every((tool) => new Set<string>(REAL_RUNTIME_TOOL_NAMES).has(tool)),
+      ).toBe(true);
       expect(entry.mappingClass).toBe("EXACT");
     }
   });
@@ -2549,7 +3059,7 @@ describeDiagnosticLive("v1I model-choice diagnostic", () => {
         terminalSuccess: observation?.terminalSuccess ?? null,
         invalidReason: observation?.invalidReason ?? (failure ? "HARNESS_ERROR" : null),
         rawRuntimeStatus:
-          observation?.requestPreparationDiagnostics.normalizedRuntimeStatus ?? null,
+          observation?.requestPreparationDiagnostics?.normalizedRuntimeStatus ?? null,
         originalErrorName: failure instanceof Error ? failure.name : null,
         originalErrorMessage: failure instanceof Error ? failure.message : null,
         artifactSerialization: "PASS",
@@ -2870,7 +3380,6 @@ async function runStratum(input: {
       mappingClass,
       authorizedNames,
       v1cTop8,
-      requiredMappedTools,
       arm: cell.arm,
       replicate: cell.replicate,
       attempt,
@@ -2881,6 +3390,7 @@ async function runStratum(input: {
       () =>
         runOne({
           ...attemptInput,
+          requiredMappedTools,
           eligibility,
           config: input.config,
           workspaceDir: input.workspaceDir,
@@ -2938,6 +3448,8 @@ async function runOne(input: {
   authorizedNames: readonly string[];
   v1cTop8: readonly string[];
   requiredMappedTools?: readonly string[];
+  preferredToolOverride?: string | null;
+  runIdOverride?: string;
   arm: Arm;
   replicate: number;
   attempt: number;
@@ -3390,7 +3902,9 @@ async function runOne(input: {
       }
       return result;
     };
-    const runId = `v1i-${input.surfaceMode.toLowerCase()}-${input.benchmarkCase.id}-${input.arm}-${input.replicate}`;
+    const runId =
+      input.runIdOverride ??
+      `v1i-${input.surfaceMode.toLowerCase()}-${input.benchmarkCase.id}-${input.arm}-${input.replicate}`;
     if (input.directRunner) {
       const { embeddedReplaySessionId, embeddedReplaySessionKey } =
         await import("./embedded-replay-runtime.js");
@@ -3482,9 +3996,15 @@ async function runOne(input: {
     executions: rawExecutionRecords,
   });
   const preferredBenchmarkTool = input.benchmarkCase.expectedTopTools[0] ?? "";
-  const preferredMapping = getBenchmarkRealToolMapping(preferredBenchmarkTool);
+  const preferredMapping = preferredBenchmarkTool
+    ? getBenchmarkRealToolMapping(preferredBenchmarkTool)
+    : undefined;
   const mappedRealTool =
-    input.mode === "synthetic" ? preferredBenchmarkTool : preferredMapping.realTool;
+    input.preferredToolOverride !== undefined
+      ? input.preferredToolOverride
+      : input.mode === "synthetic"
+        ? preferredBenchmarkTool || null
+        : (preferredMapping?.realTool ?? null);
   const actualV1cTop8 = observedRanking
     ? observedRanking.rankings.slice(0, 8).map((entry) => entry.name)
     : input.v1cTop8;
@@ -4609,7 +5129,6 @@ describeV1JSchemaCapture("v1J provider schema capture-only entrypoint", () => {
           model: MODEL_ID,
           abortSignal: abortController.signal,
           requestCapture: {
-            stopAfterCapture: true,
             headCommit,
             surfaceMode: "REAL_EXACT",
             benchmarkCandidateNames: benchmarkCase.tools.map((tool) => tool.name),

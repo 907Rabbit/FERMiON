@@ -12,10 +12,12 @@ import {
   assertV1JPreflightPairComplete,
   assertV1JSmokeProvenance,
   buildV1JSmokeSchedule,
+  createV1JArmCOnlyPreflightDiagnosticJournal,
   createV1JPreflightDiagnosticJournal,
   createV1JSmokeArtifactState,
   finalizeV1JSmokeArtifacts,
   resolveV1JSmokeRoot,
+  runV1JArmCPreflightOnly,
   runV1JSmokeSchedule,
   V1J_FORMAL_ARTIFACT_RELATIVE_PATH,
   V1J_SMOKE_PROVENANCE_PATH,
@@ -1252,6 +1254,51 @@ const describeFullLive =
 const describeSmokeLive = SMOKE_TEST ? describe : describe.skip;
 const describeDiagnosticLive = DIAGNOSTIC_TEST ? describe : describe.skip;
 const LIVE_MODE = resolveV1IMode(LIVE, process.env.OPENCLAW_V1I_MODE);
+
+describe("v1J Arm C preflight entrypoint wiring", () => {
+  it("creates its journal and reaches one preflight without entering a schedule", async () => {
+    const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), "v1j-arm-c-entrypoint-wiring-"));
+    const head = "7".repeat(40);
+    const journal = createV1JArmCOnlyPreflightDiagnosticJournal({
+      repoRoot,
+      harnessCommit: head,
+      caseId: "offline-arm-c-entrypoint",
+      preflightId: "offline-arm-c-entrypoint-wiring",
+      pid: process.pid,
+    });
+    let preflightCalls = 0;
+    try {
+      journal.record("arm-c-only-entrypoint-guards-verified", {
+        armAPreflightReached: false,
+        smokeScheduleReached: false,
+        formalArtifactTouched: false,
+        normalSmokeArtifactTouched: false,
+      });
+      await runV1JArmCPreflightOnly({
+        journal,
+        captureArmC: async () => {
+          preflightCalls += 1;
+          return "arm-c-preflight-complete";
+        },
+      });
+      const events = fs
+        .readFileSync(journal.filePath, "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => (JSON.parse(line) as { event: string }).event);
+      expect(preflightCalls).toBe(1);
+      expect(events).toEqual([
+        "arm-c-preflight-start",
+        "arm-c-only-entrypoint-guards-verified",
+        "arm-c-only-preflight-start",
+        "arm-c-only-preflight-terminated",
+      ]);
+    } finally {
+      journal.close();
+      fs.rmSync(repoRoot, { recursive: true, force: true });
+    }
+  });
+});
 
 describeV1JArmCPreflightDiagnostic("v1J Arm C preflight-only diagnostic", () => {
   it(

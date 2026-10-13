@@ -64,7 +64,7 @@ export type V1JProtocol = {
   };
   schedule: { seed: number; noOutcomeBasedReordering: boolean };
   surfaceAndRuntime: { schemaIntegrityGate: V1JSchemaFingerprints };
-  schemaBaseline: V1JSchemaBaseline & { expectedRuntimeNames: readonly string[] };
+  schemaBaseline: V1JSchemaBaseline;
   metrics: Record<string, string>;
   primarySuccessCriteria: Record<string, number | boolean>;
   classification: Record<string, string | readonly string[]>;
@@ -74,17 +74,33 @@ export type V1JProtocol = {
   authorizationGate: { liveExecutionAuthorized: boolean };
 };
 
-export type V1JSchemaBaseline = {
+export type V1JSchemaFingerprints = {
   authorizedToolCount: number;
   providerToolCount: number;
   authorizedToolNameSha256: string;
   providerToolNameSha256: string;
   authorizedToolSchemaSha256: string;
   providerToolSchemaSha256: string;
-  authorizedToolNames: readonly string[];
 };
 
-export type V1JSchemaFingerprints = Omit<V1JSchemaBaseline, "authorizedToolNames">;
+export type V1JSchemaBaseline = V1JSchemaFingerprints & {
+  baselineType: string;
+  benchmarkCandidateInventoryCount: number;
+  mappedRuntimeNameCount: number;
+  expectedRealExactRuntimeCount: number;
+  expectedRuntimeNames: readonly string[];
+  schemaCanonicalizationVersion: string;
+  schemaCanonicalization: readonly string[];
+  authorizedSetEqualsProviderSet: boolean;
+  freshRuntimeRepeatability: boolean;
+  armAArmCParity: boolean;
+  imageBenchmarkMapping: string;
+  runtimeBuiltInImageToolName: string;
+  imageFactoryEligible: boolean;
+  imageFactoryConstructed: boolean;
+  activeFilteringEnabled: boolean;
+};
+
 export type V1JCapturedSchemaSurface = V1JSchemaFingerprints & {
   authorizedToolNames: readonly string[];
 };
@@ -593,10 +609,24 @@ export function assertV1JSchemaBaseline(
   expected: V1JSchemaBaseline,
   actual: V1JCapturedSchemaSurface,
 ): void {
-  for (const key of Object.keys(expected) as (keyof V1JSchemaBaseline)[]) {
+  const measuredFields = [
+    "authorizedToolCount",
+    "providerToolCount",
+    "authorizedToolNameSha256",
+    "providerToolNameSha256",
+    "authorizedToolSchemaSha256",
+    "providerToolSchemaSha256",
+  ] as const satisfies readonly (keyof V1JSchemaFingerprints)[];
+  for (const key of measuredFields) {
     if (actual[key] !== expected[key]) {
       throw new Error(`v1J frozen schema baseline mismatch: ${key}`);
     }
+  }
+  if (
+    actual.authorizedToolNames.length !== expected.expectedRuntimeNames.length ||
+    actual.authorizedToolNames.some((name, index) => name !== expected.expectedRuntimeNames[index])
+  ) {
+    throw new Error("v1J frozen schema baseline mismatch: authorizedToolNames");
   }
 }
 

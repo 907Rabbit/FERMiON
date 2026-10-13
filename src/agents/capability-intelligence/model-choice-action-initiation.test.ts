@@ -207,6 +207,11 @@ function toolsNames(protocol: V1JProtocol): string[] {
   return [...protocol.schemaBaseline.expectedRuntimeNames];
 }
 
+const capturedSchemaSurface = (protocol: V1JProtocol) => ({
+  ...protocol.schemaBaseline,
+  authorizedToolNames: toolsNames(protocol),
+});
+
 function preflightRequestObservation(
   overrides: Partial<V1JPreflightRequestObservation> = {},
 ): V1JPreflightRequestObservation {
@@ -357,11 +362,13 @@ describe("v1J action-initiation protocol and offline harness", () => {
     expect(reordered).toEqual(first);
     expect(first.authorizedToolCount).toBe(2);
     expect(first.providerToolCount).toBe(2);
-    const expected = { ...first };
-    assertV1JSchemaBaseline(expected, first);
-    expect(() => assertV1JSchemaBaseline({ ...expected, providerToolCount: 15 }, first)).toThrow(
-      "providerToolCount",
-    );
+    const protocol = loadProtocol();
+    const expected = protocol.schemaBaseline;
+    const actual = {
+      ...expected,
+      authorizedToolNames: [...expected.expectedRuntimeNames],
+    };
+    expect(() => assertV1JSchemaBaseline(expected, actual)).not.toThrow();
   });
 
   it("enforces the exact pre-run model, ranker, filtering, and canonical surface gate", () => {
@@ -374,7 +381,7 @@ describe("v1J action-initiation protocol and offline harness", () => {
       rankerVersion: protocol.base.productionFrozen.rankerVersion,
       topK: protocol.base.productionFrozen.topK,
       activeFilteringEnabled: false,
-      surface: protocol.schemaBaseline,
+      surface: capturedSchemaSurface(protocol),
     };
     expect(() => assertV1JRuntimeGate(protocol, actual)).not.toThrow();
     expect(() =>
@@ -386,6 +393,13 @@ describe("v1J action-initiation protocol and offline harness", () => {
         surface: { ...actual.surface, providerToolSchemaSha256: "0".repeat(64) },
       }),
     ).toThrow("providerToolSchemaSha256");
+    expect(() =>
+      assertV1JRuntimeGate(protocol, {
+        ...actual,
+        provider: "wrong-provider",
+        surface: { ...actual.surface, providerToolSchemaSha256: "0".repeat(64) },
+      }),
+    ).toThrow("configuration drift");
   });
 
   it("builds a source-bound manifest without changing the frozen preregistration", () => {

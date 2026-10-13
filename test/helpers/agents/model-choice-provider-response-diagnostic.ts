@@ -1,0 +1,247 @@
+import fs from "node:fs";
+import path from "node:path";
+
+export const V1J_PROVIDER_RESPONSE_DIAGNOSTIC_PARENT =
+  "artifacts/capability-intelligence/v1j-action-initiation";
+export const V1J_PROVIDER_RESPONSE_DIAGNOSTIC_PREFIX = "provider-response-diagnostic-";
+export const V1J_PROVIDER_RESPONSE_DIAGNOSTIC_CELL = "smoke-tool-required:A:1";
+export const V1J_PROVIDER_RESPONSE_DIAGNOSTIC_FORMAL_PATH =
+  "artifacts/capability-intelligence/v1j-action-initiation/real-exact-run1";
+
+const SAFE_DETAIL_KEYS = new Set([
+  "requestId",
+  "correlationId",
+  "requestIndex",
+  "httpStatus",
+  "responseBytes",
+  "contentType",
+  "errorClass",
+  "errorCode",
+  "failureStage",
+  "abortState",
+  "abortReasonClass",
+  "timeoutState",
+  "providerResponseObserved",
+  "terminalEvidenceComplete",
+  "terminalEvidencePersisted",
+  "cleanupExceptionClass",
+  "cleanupSecondary",
+  "modelLoopStatus",
+  "parserOutcome",
+  "toolCallCount",
+  "executionCount",
+  "correlationStatus",
+  "invalidReason",
+  "dispatchAttempt",
+  "outcome",
+  "adapterErrorClass",
+  "adapterErrorCode",
+]);
+
+export type V1JProviderResponseDiagnosticJournal = {
+  root: string;
+  filePath: string;
+  record: (event: string, details?: Record<string, unknown>) => void;
+  close: () => void;
+};
+
+export async function observeV1JAdapterResponse<T>(input: {
+  journal: V1JProviderResponseDiagnosticJournal;
+  requestIndex: number;
+  observe: () => T | Promise<T>;
+}): Promise<T> {
+  input.journal.record("adapter-response-enter", {
+    requestIndex: input.requestIndex,
+    outcome: "entered",
+  });
+  try {
+    const response = await input.observe();
+    input.journal.record("provider-response-hook-complete", {
+      requestIndex: input.requestIndex,
+      outcome: "completed",
+    });
+    return response;
+  } catch (error) {
+    const errorClass = error instanceof Error ? error.name : "NonErrorThrown";
+    const code = error instanceof Error ? (error as Error & { code?: unknown }).code : undefined;
+    input.journal.record("adapter-response-failed", {
+      requestIndex: input.requestIndex,
+      outcome: "rejected",
+      errorClass,
+      ...(typeof code === "string" || typeof code === "number" ? { errorCode: String(code) } : {}),
+    });
+    throw error;
+  }
+}
+
+export function resolveV1JProviderResponseDiagnosticRoot(
+  repoRoot: string,
+  harnessCommit: string,
+): string {
+  if (!/^[0-9a-f]{40}$/i.test(harnessCommit)) {
+    throw new Error("v1J provider-response diagnostics require the actual full harness SHA");
+  }
+  return path.resolve(
+    repoRoot,
+    V1J_PROVIDER_RESPONSE_DIAGNOSTIC_PARENT,
+    `${V1J_PROVIDER_RESPONSE_DIAGNOSTIC_PREFIX}${harnessCommit}`,
+  );
+}
+
+export function createV1JProviderResponseDiagnosticJournal(input: {
+  repoRoot: string;
+  harnessCommit: string;
+  modelId: string;
+  modelConfigHash: string;
+  schemaFingerprint: {
+    authorizedToolCount: number;
+    providerToolCount: number;
+    authorizedToolNameSha256: string;
+    providerToolNameSha256: string;
+    authorizedToolSchemaSha256: string;
+    providerToolSchemaSha256: string;
+  };
+  startedAt: string;
+}): V1JProviderResponseDiagnosticJournal {
+  const repoRoot = fs.realpathSync(input.repoRoot);
+  const parent = path.resolve(repoRoot, V1J_PROVIDER_RESPONSE_DIAGNOSTIC_PARENT);
+  fs.mkdirSync(parent, { recursive: true });
+  if (fs.realpathSync(parent) !== parent) {
+    throw new Error("v1J provider-response diagnostics refuse an aliased artifact parent");
+  }
+  const root = resolveV1JProviderResponseDiagnosticRoot(repoRoot, input.harnessCommit);
+  const formalRoot = path.resolve(repoRoot, V1J_PROVIDER_RESPONSE_DIAGNOSTIC_FORMAL_PATH);
+  const smokeRoot = path.resolve(parent, `smoke-${input.harnessCommit}`);
+  if (pathsOverlap(root, formalRoot) || pathsOverlap(root, smokeRoot)) {
+    throw new Error("v1J provider-response diagnostics overlap formal or smoke artifacts");
+  }
+  if (fs.existsSync(formalRoot)) {
+    throw new Error("v1J provider-response diagnostics refuse existing formal state");
+  }
+  assertWithin(parent, root);
+  fs.mkdirSync(root, { recursive: false });
+  if (fs.realpathSync(root) !== root) {
+    throw new Error("v1J provider-response diagnostics refuse an aliased diagnostic root");
+  }
+  const filePath = path.join(root, "lifecycle.jsonl");
+  assertWithin(root, filePath);
+  const fd = fs.openSync(filePath, "wx");
+  const manifestPath = path.join(root, "manifest.json");
+  const manifest = {
+    artifactKind: "v1J-provider-response-diagnostic",
+    harnessCommit: input.harnessCommit,
+    modelId: input.modelId,
+    modelConfigHash: input.modelConfigHash,
+    schemaFingerprint: input.schemaFingerprint,
+    cellId: V1J_PROVIDER_RESPONSE_DIAGNOSTIC_CELL,
+    activeFilteringEnabled: false,
+    formalStateTouched: false,
+    smokeStateTouched: false,
+    promptContentPersisted: false,
+    credentialsPersisted: false,
+    startedAt: input.startedAt,
+  };
+  const manifestFd = fs.openSync(manifestPath, "wx");
+  try {
+    fs.writeFileSync(manifestFd, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+    fs.fsyncSync(manifestFd);
+  } finally {
+    fs.closeSync(manifestFd);
+  }
+
+  const startedAtMs = Date.now();
+  let eventIndex = 0;
+  let closed = false;
+  const record = (event: string, details: Record<string, unknown> = {}) => {
+    if (closed) {
+      throw new Error("v1J provider-response diagnostic journal is closed");
+    }
+    if (!/^[a-z][a-z0-9-]{0,63}$/.test(event)) {
+      throw new Error("v1J provider-response diagnostic event name is invalid");
+    }
+    const safeDetails = Object.fromEntries(
+      Object.entries(details).filter(
+        ([key, value]) => SAFE_DETAIL_KEYS.has(key) && isSafeValue(key, value),
+      ),
+    );
+    const row = {
+      event,
+      eventIndex: ++eventIndex,
+      observedAt: new Date().toISOString(),
+      elapsedMs: Date.now() - startedAtMs,
+      pid: process.pid,
+      harnessCommit: input.harnessCommit,
+      cellId: V1J_PROVIDER_RESPONSE_DIAGNOSTIC_CELL,
+      ...safeDetails,
+    };
+    fs.writeSync(fd, `${JSON.stringify(row)}\n`, undefined, "utf8");
+    fs.fsyncSync(fd);
+  };
+  record("diagnostic-entrypoint-start", {
+    outcome: "started",
+    terminalEvidenceComplete: false,
+    terminalEvidencePersisted: false,
+  });
+  return {
+    root,
+    filePath,
+    record,
+    close: () => {
+      if (!closed) {
+        fs.fsyncSync(fd);
+        fs.closeSync(fd);
+        closed = true;
+      }
+    },
+  };
+}
+
+export function isV1JCleanupFailureSecondary(input: {
+  terminalEvidenceComplete: boolean;
+  terminalEvidencePersisted: boolean;
+}): boolean {
+  return input.terminalEvidenceComplete && input.terminalEvidencePersisted;
+}
+
+function isSafeValue(key: string, value: unknown): value is string | number | boolean | null {
+  if (value === null || typeof value === "boolean") {
+    return true;
+  }
+  if (typeof value === "number") {
+    return Number.isFinite(value);
+  }
+  if (typeof value !== "string" || value.length > 160) {
+    return false;
+  }
+  if (key === "contentType") {
+    return /^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/i.test(value);
+  }
+  if (key === "errorCode") {
+    return /^[a-z0-9_-]{1,40}$/i.test(value);
+  }
+  if (key.endsWith("Class")) {
+    return /^[a-z][a-z0-9_.-]{0,79}$/i.test(value);
+  }
+  if (key === "failureStage") {
+    return /^[a-z0-9_.-]{1,120}$/i.test(value);
+  }
+  if (key === "requestId" || key === "correlationId") {
+    return /^[a-z0-9_.:-]{1,120}$/i.test(value);
+  }
+  return true;
+}
+
+function assertWithin(parent: string, target: string): void {
+  const relative = path.relative(parent, target);
+  if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw new Error("v1J provider-response diagnostic path escaped its artifact root");
+  }
+}
+
+function pathsOverlap(left: string, right: string): boolean {
+  const within = (parent: string, child: string) => {
+    const relative = path.relative(parent, child);
+    return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`));
+  };
+  return within(left, right) || within(right, left);
+}

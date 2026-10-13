@@ -45,6 +45,13 @@ import {
   type V1JObservation,
   type V1JProtocol,
 } from "../../../test/helpers/agents/model-choice-action-initiation.js";
+import {
+  createV1JProviderResponseDiagnosticJournal,
+  isV1JCleanupFailureSecondary,
+  observeV1JAdapterResponse,
+  V1J_PROVIDER_RESPONSE_DIAGNOSTIC_CELL,
+  type V1JProviderResponseDiagnosticJournal,
+} from "../../../test/helpers/agents/model-choice-provider-response-diagnostic.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { AssistantMessage } from "../../llm/types.js";
 import { applyTestPluginDefaults } from "../../plugins/config-state.js";
@@ -131,7 +138,26 @@ const V1J_ACTION_LIVE_TEST = process.env.OPENCLAW_V1J_LIVE_TEST === "1";
 const V1J_ACTION_LIVE_AUTHORIZED = process.env.OPENCLAW_V1J_LIVE_EXECUTION_AUTHORIZED === "1";
 const V1J_ACTION_SMOKE_TEST = process.env.OPENCLAW_V1J_LIVE_SMOKE === "1";
 const V1J_ACTION_SMOKE_AUTHORIZED = process.env.OPENCLAW_V1J_LIVE_SMOKE_AUTHORIZED === "1";
+const V1J_PROVIDER_RESPONSE_DIAGNOSTIC =
+  process.env.OPENCLAW_V1J_PROVIDER_RESPONSE_DIAGNOSTIC === "1";
+const V1J_PROVIDER_RESPONSE_DIAGNOSTIC_AUTHORIZED =
+  process.env.OPENCLAW_V1J_PROVIDER_RESPONSE_DIAGNOSTIC_AUTHORIZED === "1";
 const V1J_ARM_C_PREFLIGHT_DIAGNOSTIC = process.env.OPENCLAW_V1J_ARM_C_PREFLIGHT_DIAGNOSTIC === "1";
+if (
+  V1J_PROVIDER_RESPONSE_DIAGNOSTIC &&
+  (LIVE ||
+    V1J_ACTION_LIVE_TEST ||
+    V1J_ACTION_LIVE_AUTHORIZED ||
+    V1J_ACTION_SMOKE_TEST ||
+    V1J_ACTION_SMOKE_AUTHORIZED ||
+    V1J_ARM_C_PREFLIGHT_DIAGNOSTIC ||
+    V1J_SCHEMA_CAPTURE_MODE !== undefined ||
+    process.env.OPENCLAW_V1J_CELL_ALLOWLIST !== undefined ||
+    process.env.OPENCLAW_V1J_MAX_CELLS !== undefined ||
+    process.env.OPENCLAW_V1I_MODE !== undefined)
+) {
+  throw new Error("v1J provider-response diagnostic cannot share another live execution mode");
+}
 if (
   V1J_ARM_C_PREFLIGHT_DIAGNOSTIC &&
   (LIVE ||
@@ -139,6 +165,8 @@ if (
     V1J_ACTION_LIVE_AUTHORIZED ||
     V1J_ACTION_SMOKE_TEST ||
     V1J_ACTION_SMOKE_AUTHORIZED ||
+    V1J_PROVIDER_RESPONSE_DIAGNOSTIC ||
+    V1J_PROVIDER_RESPONSE_DIAGNOSTIC_AUTHORIZED ||
     V1J_SCHEMA_CAPTURE_MODE !== undefined ||
     process.env.OPENCLAW_V1J_CELL_ALLOWLIST !== undefined ||
     process.env.OPENCLAW_V1J_MAX_CELLS !== undefined ||
@@ -1242,6 +1270,24 @@ type ModelPayloadCapture = {
   restore: () => void;
 };
 
+function safeDiagnosticError(error: unknown): { errorClass: string; errorCode?: string } {
+  if (!(error instanceof Error)) {
+    return { errorClass: "NonErrorThrown" };
+  }
+  const code = (error as Error & { code?: unknown }).code;
+  return {
+    errorClass: error.name || "Error",
+    ...(typeof code === "string" || typeof code === "number" ? { errorCode: String(code) } : {}),
+  };
+}
+
+function safeDiagnosticContentType(response: Response): string | undefined {
+  const mediaType = response.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase();
+  return mediaType && /^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/i.test(mediaType)
+    ? mediaType
+    : undefined;
+}
+
 class V1IProviderRequestCapturedError extends Error {
   constructor() {
     super("v1I provider request captured before network I/O");
@@ -1276,6 +1322,8 @@ const describeV1JSchemaCapture = V1J_SCHEMA_CAPTURE_MODE === undefined ? describ
 const describeV1JActionLive =
   V1J_ACTION_LIVE_TEST &&
   V1J_ACTION_LIVE_AUTHORIZED &&
+  !V1J_PROVIDER_RESPONSE_DIAGNOSTIC &&
+  !V1J_PROVIDER_RESPONSE_DIAGNOSTIC_AUTHORIZED &&
   !V1J_ACTION_SMOKE_TEST &&
   !V1J_ACTION_SMOKE_AUTHORIZED &&
   V1J_SCHEMA_CAPTURE_MODE === undefined
@@ -1283,6 +1331,10 @@ const describeV1JActionLive =
     : describe.skip;
 const describeV1JActionSmoke =
   V1J_ACTION_SMOKE_TEST || V1J_ACTION_SMOKE_AUTHORIZED ? describe : describe.skip;
+const describeV1JProviderResponseDiagnostic =
+  V1J_PROVIDER_RESPONSE_DIAGNOSTIC || V1J_PROVIDER_RESPONSE_DIAGNOSTIC_AUTHORIZED
+    ? describe
+    : describe.skip;
 const describeV1JArmCPreflightDiagnostic = V1J_ARM_C_PREFLIGHT_DIAGNOSTIC
   ? describe
   : describe.skip;
@@ -1293,7 +1345,9 @@ const describeFullLive =
   V1J_SCHEMA_CAPTURE_MODE === undefined &&
   !V1J_ACTION_LIVE_TEST &&
   !V1J_ACTION_SMOKE_TEST &&
-  !V1J_ACTION_SMOKE_AUTHORIZED
+  !V1J_ACTION_SMOKE_AUTHORIZED &&
+  !V1J_PROVIDER_RESPONSE_DIAGNOSTIC &&
+  !V1J_PROVIDER_RESPONSE_DIAGNOSTIC_AUTHORIZED
     ? describe
     : describe.skip;
 const describeSmokeLive = SMOKE_TEST ? describe : describe.skip;
@@ -1405,6 +1459,204 @@ describeV1JArmCPreflightDiagnostic("v1J Arm C preflight-only diagnostic", () => 
           journal,
           captureArmC: () => captureV1JPreflightSurface(protocol, "C", head, journal),
         });
+      } finally {
+        journal.close();
+      }
+    },
+  );
+});
+
+describeV1JProviderResponseDiagnostic("v1J provider-response first-cell diagnostic", () => {
+  it(
+    "diagnoses only smoke-tool-required Arm A cell 1 in an isolated artifact root",
+    { timeout: 240_000 },
+    async () => {
+      if (
+        !V1J_PROVIDER_RESPONSE_DIAGNOSTIC ||
+        !V1J_PROVIDER_RESPONSE_DIAGNOSTIC_AUTHORIZED ||
+        LIVE ||
+        V1J_ACTION_LIVE_TEST ||
+        V1J_ACTION_LIVE_AUTHORIZED ||
+        V1J_ACTION_SMOKE_TEST ||
+        V1J_ACTION_SMOKE_AUTHORIZED ||
+        V1J_ARM_C_PREFLIGHT_DIAGNOSTIC ||
+        V1J_SCHEMA_CAPTURE_MODE !== undefined ||
+        process.env.OPENCLAW_V1J_CELL_ALLOWLIST !== undefined ||
+        process.env.OPENCLAW_V1J_MAX_CELLS !== undefined ||
+        process.env.OPENCLAW_V1I_MODE !== undefined
+      ) {
+        throw new Error("v1J provider-response diagnostic requires only its dedicated gates");
+      }
+      const protocol = readV1JPreregistration();
+      const head = assertV1JCommittedHarness(protocol);
+      const repoRoot = process.cwd();
+      assertV1JFormalStateEmpty(repoRoot);
+      if (
+        V1J_PREREGISTRATION_SHA256 !==
+          "72f0d7c2c98038a09b767216a7a78c668b29971b8797a80c4f30a9d9c8af4172" ||
+        ACTIVE_FILTERING_ENABLED !== false ||
+        protocol.base.productionFrozen.activeFilteringEnabled !== false
+      ) {
+        throw new Error("v1J provider-response diagnostic frozen protocol gate failed");
+      }
+      const provenancePath = path.resolve(repoRoot, V1J_SMOKE_PROVENANCE_PATH);
+      const provenance = JSON.parse(fs.readFileSync(provenancePath, "utf8")) as unknown;
+      assertV1JSmokeProvenance(provenance, protocol, head);
+      await assertLiveModelAvailable();
+
+      const surfaceA = await captureV1JPreflightSurface(protocol, "A", head);
+      const surfaceC = await captureV1JPreflightSurface(protocol, "C", head);
+      if (canonicalizeV1IValue(surfaceA) !== canonicalizeV1IValue(surfaceC)) {
+        throw new Error("v1J provider-response diagnostic A/C schema parity failed");
+      }
+      const expectedSurface = protocol.schemaBaseline;
+      if (
+        surfaceA.authorizedToolCount !== expectedSurface.authorizedToolCount ||
+        surfaceA.providerToolCount !== expectedSurface.providerToolCount ||
+        surfaceA.authorizedToolNameSha256 !== expectedSurface.authorizedToolNameSha256 ||
+        surfaceA.providerToolNameSha256 !== expectedSurface.providerToolNameSha256 ||
+        surfaceA.authorizedToolSchemaSha256 !== expectedSurface.authorizedToolSchemaSha256 ||
+        surfaceA.providerToolSchemaSha256 !== expectedSurface.providerToolSchemaSha256
+      ) {
+        throw new Error("v1J provider-response diagnostic schema fingerprints drifted");
+      }
+      const smokeRoot = resolveV1JSmokeRoot(repoRoot, head);
+      if (fs.existsSync(smokeRoot)) {
+        throw new Error("v1J provider-response diagnostic refuses an existing normal smoke path");
+      }
+      const workspaceDir = fs.mkdtempSync(path.join(os.tmpdir(), "v1j-provider-diagnostic-"));
+      fs.writeFileSync(path.join(workspaceDir, "smoke-reference.txt"), "smoke-token-47\n", {
+        encoding: "utf8",
+        flag: "wx",
+      });
+      const journal = createV1JProviderResponseDiagnosticJournal({
+        repoRoot,
+        harnessCommit: head,
+        modelId: protocol.model.id,
+        modelConfigHash: hashV1ICanonical(modelConfigIdentity()),
+        schemaFingerprint: {
+          authorizedToolCount: surfaceA.authorizedToolCount,
+          providerToolCount: surfaceA.providerToolCount,
+          authorizedToolNameSha256: surfaceA.authorizedToolNameSha256,
+          providerToolNameSha256: surfaceA.providerToolNameSha256,
+          authorizedToolSchemaSha256: surfaceA.authorizedToolSchemaSha256,
+          providerToolSchemaSha256: surfaceA.providerToolSchemaSha256,
+        },
+        startedAt: new Date().toISOString(),
+      });
+      try {
+        const cell = buildV1JSmokeSchedule(protocol)[0];
+        if (!cell || cell.cellId !== V1J_PROVIDER_RESPONSE_DIAGNOSTIC_CELL) {
+          fs.rmSync(workspaceDir, { recursive: true, force: true });
+          throw new Error("v1J provider-response diagnostic cell identity changed");
+        }
+        journal.record("preflight-complete", {
+          outcome: "pass",
+          providerResponseObserved: false,
+          terminalEvidenceComplete: false,
+        });
+        let observation: V1JObservation | undefined;
+        let terminalEvidencePersisted = false;
+        let cleanupFailure: unknown;
+        try {
+          observation = await executeV1JCell({
+            protocol,
+            cell,
+            attempt: 1,
+            head,
+            benchmarkOverride: v1jSmokeBenchmark(cell),
+            workspaceDirOverride: workspaceDir,
+            allowNoToolTerminalEvidence: true,
+            runIdPrefix: "v1j-provider-response-diagnostic",
+            lifecycleJournal: journal,
+          });
+          terminalEvidencePersisted = true;
+        } catch (error) {
+          journal.record("diagnostic-cell-threw", {
+            outcome: "rejected",
+            ...safeDiagnosticError(error),
+            terminalEvidenceComplete: false,
+            terminalEvidencePersisted: false,
+          });
+          throw error;
+        } finally {
+          journal.record("cleanup-start", {
+            terminalEvidenceComplete: observation?.terminalEvidenceComplete === true,
+            terminalEvidencePersisted,
+          });
+          try {
+            fs.rmSync(workspaceDir, {
+              recursive: true,
+              force: true,
+              maxRetries: 3,
+              retryDelay: 50,
+            });
+          } catch (error) {
+            cleanupFailure = error;
+            const cleanupSecondary = isV1JCleanupFailureSecondary({
+              terminalEvidenceComplete: observation?.terminalEvidenceComplete === true,
+              terminalEvidencePersisted,
+            });
+            journal.record("cleanup-failed", {
+              cleanupExceptionClass: safeDiagnosticError(error).errorClass,
+              errorCode: safeDiagnosticError(error).errorCode,
+              cleanupSecondary,
+              terminalEvidenceComplete: observation?.terminalEvidenceComplete === true,
+              terminalEvidencePersisted,
+              outcome: "failed",
+            });
+          }
+          if (!fs.existsSync(workspaceDir)) {
+            journal.record("cleanup-complete", {
+              terminalEvidenceComplete: observation?.terminalEvidenceComplete === true,
+              terminalEvidencePersisted,
+              outcome: "complete",
+            });
+          } else if (!cleanupFailure) {
+            cleanupFailure = new Error("workspace remains after cleanup returned");
+            const cleanupSecondary = isV1JCleanupFailureSecondary({
+              terminalEvidenceComplete: observation?.terminalEvidenceComplete === true,
+              terminalEvidencePersisted,
+            });
+            journal.record("cleanup-failed", {
+              cleanupExceptionClass: "WorkspaceNotRemovedError",
+              cleanupSecondary,
+              terminalEvidenceComplete: observation?.terminalEvidenceComplete === true,
+              terminalEvidencePersisted,
+              outcome: "failed",
+            });
+          }
+        }
+        assertV1JFormalStateEmpty(repoRoot);
+        if (fs.existsSync(smokeRoot)) {
+          journal.record("normal-smoke-path-unexpectedly-created", { outcome: "hard-stop" });
+          throw new Error("v1J provider-response diagnostic touched the normal smoke path");
+        }
+        journal.record("diagnostic-cell-finalized", {
+          outcome: observation?.valid ? "valid" : "invalid",
+          invalidReason: observation?.invalidReason ?? undefined,
+          providerResponseObserved: observation?.providerResponseObserved ?? false,
+          terminalEvidenceComplete: observation?.terminalEvidenceComplete ?? false,
+          terminalEvidencePersisted,
+          dispatchAttempt: observation?.modelRequestsSent ?? 0,
+          cleanupSecondary:
+            cleanupFailure !== undefined &&
+            isV1JCleanupFailureSecondary({
+              terminalEvidenceComplete: observation?.terminalEvidenceComplete === true,
+              terminalEvidencePersisted,
+            }),
+        });
+        const cleanupSecondary =
+          cleanupFailure !== undefined &&
+          isV1JCleanupFailureSecondary({
+            terminalEvidenceComplete: observation?.terminalEvidenceComplete === true,
+            terminalEvidencePersisted,
+          });
+        if (!observation?.valid || (cleanupFailure && !cleanupSecondary)) {
+          throw new Error(
+            `v1J provider-response diagnostic hard stop: ${observation?.invalidReason ?? "CLEANUP_FAILURE"}`,
+          );
+        }
       } finally {
         journal.close();
       }
@@ -1920,6 +2172,7 @@ async function executeV1JCell(input: {
   workspaceDirOverride?: string;
   allowNoToolTerminalEvidence?: boolean;
   runIdPrefix?: string;
+  lifecycleJournal?: V1JProviderResponseDiagnosticJournal;
 }): Promise<V1JObservation> {
   const { protocol, cell, attempt, head } = input;
   const benchmark =
@@ -1964,6 +2217,12 @@ async function executeV1JCell(input: {
       model: protocol.model.id,
       runIdOverride: `${input.runIdPrefix ?? "v1j"}-${head.slice(0, 8)}-${cell.cellId}-attempt-${attempt}`,
       requestCapture: {
+        ...(input.lifecycleJournal
+          ? {
+              lifecycleJournal: input.lifecycleJournal,
+              requestCorrelationId: `${input.runIdPrefix ?? "v1j"}-${head.slice(0, 8)}-${cell.cellId}-attempt-${attempt}`,
+            }
+          : {}),
         capturePromptInstruction: v1jInstructionForArm(protocol, cell.arm),
         onAuthorizedToolsCaptured: (tools) =>
           authorizedTools.splice(0, authorizedTools.length, ...tools),
@@ -2131,6 +2390,17 @@ async function executeV1JCell(input: {
         }),
     ...(gateFailure ? { integrity: v1jIntegrityForReason(reason) } : {}),
   };
+  input.lifecycleJournal?.record("terminal-evidence-finalized", {
+    terminalEvidenceComplete: row.terminalEvidenceComplete,
+    terminalEvidencePersisted: true,
+    invalidReason: row.invalidReason ?? undefined,
+    toolCallCount: row.toolCalls.length,
+    executionCount: row.executions.length,
+    correlationStatus: row.correlationStatus,
+    providerResponseObserved: row.providerResponseObserved,
+    dispatchAttempt: row.modelRequestsSent,
+    outcome: row.valid ? "valid" : "invalid",
+  });
   return row;
 }
 
@@ -3089,8 +3359,11 @@ describe("v1I harness evidence repair", () => {
 
   it("captures provider responses through the AI transport host fetch boundary", async () => {
     const summaries: ProviderResponseSummary[] = [];
+    const diagnostic = createTestV1JProviderResponseDiagnosticJournal();
     const capture = captureModelPayloads(undefined, {
       onResponseSummary: (summary) => summaries.push(summary),
+      lifecycleJournal: diagnostic.journal,
+      requestCorrelationId: "offline-response-success",
     });
     const previousHost = getAiTransportHost();
     const fixture = [
@@ -3123,9 +3396,121 @@ describe("v1I harness evidence repair", () => {
         toolCallFieldPresent: true,
         functionCallFieldPresent: true,
       });
+      const lifecycle = diagnostic.readRows();
+      expect(lifecycle.map((row) => row.event)).toEqual(
+        expect.arrayContaining([
+          "request-created",
+          "request-dispatch-start",
+          "request-dispatch-complete",
+          "http-response-headers",
+          "provider-response-observed",
+          "http-response-body-start",
+          "http-response-body-complete",
+        ]),
+      );
+      expect(lifecycle.find((row) => row.event === "provider-response-observed")).toMatchObject({
+        providerResponseObserved: true,
+        httpStatus: 200,
+      });
+      expect(lifecycle.find((row) => row.event === "http-response-body-complete")).toMatchObject({
+        responseBytes: new TextEncoder().encode(fixture).byteLength,
+        parserOutcome: "tool-call-complete",
+      });
+      expect(JSON.stringify(lifecycle)).not.toContain("git_status");
+      expect(capture.providerDispatchAttempts).toBe(1);
     } finally {
       configureAiTransportHost(previousHost);
       capture.restore();
+      diagnostic.dispose();
+    }
+  });
+
+  it("records HTTP error status without persisting its body", async () => {
+    const diagnostic = createTestV1JProviderResponseDiagnosticJournal();
+    const capture = captureModelPayloads(undefined, { lifecycleJournal: diagnostic.journal });
+    try {
+      const response = await capture.wrapFetch(
+        async () =>
+          new Response('{"error":{"message":"private provider detail"}}', {
+            status: 503,
+            headers: { "content-type": "application/json" },
+          }),
+      )(LM_STUDIO_BASE_URL + "/chat/completions", {
+        method: "POST",
+        body: JSON.stringify({ model: MODEL_ID, messages: [] }),
+      });
+      await response.text();
+      const rows = diagnostic.readRows();
+      expect(rows.find((row) => row.event === "provider-response-observed")).toMatchObject({
+        providerResponseObserved: true,
+        httpStatus: 503,
+      });
+      expect(rows.find((row) => row.event === "http-response-body-complete")).toMatchObject({
+        parserOutcome: "stream-closed-without-terminal",
+      });
+      expect(JSON.stringify(rows)).not.toContain("private provider detail");
+    } finally {
+      capture.restore();
+      diagnostic.dispose();
+    }
+  });
+
+  it("preserves a rejected fetch error and records its abort classification", async () => {
+    const diagnostic = createTestV1JProviderResponseDiagnosticJournal();
+    const capture = captureModelPayloads(undefined, { lifecycleJournal: diagnostic.journal });
+    const abortError = new DOMException("request aborted", "AbortError");
+    try {
+      const request = capture.wrapFetch(async () => {
+        throw abortError;
+      })(LM_STUDIO_BASE_URL + "/chat/completions", {
+        method: "POST",
+        body: JSON.stringify({ model: MODEL_ID, messages: [] }),
+      });
+      await expect(request).rejects.toBe(abortError);
+      expect(
+        diagnostic.readRows().find((row) => row.event === "request-dispatch-complete"),
+      ).toMatchObject({ outcome: "rejected", errorClass: "AbortError", timeoutState: "aborted" });
+      expect(diagnostic.readRows().some((row) => row.event === "http-response-headers")).toBe(
+        false,
+      );
+    } finally {
+      capture.restore();
+      diagnostic.dispose();
+    }
+  });
+
+  it("distinguishes a received but unparseable body from no provider response", async () => {
+    const diagnostic = createTestV1JProviderResponseDiagnosticJournal();
+    const summaries: ProviderResponseSummary[] = [];
+    const capture = captureModelPayloads(undefined, {
+      lifecycleJournal: diagnostic.journal,
+      onResponseSummary: (summary) => summaries.push(summary),
+    });
+    try {
+      const response = await capture.wrapFetch(
+        async () =>
+          new Response("data: not-json\n\n", {
+            headers: { "content-type": "text/event-stream" },
+          }),
+      )(LM_STUDIO_BASE_URL + "/chat/completions", {
+        method: "POST",
+        body: JSON.stringify({ model: MODEL_ID, messages: [] }),
+      });
+      await response.text();
+      expect(
+        diagnostic
+          .readRows()
+          .some(
+            (row) => row.event === "provider-response-observed" && row.providerResponseObserved,
+          ),
+      ).toBe(true);
+      expect(summaries.at(-1)?.parserOutcome).toBe("parse-error");
+      expect(diagnostic.readRows().some((row) => row.event === "adapter-response-parsed")).toBe(
+        false,
+      );
+    } finally {
+      capture.restore();
+      diagnostic.dispose();
     }
   });
 
@@ -4349,6 +4734,8 @@ async function runOne(input: {
     onAssistantMessage?: (message: AssistantMessage, modelTurnIndex: number) => void;
     liveness?: V1JCaptureLiveness;
     onProviderDispatchAttempt?: (count: number) => void;
+    lifecycleJournal?: V1JProviderResponseDiagnosticJournal;
+    requestCorrelationId?: string;
   };
   abortSignal?: AbortSignal;
   timeoutMs?: number;
@@ -4547,15 +4934,21 @@ async function runOne(input: {
   };
   diagnostics.hooks.onTimeoutArmed = () => {
     input.attemptCheckpointJournal?.record("timeout-armed");
+    input.requestCapture?.lifecycleJournal?.record("timeout-armed", { timeoutState: "armed" });
   };
   diagnostics.hooks.onTimeoutFired = () => {
     input.attemptCheckpointJournal?.record("timeout-fired");
+    input.requestCapture?.lifecycleJournal?.record("timeout-fired", {
+      timeoutState: "timed-out",
+    });
   };
   diagnostics.hooks.onAbortRequested = () => {
     input.attemptCheckpointJournal?.record("abort-requested");
+    input.requestCapture?.lifecycleJournal?.record("abort-requested", { abortState: true });
   };
   diagnostics.hooks.onAbortObserved = () => {
     input.attemptCheckpointJournal?.record("abort-observed");
+    input.requestCapture?.lifecycleJournal?.record("abort-observed", { abortState: true });
   };
   diagnostics.hooks.onCheckpoint?.({
     stage: "synthetic-constructed",
@@ -4736,7 +5129,9 @@ async function runOne(input: {
     }
   };
   const diagnosticsProviderResponse = diagnostics.hooks.onProviderResponse;
+  let adapterResponseIndex = 0;
   diagnostics.hooks.onProviderResponse = async ({ response, model }) => {
+    const requestIndex = ++adapterResponseIndex;
     diagnostics.hooks.onCheckpoint?.({
       stage: "provider-response-received",
       toolCount: input.authorizedNames.length,
@@ -4746,11 +5141,27 @@ async function runOne(input: {
       stage: "provider-response-normalization-entered",
     });
     postResponseLiveness?.arm();
-    await diagnosticsProviderResponse?.({ response, model });
+    if (input.requestCapture?.lifecycleJournal) {
+      await observeV1JAdapterResponse({
+        journal: input.requestCapture.lifecycleJournal,
+        requestIndex,
+        observe: async () => diagnosticsProviderResponse?.({ response, model }),
+      });
+    } else {
+      await diagnosticsProviderResponse?.({ response, model });
+    }
   };
   const restoreAssistantMessageObserver = installAssistantMessageObserver(
     diagnostics.hooks,
     (message, modelTurnIndex) => {
+      const normalizedToolCallCount = message.content.filter(
+        (block) => block.type === "toolCall",
+      ).length;
+      input.requestCapture?.lifecycleJournal?.record("adapter-response-parsed", {
+        requestIndex: modelTurnIndex + 1,
+        toolCallCount: normalizedToolCallCount,
+        outcome: "parsed",
+      });
       diagnostics.hooks.onPostResponseCheckpoint?.({
         stage: "provider-response-normalization-complete",
       });
@@ -4984,7 +5395,38 @@ async function runOne(input: {
           ...(input.abortSignal === undefined ? {} : { abortSignal: input.abortSignal }),
         },
       });
+      const requestFailure = diagnostics.readFailure();
+      input.requestCapture?.lifecycleJournal?.record("model-loop-complete", {
+        modelLoopStatus: execution.status,
+        outcome: execution.status,
+        ...(requestFailure
+          ? {
+              adapterErrorClass: requestFailure.errorName,
+              failureStage: requestFailure.failureStage,
+              timeoutState:
+                requestFailure.errorName === "TimeoutError" ? "timed-out" : "not-reported",
+            }
+          : {}),
+      });
     }
+  } catch (error) {
+    input.requestCapture?.lifecycleJournal?.record("model-loop-complete", {
+      modelLoopStatus: "error",
+      outcome: "rejected",
+      ...safeDiagnosticError(error),
+      abortState: input.abortSignal?.aborted === true,
+      abortReasonClass:
+        input.abortSignal?.aborted && input.abortSignal.reason instanceof Error
+          ? input.abortSignal.reason.name
+          : undefined,
+      timeoutState:
+        error instanceof Error && error.name === "TimeoutError"
+          ? "timed-out"
+          : input.abortSignal?.aborted
+            ? "aborted"
+            : "not-reported",
+    });
+    throw error;
   } finally {
     postResponseLiveness?.complete();
     restoreAssistantMessageObserver?.();
@@ -4993,6 +5435,12 @@ async function runOne(input: {
   }
   const postResponseTimeout = postResponseLiveness?.readTimeout();
   if (postResponseTimeout) {
+    input.requestCapture?.lifecycleJournal?.record("model-loop-complete", {
+      modelLoopStatus: "timeout",
+      outcome: "rejected",
+      ...safeDiagnosticError(postResponseTimeout),
+      timeoutState: "timed-out",
+    });
     throw postResponseTimeout;
   }
   const completedExecution = execution;
@@ -6363,6 +6811,8 @@ function captureModelPayloads(
     onRequestCaptured?: (request: CapturedModelRequest) => void;
     onDelegatedRequest?: () => void;
     onResponseSummary?: (summary: ProviderResponseSummary) => void;
+    lifecycleJournal?: V1JProviderResponseDiagnosticJournal;
+    requestCorrelationId?: string;
   },
 ): ModelPayloadCapture {
   const requests: CapturedModelRequest[] = [];
@@ -6370,6 +6820,7 @@ function captureModelPayloads(
   let providerRequestRecorded = false;
   let delegatedRequests = 0;
   let providerDispatchAttempts = 0;
+  let providerRequestIndex = 0;
   const originalFetch = globalThis.fetch;
   const wrappedFetches = new WeakSet<typeof globalThis.fetch>();
   const wrapFetch = (baseFetch: typeof globalThis.fetch): typeof globalThis.fetch => {
@@ -6402,6 +6853,10 @@ function captureModelPayloads(
           url.includes("/responses")) &&
         typeof body === "string" &&
         body.trim().startsWith("{");
+      const requestIndex = isProviderRequest ? ++providerRequestIndex : 0;
+      const correlationId = isProviderRequest
+        ? `${options?.requestCorrelationId ?? "v1j-request"}:${requestIndex}`
+        : undefined;
       if (isProviderRequest) {
         const parsed = JSON.parse(body) as Record<string, unknown>;
         const request = { body: parsed, url };
@@ -6480,14 +6935,92 @@ function captureModelPayloads(
           { callSite: "captureModelPayloads.wrapFetch.baseFetch" },
         );
       }
-      const response = await baseFetch(input, init);
+      if (isProviderRequest) {
+        options?.lifecycleJournal?.record("request-created", {
+          requestId: correlationId,
+          correlationId,
+          requestIndex,
+          outcome: "created",
+        });
+        options?.lifecycleJournal?.record("request-dispatch-start", {
+          requestId: correlationId,
+          correlationId,
+          requestIndex,
+          dispatchAttempt: providerDispatchAttempts,
+          abortState: init?.signal?.aborted === true,
+          timeoutState: "pending",
+        });
+      }
+      let response: Response;
+      try {
+        response = await baseFetch(input, init);
+      } catch (error) {
+        if (isProviderRequest) {
+          const safeError = safeDiagnosticError(error);
+          options?.lifecycleJournal?.record("request-dispatch-complete", {
+            requestId: correlationId,
+            correlationId,
+            requestIndex,
+            outcome: "rejected",
+            ...safeError,
+            abortState: init?.signal?.aborted === true,
+            abortReasonClass:
+              init?.signal?.aborted && init.signal.reason instanceof Error
+                ? init.signal.reason.name
+                : undefined,
+            timeoutState:
+              safeError.errorClass === "TimeoutError" || safeError.errorCode === "ETIMEDOUT"
+                ? "timed-out"
+                : init?.signal?.aborted || safeError.errorClass === "AbortError"
+                  ? "aborted"
+                  : "not-reported",
+          });
+        }
+        throw error;
+      }
       if (!isProviderRequest) {
         return response;
       }
+      const contentType = safeDiagnosticContentType(response);
+      options?.lifecycleJournal?.record("request-dispatch-complete", {
+        requestId: correlationId,
+        correlationId,
+        requestIndex,
+        outcome: "response",
+        httpStatus: response.status,
+        contentType,
+      });
+      options?.lifecycleJournal?.record("http-response-headers", {
+        requestId: correlationId,
+        correlationId,
+        requestIndex,
+        httpStatus: response.status,
+        contentType,
+      });
+      options?.lifecycleJournal?.record("provider-response-observed", {
+        requestId: correlationId,
+        correlationId,
+        requestIndex,
+        providerResponseObserved: true,
+        httpStatus: response.status,
+      });
       const initialSummary = createPendingProviderResponseSummary(response);
       responseSummaries.push(initialSummary);
       emitResponseSummary(initialSummary);
       if (!response.body) {
+        options?.lifecycleJournal?.record("http-response-body-start", {
+          requestId: correlationId,
+          correlationId,
+          requestIndex,
+          responseBytes: 0,
+        });
+        options?.lifecycleJournal?.record("http-response-body-complete", {
+          requestId: correlationId,
+          correlationId,
+          requestIndex,
+          responseBytes: 0,
+          outcome: "empty",
+        });
         const emptySummary = {
           ...initialSummary,
           parserOutcome: "empty-body",
@@ -6497,20 +7030,71 @@ function captureModelPayloads(
         return response;
       }
       const state = createResponseSummaryState(response.headers.get("content-type"));
-      const observedBody = response.body.pipeThrough(
-        new TransformStream<Uint8Array, Uint8Array>({
-          transform(chunk, controller) {
-            consumeProviderResponseChunk(state, chunk);
-            controller.enqueue(chunk);
-          },
-          flush() {
-            finishProviderResponseState(state);
-            const summary = finishProviderResponseSummary(initialSummary, state);
-            responseSummaries.push(summary);
-            emitResponseSummary(summary);
-          },
-        }),
-      );
+      const reader = response.body.getReader();
+      let responseBytes = 0;
+      options?.lifecycleJournal?.record("http-response-body-start", {
+        requestId: correlationId,
+        correlationId,
+        requestIndex,
+      });
+      const observedBody = new ReadableStream<Uint8Array>({
+        async pull(controller) {
+          try {
+            const part = await reader.read();
+            if (part.done) {
+              finishProviderResponseState(state);
+              const summary = finishProviderResponseSummary(initialSummary, state);
+              responseSummaries.push(summary);
+              emitResponseSummary(summary);
+              options?.lifecycleJournal?.record("http-response-body-complete", {
+                requestId: correlationId,
+                correlationId,
+                requestIndex,
+                responseBytes,
+                parserOutcome: summary.parserOutcome,
+                outcome: "complete",
+              });
+              controller.close();
+              return;
+            }
+            responseBytes += part.value.byteLength;
+            consumeProviderResponseChunk(state, part.value);
+            controller.enqueue(part.value);
+          } catch (error) {
+            options?.lifecycleJournal?.record("http-response-body-failed", {
+              requestId: correlationId,
+              correlationId,
+              requestIndex,
+              responseBytes,
+              outcome: "rejected",
+              ...safeDiagnosticError(error),
+              abortState: init?.signal?.aborted === true,
+              timeoutState:
+                init?.signal?.aborted || safeDiagnosticError(error).errorClass === "AbortError"
+                  ? "aborted"
+                  : safeDiagnosticError(error).errorClass === "TimeoutError"
+                    ? "timed-out"
+                    : "not-reported",
+            });
+            controller.error(error);
+          }
+        },
+        async cancel(reason) {
+          try {
+            await reader.cancel(reason);
+          } finally {
+            options?.lifecycleJournal?.record("http-response-body-cancelled", {
+              requestId: correlationId,
+              correlationId,
+              requestIndex,
+              responseBytes,
+              outcome: "cancelled",
+              ...safeDiagnosticError(reason),
+              abortState: init?.signal?.aborted === true,
+            });
+          }
+        },
+      });
       return new Response(observedBody, {
         status: response.status,
         statusText: response.statusText,
@@ -6604,6 +7188,38 @@ async function captureProviderSummaryForFixture(fixture: string): Promise<Provid
     throw new Error("provider response fixture did not produce a summary");
   }
   return summary;
+}
+
+function createTestV1JProviderResponseDiagnosticJournal() {
+  const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), "v1j-provider-response-journal-test-"));
+  const journal = createV1JProviderResponseDiagnosticJournal({
+    repoRoot,
+    harnessCommit: "a".repeat(40),
+    modelId: MODEL_ID,
+    modelConfigHash: hashV1ICanonical(modelConfigIdentity()),
+    schemaFingerprint: {
+      authorizedToolCount: 15,
+      providerToolCount: 15,
+      authorizedToolNameSha256: "b".repeat(64),
+      providerToolNameSha256: "b".repeat(64),
+      authorizedToolSchemaSha256: "c".repeat(64),
+      providerToolSchemaSha256: "d".repeat(64),
+    },
+    startedAt: new Date().toISOString(),
+  });
+  return {
+    journal,
+    readRows: () =>
+      fs
+        .readFileSync(journal.filePath, "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as Record<string, unknown>),
+    dispose: () => {
+      journal.close();
+      fs.rmSync(repoRoot, { recursive: true, force: true });
+    },
+  };
 }
 
 function summarizeAssistantMessage(

@@ -35,6 +35,7 @@ import {
   v1jInstructionForArm,
   sha256 as sha256V1J,
   writeV1JSummary,
+  V1J_PREREGISTRATION_SHA256,
   V1JSerializationFailureError,
   type V1JCell,
   type V1JObservation,
@@ -126,6 +127,21 @@ const V1J_ACTION_LIVE_TEST = process.env.OPENCLAW_V1J_LIVE_TEST === "1";
 const V1J_ACTION_LIVE_AUTHORIZED = process.env.OPENCLAW_V1J_LIVE_EXECUTION_AUTHORIZED === "1";
 const V1J_ACTION_SMOKE_TEST = process.env.OPENCLAW_V1J_LIVE_SMOKE === "1";
 const V1J_ACTION_SMOKE_AUTHORIZED = process.env.OPENCLAW_V1J_LIVE_SMOKE_AUTHORIZED === "1";
+const V1J_ARM_C_PREFLIGHT_DIAGNOSTIC = process.env.OPENCLAW_V1J_ARM_C_PREFLIGHT_DIAGNOSTIC === "1";
+if (
+  V1J_ARM_C_PREFLIGHT_DIAGNOSTIC &&
+  (LIVE ||
+    V1J_ACTION_LIVE_TEST ||
+    V1J_ACTION_LIVE_AUTHORIZED ||
+    V1J_ACTION_SMOKE_TEST ||
+    V1J_ACTION_SMOKE_AUTHORIZED ||
+    V1J_SCHEMA_CAPTURE_MODE !== undefined ||
+    process.env.OPENCLAW_V1J_CELL_ALLOWLIST !== undefined ||
+    process.env.OPENCLAW_V1J_MAX_CELLS !== undefined ||
+    process.env.OPENCLAW_V1I_MODE !== undefined)
+) {
+  throw new Error("v1J Arm C preflight diagnostic cannot share another live execution mode");
+}
 import {
   ARM_B_INSTRUCTION,
   CONTEXT_LENGTH,
@@ -1220,6 +1236,9 @@ const describeV1JActionLive =
     : describe.skip;
 const describeV1JActionSmoke =
   V1J_ACTION_SMOKE_TEST || V1J_ACTION_SMOKE_AUTHORIZED ? describe : describe.skip;
+const describeV1JArmCPreflightDiagnostic = V1J_ARM_C_PREFLIGHT_DIAGNOSTIC
+  ? describe
+  : describe.skip;
 const describeFullLive =
   LIVE &&
   !SMOKE_TEST &&
@@ -1233,6 +1252,73 @@ const describeFullLive =
 const describeSmokeLive = SMOKE_TEST ? describe : describe.skip;
 const describeDiagnosticLive = DIAGNOSTIC_TEST ? describe : describe.skip;
 const LIVE_MODE = resolveV1IMode(LIVE, process.env.OPENCLAW_V1I_MODE);
+
+describeV1JArmCPreflightDiagnostic("v1J Arm C preflight-only diagnostic", () => {
+  it(
+    "captures only Arm C and terminates after its preflight outcome",
+    { timeout: 120_000 },
+    async () => {
+      if (!V1J_ARM_C_PREFLIGHT_DIAGNOSTIC || LIVE) {
+        throw new Error("v1J Arm C preflight requires its dedicated execution gate");
+      }
+      const protocol = readV1JPreregistration();
+      const head = assertV1JCommittedHarness(protocol);
+      const provenancePath = path.resolve(process.cwd(), V1J_SMOKE_PROVENANCE_PATH);
+      const provenance = JSON.parse(fs.readFileSync(provenancePath, "utf8")) as unknown;
+      assertV1JSmokeProvenance(provenance, protocol, head);
+      if (
+        V1J_PREREGISTRATION_SHA256 !==
+          "72f0d7c2c98038a09b767216a7a78c668b29971b8797a80c4f30a9d9c8af4172" ||
+        protocol.base.productionFrozen.activeFilteringEnabled !== false ||
+        ACTIVE_FILTERING_ENABLED !== false
+      ) {
+        throw new Error("v1J Arm C preflight frozen protocol/runtime guards failed");
+      }
+      const schemaGate = protocol.surfaceAndRuntime.schemaIntegrityGate;
+      if (
+        schemaGate.authorizedToolCount !== 15 ||
+        schemaGate.providerToolCount !== 15 ||
+        schemaGate.authorizedToolNameSha256 !==
+          "741f7983e4ba7652384ee83fed16b67f81e567b2231cfccbba8f58c19ee6837b" ||
+        schemaGate.providerToolNameSha256 !==
+          "741f7983e4ba7652384ee83fed16b67f81e567b2231cfccbba8f58c19ee6837b" ||
+        schemaGate.authorizedToolSchemaSha256 !==
+          "e82b1930002abb9d4784edcada56491af39420d36e292c9f9792256a2231f128" ||
+        schemaGate.providerToolSchemaSha256 !==
+          "e87b23c436597f65b0a76c5f91a49b53440178731718efdbc70a7a048cbf39b2"
+      ) {
+        throw new Error(
+          "v1J Arm C preflight schema fingerprints differ from the accepted baseline",
+        );
+      }
+      await assertLiveModelAvailable();
+      const caseId =
+        protocol.design.cells.find((entry) => entry.stratum === "TOOL_REQUIRED")?.caseId ??
+        "unknown";
+      const journal = createV1JArmCOnlyPreflightDiagnosticJournal({
+        repoRoot: process.cwd(),
+        harnessCommit: head,
+        caseId,
+        preflightId: `arm-c-only-${head.slice(0, 8)}-${process.pid}`,
+        pid: process.pid,
+      });
+      try {
+        journal.record("arm-c-only-entrypoint-guards-verified", {
+          v2Sha256: V1J_PREREGISTRATION_SHA256,
+          provenanceAmendmentAccepted: true,
+          schemaFingerprintsVerified: true,
+          activeFilteringEnabled: false,
+        });
+        await runV1JArmCPreflightOnly({
+          journal,
+          captureArmC: () => captureV1JPreflightSurface(protocol, "C", head, journal),
+        });
+      } finally {
+        journal.close();
+      }
+    },
+  );
+});
 
 describeV1JActionSmoke("v1J isolated live operational smoke", () => {
   it(
@@ -1443,11 +1529,10 @@ function assertV1JCommittedHarness(protocol: V1JProtocol): string {
     throw new Error("v1J refuses an explicit harness-commit override");
   }
   const head = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
-  const sourceStatus = execFileSync(
-    "git",
-    ["status", "--porcelain=v1", "--untracked-files=all", "--", "src"],
-    { encoding: "utf8" },
-  ).trim();
+  // Harness helpers are part of the evidence producer, so any tracked dirty path invalidates HEAD binding.
+  const sourceStatus = execFileSync("git", ["status", "--porcelain=v1", "--untracked-files=no"], {
+    encoding: "utf8",
+  }).trim();
   if (!/^[0-9a-f]{40}$/i.test(head) || sourceStatus || HARNESS_COMMIT !== head) {
     throw new Error("v1J requires a clean, committed harness at the actual HEAD");
   }
@@ -1484,6 +1569,7 @@ async function captureV1JPreflightSurface(
       v1cTop8: rankTop8(benchmarkCase.tools, benchmarkCase.query),
       requiredMappedTools: [],
       preferredToolOverride: null,
+      // The v1I result shape is A/B; v1J Arm C is applied by the explicit prompt override below.
       arm: "A",
       replicate: 1,
       attempt: 1,

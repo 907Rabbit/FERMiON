@@ -10,6 +10,7 @@ import {
 export const V1J_SMOKE_PROVENANCE_PATH =
   "artifacts/capability-intelligence/v1j-action-initiation/provenance-amendment.json";
 export const V1J_SMOKE_ARTIFACT_PARENT = "artifacts/capability-intelligence/v1j-action-initiation";
+export const V1J_ARM_C_PREFLIGHT_ARTIFACT_PREFIX = "arm-c-preflight-diagnostic-";
 export const V1J_FORMAL_ARTIFACT_RELATIVE_PATH =
   "artifacts/capability-intelligence/v1j-action-initiation/real-exact-run1";
 
@@ -98,11 +99,104 @@ export function createV1JPreflightDiagnosticJournal(input: {
     root,
     `preflight-${input.arm.toLowerCase()}-${input.pid}-${Date.now()}-${input.preflightId.replace(/[^a-zA-Z0-9_-]/gu, "_")}.jsonl`,
   );
-  const relative = path.relative(path.resolve(input.repoRoot, V1J_SMOKE_ARTIFACT_PARENT), filePath);
-  if (relative.startsWith("..") || path.isAbsolute(relative)) {
+  assertV1JDiagnosticFilePath(input.repoRoot, root, filePath);
+  return createV1JPreflightDiagnosticJournalAtPath(input, root, filePath, {
+    createRootRecursively: true,
+  });
+}
+
+export function createV1JArmCOnlyPreflightDiagnosticJournal(input: {
+  repoRoot: string;
+  harnessCommit: string;
+  caseId: string;
+  preflightId: string;
+  pid: number;
+  startedAtMs?: number;
+}): V1JPreflightDiagnosticJournal {
+  if (!/^[0-9a-f]{40}$/i.test(input.harnessCommit)) {
+    throw new Error("v1J Arm C diagnostics require the actual full harness SHA");
+  }
+  const root = path.resolve(
+    input.repoRoot,
+    V1J_SMOKE_ARTIFACT_PARENT,
+    `${V1J_ARM_C_PREFLIGHT_ARTIFACT_PREFIX}${input.harnessCommit}`,
+  );
+  const formalRoot = path.resolve(input.repoRoot, V1J_FORMAL_ARTIFACT_RELATIVE_PATH);
+  const smokeRoot = resolveV1JSmokeRoot(input.repoRoot, input.harnessCommit);
+  if (pathsOverlap(root, formalRoot) || pathsOverlap(root, smokeRoot)) {
+    throw new Error("v1J Arm C diagnostics path overlaps formal or smoke artifacts");
+  }
+  const parent = path.dirname(root);
+  const filePath = path.join(root, "arm-c-preflight.jsonl");
+  assertV1JDiagnosticFilePath(input.repoRoot, root, filePath);
+  fs.mkdirSync(parent, { recursive: true });
+  fs.mkdirSync(root, { recursive: false });
+  return createV1JPreflightDiagnosticJournalAtPath({ ...input, arm: "C" }, root, filePath, {
+    rootAlreadyCreated: true,
+    checkFormalStateEmpty: false,
+    entrypointGuards: {
+      armAPreflightReached: false,
+      smokeScheduleReached: false,
+      formalArtifactTouched: false,
+      normalSmokeArtifactTouched: false,
+    },
+  });
+}
+
+function assertV1JDiagnosticFilePath(repoRoot: string, root: string, filePath: string): void {
+  const parent = path.resolve(repoRoot, V1J_SMOKE_ARTIFACT_PARENT);
+  const rootRelative = path.relative(parent, root);
+  const fileRelative = path.relative(root, filePath);
+  if (
+    rootRelative === ".." ||
+    rootRelative.startsWith(`..${path.sep}`) ||
+    path.isAbsolute(rootRelative) ||
+    fileRelative === ".." ||
+    fileRelative.startsWith(`..${path.sep}`) ||
+    path.isAbsolute(fileRelative)
+  ) {
     throw new Error("v1J preflight diagnostics path escaped its artifact root");
   }
-  fs.mkdirSync(root, { recursive: true });
+}
+
+function pathsOverlap(left: string, right: string): boolean {
+  const leftRelative = path.relative(left, right);
+  const rightRelative = path.relative(right, left);
+  const isWithin = (relative: string) =>
+    relative === "" ||
+    (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+  return isWithin(leftRelative) || isWithin(rightRelative);
+}
+
+function createV1JPreflightDiagnosticJournalAtPath(
+  input: {
+    repoRoot: string;
+    harnessCommit: string;
+    arm: "A" | "C";
+    caseId: string;
+    preflightId: string;
+    pid: number;
+    startedAtMs?: number;
+  },
+  root: string,
+  filePath: string,
+  options: {
+    createRootRecursively?: boolean;
+    rootAlreadyCreated?: boolean;
+    checkFormalStateEmpty?: boolean;
+    entrypointGuards?: {
+      armAPreflightReached: false;
+      smokeScheduleReached: false;
+      formalArtifactTouched: false;
+      normalSmokeArtifactTouched: false;
+    };
+  } = {},
+): V1JPreflightDiagnosticJournal {
+  if (options.createRootRecursively) {
+    fs.mkdirSync(root, { recursive: true });
+  } else if (!options.rootAlreadyCreated) {
+    fs.mkdirSync(root, { recursive: false });
+  }
   const fd = fs.openSync(filePath, "wx");
   const startedAtMs = input.startedAtMs ?? Date.now();
   const counters: V1JPreflightCounters = {
@@ -121,7 +215,9 @@ export function createV1JPreflightDiagnosticJournal(input: {
   let eventIndex = 0;
   let closed = false;
   const record = (event: string, details: Record<string, unknown> = {}) => {
-    assertV1JFormalStateEmpty(input.repoRoot);
+    if (options.checkFormalStateEmpty !== false) {
+      assertV1JFormalStateEmpty(input.repoRoot);
+    }
     if (closed) {
       throw new Error("v1J preflight diagnostic journal is closed");
     }
@@ -138,6 +234,7 @@ export function createV1JPreflightDiagnosticJournal(input: {
       preflightId: input.preflightId,
       counters: { ...counters },
       ...details,
+      ...(options.entrypointGuards ? { entrypointGuards: options.entrypointGuards } : {}),
     };
     fs.writeSync(fd, `${JSON.stringify(row)}\n`, undefined, "utf8");
     fs.fsyncSync(fd);
@@ -191,6 +288,37 @@ export function createV1JPreflightDiagnosticJournal(input: {
       }
     },
   };
+}
+
+export async function runV1JArmCPreflightOnly<T>(input: {
+  journal: V1JPreflightDiagnosticJournal;
+  captureArmC: () => Promise<T>;
+}): Promise<T> {
+  if (input.journal.arm !== "C") {
+    throw new Error("v1J Arm C diagnostic refuses a non-C journal");
+  }
+  const entrypointGuards = {
+    armAPreflightReached: false,
+    smokeScheduleReached: false,
+    formalArtifactTouched: false,
+    normalSmokeArtifactTouched: false,
+  } as const;
+  input.journal.record("arm-c-only-preflight-start", { entrypointGuards });
+  try {
+    const surface = await input.captureArmC();
+    input.journal.record("arm-c-only-preflight-terminated", {
+      outcome: "complete",
+      entrypointGuards,
+    });
+    return surface;
+  } catch (error) {
+    input.journal.record("arm-c-only-preflight-terminated", {
+      outcome: "failed",
+      errorName: error instanceof Error ? error.name : typeof error,
+      entrypointGuards,
+    });
+    throw error;
+  }
 }
 
 const SMOKE_CASES = [

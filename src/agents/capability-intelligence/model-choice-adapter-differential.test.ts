@@ -3,6 +3,10 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import {
+  readV1JPreregistration,
+  V1J_PREREGISTRATION_PATH,
+} from "../../../test/helpers/agents/model-choice-action-initiation.js";
+import {
   assertV1JAdapterDifferentialRequestBudget,
   assertV1JAdapterDifferentialRequestMatch,
   assertV1JAdapterDifferentialPreflight,
@@ -48,6 +52,34 @@ const requestBody = {
 };
 
 describe("v1J adapter differential diagnostics", () => {
+  it("resolves the frozen preregistration while an unauthorized config remains fail-closed", () => {
+    const protocolPath = path.resolve(process.cwd(), V1J_PREREGISTRATION_PATH);
+    expect(fs.existsSync(protocolPath)).toBe(true);
+    expect(readV1JPreregistration().experimentId).toBe("v1J-ACTION-INITIATION");
+
+    expect(() =>
+      assertV1JAdapterDifferentialPreflight({
+        env: {
+          [V1J_ADAPTER_DIFFERENTIAL_RUN_FLAG]: "1",
+          [V1J_ADAPTER_DIFFERENTIAL_COMMIT_FLAG]: head,
+        },
+        head,
+        trackedTreeClean: true,
+        activeFilteringEnabled: false,
+        modelId: "qwen/qwen3.5-9b",
+        provider: "lmstudio",
+        contextLength: 262_144,
+        modelConfigHash: "2a219399da63b03057ceaf46a9dd1d74e76be20ead626f07af2b8ba45f37c529",
+        protocolSha256: "72f0d7c2c98038a09b767216a7a78c668b29971b8797a80c4f30a9d9c8af4172",
+        detachedProtocolSha256:
+          "72f0d7c2c98038a09b767216a7a78c668b29971b8797a80c4f30a9d9c8af4172  preregistration-v2.json",
+        schema,
+        provenanceAccepted: true,
+        artifactExists: false,
+      }),
+    ).toThrow(/exact commit-bound authorization flags/);
+  });
+
   it("requires exact commit-bound, protocol, model, schema, and filtering gates", () => {
     const input = {
       env: {

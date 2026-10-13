@@ -41,6 +41,7 @@ import {
   sha256 as sha256V1J,
   writeV1JSummary,
   V1J_PREREGISTRATION_SHA256,
+  V1J_PREREGISTRATION_PATH,
   V1JSerializationFailureError,
   type V1JCell,
   type V1JObservation,

@@ -1,6 +1,15 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { isRecord } from "@openclaw/normalization-core/record-coerce";
+import {
+  getGlobalPluginRegistry,
+  initializeGlobalHookRunner,
+  resetGlobalHookRunner,
+} from "../../../src/plugins/hook-runner-global.js";
+import { createMockPluginRegistry } from "../../../src/plugins/hooks.test-fixtures.js";
+import type { PluginRegistry } from "../../../src/plugins/registry-types.js";
+import { getPluginRuntimeGenerationRegistry } from "../../../src/plugins/runtime/generation-scope.js";
 import {
   runV1JProviderTransportControls,
   type V1JProviderControlFetch,
@@ -31,6 +40,169 @@ export type V1JAdapterDifferentialRequestMetrics = {
   canonicalRequestSha256: string;
 };
 
+export const V1J_ADAPTER_DIFFERENTIAL_MAX_RAW_REQUESTS = 1;
+export const V1J_ADAPTER_DIFFERENTIAL_MAX_ADAPTER_REQUESTS = 2;
+export const V1J_ADAPTER_DIFFERENTIAL_MAX_TOTAL_REQUESTS = 3;
+
+export type V1JAdapterDifferentialToolGuard = {
+  ensureInstalled: () => void;
+  restore: () => void;
+  readDispatches: () => number;
+  blockedToolCalls: () => number;
+};
+
+/** Installs a diagnostic-only pre-execution policy without changing tool exposure. */
+export function installV1JAdapterDifferentialToolGuard(input: {
+  workspaceRoot: string;
+  journal?: V1JAdapterDifferentialJournal;
+}): V1JAdapterDifferentialToolGuard {
+  const workspaceRoot = fs.realpathSync(input.workspaceRoot);
+  const expectedTarget = path.join(workspaceRoot, "smoke-reference.txt");
+  let priorRegistry = getGlobalPluginRegistry();
+  let installedRegistry: PluginRegistry | undefined;
+  const generationRegistries = new Map<PluginRegistry, PluginRegistry["typedHooks"][number]>();
+  let readDispatchCount = 0;
+  let blockedCount = 0;
+  let blocked = false;
+  let restored = false;
+
+  const allowExactRead = (toolName: unknown, params: unknown): boolean => {
+    if (blocked || toolName !== "read" || !isRecord(params)) {
+      return false;
+    }
+    const keys = Object.keys(params);
+    if (keys.length !== 1 || keys[0] !== "path" || params.path !== "smoke-reference.txt") {
+      return false;
+    }
+    try {
+      const target = fs.lstatSync(expectedTarget);
+      return (
+        target.isFile() &&
+        !target.isSymbolicLink() &&
+        fs.realpathSync(expectedTarget) === expectedTarget &&
+        path.dirname(expectedTarget) === workspaceRoot &&
+        path.resolve(workspaceRoot, params.path) === expectedTarget
+      );
+    } catch {
+      return false;
+    }
+  };
+
+  const guardRegistry = createMockPluginRegistry([
+    {
+      pluginId: "v1j-adapter-differential-guard",
+      hookName: "before_tool_call",
+      registrationId: "v1j-adapter-differential-guard",
+      priority: Number.MAX_SAFE_INTEGER,
+      handler: (event) => {
+        const allowed = allowExactRead(event.toolName, event.params);
+        if (allowed) {
+          readDispatchCount += 1;
+          input.journal?.record("adapter-tool-execution-guard", {
+            outcome: "read-allowed",
+            allowedReadDispatches: readDispatchCount,
+          });
+          return { params: { path: "smoke-reference.txt" } };
+        }
+        blocked = true;
+        blockedCount += 1;
+        input.journal?.record("adapter-tool-execution-guard", {
+          outcome: "blocked",
+          blockedToolCalls: blockedCount,
+        });
+        return {
+          block: true,
+          blockReason: "This diagnostic permits only reading its smoke reference file.",
+        };
+      },
+    },
+  ]);
+
+  const ensureInstalled = () => {
+    if (restored) {
+      throw new Error("v1J adapter differential tool guard was already restored");
+    }
+    const generationRegistry = getPluginRuntimeGenerationRegistry();
+    if (generationRegistry && !generationRegistries.has(generationRegistry)) {
+      generationRegistry.typedHooks.push(...guardRegistry.typedHooks);
+      generationRegistry.plugins.push(...guardRegistry.plugins);
+      generationRegistries.set(generationRegistry, guardRegistry.typedHooks[0]!);
+      if (
+        !generationRegistry.typedHooks.some(
+          (hook) => hook.registrationId === "v1j-adapter-differential-guard",
+        )
+      ) {
+        throw new Error("v1J adapter differential guard did not bind to the active runtime");
+      }
+    }
+    const activeRegistry = getGlobalPluginRegistry();
+    if (installedRegistry && activeRegistry === installedRegistry) {
+      return;
+    }
+    priorRegistry = activeRegistry;
+    const registry = activeRegistry
+      ? ({
+          ...activeRegistry,
+          hooks: [...activeRegistry.hooks],
+          typedHooks: [...activeRegistry.typedHooks, ...guardRegistry.typedHooks],
+          plugins: [...activeRegistry.plugins, ...guardRegistry.plugins],
+        } as PluginRegistry)
+      : guardRegistry;
+    installedRegistry = registry;
+    initializeGlobalHookRunner(registry);
+  };
+
+  ensureInstalled();
+  return {
+    ensureInstalled,
+    readDispatches: () => readDispatchCount,
+    blockedToolCalls: () => blockedCount,
+    restore: () => {
+      if (restored) {
+        return;
+      }
+      restored = true;
+      for (const [registry, hook] of generationRegistries) {
+        const hookIndex = registry.typedHooks.indexOf(hook);
+        if (hookIndex >= 0) {
+          registry.typedHooks.splice(hookIndex, 1);
+        }
+        const pluginIndex = registry.plugins.findIndex(
+          (plugin) => plugin.id === "v1j-adapter-differential-guard",
+        );
+        if (pluginIndex >= 0) {
+          registry.plugins.splice(pluginIndex, 1);
+        }
+      }
+      if (getGlobalPluginRegistry() !== installedRegistry) {
+        return;
+      }
+      if (priorRegistry) {
+        initializeGlobalHookRunner(priorRegistry);
+      } else {
+        resetGlobalHookRunner();
+      }
+    },
+  };
+}
+
+export function assertV1JAdapterDifferentialRequestBudget(input: {
+  rawRequests: number;
+  adapterRequests: number;
+}): void {
+  if (
+    !Number.isSafeInteger(input.rawRequests) ||
+    !Number.isSafeInteger(input.adapterRequests) ||
+    input.rawRequests < 0 ||
+    input.adapterRequests < 0 ||
+    input.rawRequests > V1J_ADAPTER_DIFFERENTIAL_MAX_RAW_REQUESTS ||
+    input.adapterRequests > V1J_ADAPTER_DIFFERENTIAL_MAX_ADAPTER_REQUESTS ||
+    input.rawRequests + input.adapterRequests > V1J_ADAPTER_DIFFERENTIAL_MAX_TOTAL_REQUESTS
+  ) {
+    throw new Error("v1J adapter differential exceeded its fixed model-request budget");
+  }
+}
+
 export function assertV1JAdapterDifferentialRequestMatch(
   rawRequest: Record<string, unknown>,
   adapterRequest: Record<string, unknown>,
@@ -56,6 +228,8 @@ const SAFE_DETAIL_KEYS = new Set([
   "responseChunkCount",
   "responseByteCount",
   "toolCallCount",
+  "allowedReadDispatches",
+  "blockedToolCalls",
   "executionCount",
   "correlationStatus",
   "modelLoopStatus",
@@ -202,7 +376,7 @@ export async function runV1JAdapterDifferentialRawTransport(input: {
     requests: [{ mode: "C", requestObject: input.requestBody }],
     fetchImpl: (request, init) => {
       dispatches += 1;
-      if (dispatches > 1) {
+      if (dispatches > V1J_ADAPTER_DIFFERENTIAL_MAX_RAW_REQUESTS) {
         throw new Error("v1J adapter differential raw transport exceeded its one-request limit");
       }
       return input.fetchImpl(request, init);
@@ -277,7 +451,7 @@ export function createV1JAdapterDifferentialJournal(input: {
     modelConfigHash: input.modelConfigHash,
     schemaFingerprint: input.schemaFingerprint,
     comparisons: ["raw-transport", "adapter-model-loop"],
-    maxModelRequests: 3,
+    maxModelRequests: V1J_ADAPTER_DIFFERENTIAL_MAX_TOTAL_REQUESTS,
     activeFilteringEnabled: false,
     formalStateTouched: false,
     smokeStateTouched: false,

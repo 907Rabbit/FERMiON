@@ -49,11 +49,15 @@ import {
 import {
   assertV1JAdapterDifferentialRequestMatch,
   assertV1JAdapterDifferentialPreflight,
+  assertV1JAdapterDifferentialRequestBudget,
   createV1JAdapterDifferentialJournal,
+  installV1JAdapterDifferentialToolGuard,
   runV1JAdapterDifferentialRawTransport,
   summarizeV1JAdapterDifferentialRequest,
   V1J_ADAPTER_DIFFERENTIAL_AUTHORIZED_FLAG,
   V1J_ADAPTER_DIFFERENTIAL_COMMIT_FLAG,
+  V1J_ADAPTER_DIFFERENTIAL_MAX_ADAPTER_REQUESTS,
+  V1J_ADAPTER_DIFFERENTIAL_MAX_TOTAL_REQUESTS,
   V1J_ADAPTER_DIFFERENTIAL_PREFIX,
   V1J_ADAPTER_DIFFERENTIAL_RUN_FLAG,
 } from "../../../test/helpers/agents/model-choice-adapter-differential.js";
@@ -1889,6 +1893,7 @@ describeV1JAdapterDifferential("v1J raw-transport versus adapter differential", 
       let rawResult: Awaited<ReturnType<typeof runV1JAdapterDifferentialRawTransport>> | undefined;
       let observation: V1JObservation | undefined;
       let adapterDispatches = 0;
+      let adapterToolGuard: ReturnType<typeof installV1JAdapterDifferentialToolGuard> | undefined;
       let adapterRequestMatch:
         | { rawRequestSha256: string; adapterRequestSha256: string }
         | undefined;
@@ -1909,6 +1914,14 @@ describeV1JAdapterDifferential("v1J raw-transport versus adapter differential", 
           elapsedMs: rawResult.elapsedMs,
           outcome: rawResult.streamEnd ? "complete" : "incomplete",
         });
+        assertV1JAdapterDifferentialRequestBudget({
+          rawRequests: rawResult.requestDispatchStarted ? 1 : 0,
+          adapterRequests: 0,
+        });
+        adapterToolGuard = installV1JAdapterDifferentialToolGuard({
+          workspaceRoot: workspaceDir,
+          journal,
+        });
         journal.record("adapter-path-start", { requestIndex: 1, outcome: "started" });
         observation = await executeV1JCell({
           protocol,
@@ -1920,6 +1933,7 @@ describeV1JAdapterDifferential("v1J raw-transport versus adapter differential", 
           allowNoToolTerminalEvidence: true,
           runIdPrefix: "v1j-adapter-differential",
           lifecycleJournal: journal,
+          onAssistantMessage: () => adapterToolGuard?.ensureInstalled(),
           onRequestCaptured: (request, requestIndex) => {
             if (requestIndex === 1) {
               adapterRequestMatch = assertV1JAdapterDifferentialRequestMatch(
@@ -1939,14 +1953,25 @@ describeV1JAdapterDifferential("v1J raw-transport versus adapter differential", 
           },
           onProviderDispatchAttempt: (count) => {
             adapterDispatches = count;
+            assertV1JAdapterDifferentialRequestBudget({
+              rawRequests: rawResult?.requestDispatchStarted ? 1 : 0,
+              adapterRequests: count,
+            });
             journal.record("adapter-dispatch-attempt", {
               requestIndex: count,
-              outcome: count <= 2 ? "within-bound" : "hard-stop",
+              outcome:
+                count <= V1J_ADAPTER_DIFFERENTIAL_MAX_ADAPTER_REQUESTS
+                  ? "within-bound"
+                  : "hard-stop",
             });
-            if (count > 2) {
-              throw new Error("v1J adapter differential exceeded two adapter model requests");
-            }
           },
+        });
+        if (adapterToolGuard.blockedToolCalls() > 0) {
+          throw new Error("v1J adapter differential blocked an unapproved tool selection");
+        }
+        assertV1JAdapterDifferentialRequestBudget({
+          rawRequests: rawResult.requestDispatchStarted ? 1 : 0,
+          adapterRequests: adapterDispatches,
         });
         journal.record("differential-complete", {
           requestIndex: 1,
@@ -1955,6 +1980,8 @@ describeV1JAdapterDifferential("v1J raw-transport versus adapter differential", 
           modelLoopStatus: observation.invalidReason ?? "completed",
           toolCallCount: observation.toolCalls.length,
           executionCount: observation.executions.length,
+          allowedReadDispatches: adapterToolGuard.readDispatches(),
+          blockedToolCalls: adapterToolGuard.blockedToolCalls(),
           correlationStatus: observation.correlationStatus,
           terminalEvidenceComplete: observation.terminalEvidenceComplete,
         });
@@ -1971,6 +1998,7 @@ describeV1JAdapterDifferential("v1J raw-transport versus adapter differential", 
         });
         throw error;
       } finally {
+        adapterToolGuard?.restore();
         try {
           fs.rmSync(workspaceDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
         } catch (error) {
@@ -1989,6 +2017,8 @@ describeV1JAdapterDifferential("v1J raw-transport versus adapter differential", 
         `${JSON.stringify({
           rawTransport: rawResult,
           adapterDispatches,
+          maxAdapterDispatches: V1J_ADAPTER_DIFFERENTIAL_MAX_ADAPTER_REQUESTS,
+          maxTotalModelRequests: V1J_ADAPTER_DIFFERENTIAL_MAX_TOTAL_REQUESTS,
           adapterRequestMatch: Boolean(adapterRequestMatch),
           terminalEvidenceComplete: observation?.terminalEvidenceComplete ?? false,
           correlationStatus: observation?.correlationStatus ?? "UNPROVABLE",
@@ -2532,6 +2562,7 @@ async function executeV1JCell(input: {
   runIdPrefix?: string;
   lifecycleJournal?: V1JLifecycleJournal;
   onRequestCaptured?: (request: CapturedModelRequest, requestIndex: number) => void;
+  onAssistantMessage?: (message: AssistantMessage, modelTurnIndex: number) => void;
   onProviderDispatchAttempt?: (count: number) => void;
 }): Promise<V1JObservation> {
   const { protocol, cell, attempt, head } = input;
@@ -2587,6 +2618,7 @@ async function executeV1JCell(input: {
         capturePromptInstruction: v1jInstructionForArm(protocol, cell.arm),
         onAuthorizedToolsCaptured: (tools) =>
           authorizedTools.splice(0, authorizedTools.length, ...tools),
+        onAssistantMessage: input.onAssistantMessage,
         onRequestCaptured: (request) => {
           const requestIndex = ++capturedProviderRequestCount;
           providerRequests.push(request);

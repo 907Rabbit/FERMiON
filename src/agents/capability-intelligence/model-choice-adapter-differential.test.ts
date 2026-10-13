@@ -1,19 +1,33 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
+  assertV1JAdapterDifferentialRequestBudget,
   assertV1JAdapterDifferentialRequestMatch,
   assertV1JAdapterDifferentialPreflight,
   createV1JAdapterDifferentialJournal,
+  installV1JAdapterDifferentialToolGuard,
   runV1JAdapterDifferentialRawTransport,
   summarizeV1JAdapterDifferentialRequest,
   V1J_ADAPTER_DIFFERENTIAL_AUTHORIZED_FLAG,
   V1J_ADAPTER_DIFFERENTIAL_COMMIT_FLAG,
+  V1J_ADAPTER_DIFFERENTIAL_MAX_ADAPTER_REQUESTS,
+  V1J_ADAPTER_DIFFERENTIAL_MAX_RAW_REQUESTS,
+  V1J_ADAPTER_DIFFERENTIAL_MAX_TOTAL_REQUESTS,
   V1J_ADAPTER_DIFFERENTIAL_PARENT,
   V1J_ADAPTER_DIFFERENTIAL_PREFIX,
   V1J_ADAPTER_DIFFERENTIAL_RUN_FLAG,
 } from "../../../test/helpers/agents/model-choice-adapter-differential.js";
+import {
+  createPluginMetadataSnapshot,
+  makeRegistry,
+} from "../../config/plugin-auto-enable.test-helpers.js";
+import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import { createEmptyPluginRegistry } from "../../plugins/registry-empty.js";
+import { withPluginRuntimeGenerationScope } from "../../plugins/runtime/generation-scope.js";
+import { wrapToolWithBeforeToolCallHook } from "../agent-tools.before-tool-call.js";
+import type { AnyAgentTool } from "../tools/common.js";
 
 const head = "a".repeat(40);
 const schema = {
@@ -102,7 +116,134 @@ describe("v1J adapter differential diagnostics", () => {
     ).toThrow(/request bodies differ/);
   });
 
-  it("runs one raw streaming request and records only response progress", async () => {
+  it("keeps raw-plus-adapter dispatches within one raw and two adapter requests", () => {
+    expect(V1J_ADAPTER_DIFFERENTIAL_MAX_RAW_REQUESTS).toBe(1);
+    expect(V1J_ADAPTER_DIFFERENTIAL_MAX_ADAPTER_REQUESTS).toBe(2);
+    expect(V1J_ADAPTER_DIFFERENTIAL_MAX_TOTAL_REQUESTS).toBe(3);
+    expect(() =>
+      assertV1JAdapterDifferentialRequestBudget({ rawRequests: 1, adapterRequests: 2 }),
+    ).not.toThrow();
+    for (const budget of [
+      { rawRequests: 2, adapterRequests: 0 },
+      { rawRequests: 1, adapterRequests: 3 },
+      { rawRequests: 0, adapterRequests: 4 },
+    ]) {
+      expect(() => assertV1JAdapterDifferentialRequestBudget(budget)).toThrow(/request budget/);
+    }
+  });
+
+  it("guards adapter tool execution before the tool body runs", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "v1j-adapter-diff-tool-guard-"));
+    fs.writeFileSync(path.join(root, "smoke-reference.txt"), "smoke-token-47\n", {
+      encoding: "utf8",
+      flag: "wx",
+    });
+    const guard = installV1JAdapterDifferentialToolGuard({ workspaceRoot: root });
+    const config = {} as OpenClawConfig;
+    const generationRegistry = createEmptyPluginRegistry();
+    const metadataSnapshot = createPluginMetadataSnapshot({
+      config,
+      manifestRegistry: makeRegistry([]),
+      workspaceDir: root,
+    });
+    const callTool = async (name: string, params: Record<string, unknown>) => {
+      const execute = vi.fn(async () => ({ content: [], details: { executed: true } }));
+      const tool = wrapToolWithBeforeToolCallHook({
+        name,
+        parameters: {},
+        execute,
+      } as unknown as AnyAgentTool);
+      await tool.execute(
+        `call-${name}`,
+        params,
+        undefined,
+        {} as Parameters<typeof tool.execute>[3],
+      );
+      return execute;
+    };
+    try {
+      await withPluginRuntimeGenerationScope(
+        { config, metadataSnapshot, pluginRegistry: generationRegistry },
+        async () => {
+          guard.ensureInstalled();
+          const read = await callTool("read", { path: "smoke-reference.txt" });
+          expect(read).toHaveBeenCalledOnce();
+          expect(
+            generationRegistry.typedHooks.some(
+              (hook) => hook.registrationId === "v1j-adapter-differential-guard",
+            ),
+          ).toBe(true);
+        },
+      );
+      expect(guard.readDispatches()).toBe(1);
+      guard.restore();
+    } finally {
+      guard.restore();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks out-of-workspace reads and every other tool before execution", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "v1j-adapter-diff-tool-block-"));
+    fs.writeFileSync(path.join(root, "smoke-reference.txt"), "smoke-token-47\n", {
+      encoding: "utf8",
+      flag: "wx",
+    });
+    const guard = installV1JAdapterDifferentialToolGuard({ workspaceRoot: root });
+    const callTool = async (name: string, params: Record<string, unknown>) => {
+      const execute = vi.fn(async () => ({ content: [], details: { executed: true } }));
+      const tool = wrapToolWithBeforeToolCallHook({
+        name,
+        parameters: {},
+        execute,
+      } as unknown as AnyAgentTool);
+      await tool.execute(
+        `call-${name}`,
+        params,
+        undefined,
+        {} as Parameters<typeof tool.execute>[3],
+      );
+      return execute;
+    };
+    try {
+      for (const blockedCall of [
+        { name: "read", params: { path: "../artifacts/formal.jsonl" } },
+        { name: "read", params: { path: path.resolve(root, "../smoke-result.json") } },
+        {
+          name: "read",
+          params: {
+            path: path.resolve(root, "../../real-exact-run1/observations.jsonl"),
+          },
+        },
+        {
+          name: "read",
+          params: { path: path.resolve(root, "../../smoke-befc9628/smoke-result.json") },
+        },
+        { name: "write", params: { path: "smoke-reference.txt", content: "changed" } },
+        { name: "edit", params: { path: "smoke-reference.txt" } },
+        { name: "exec", params: { command: "whoami" } },
+        { name: "apply_patch", params: { patch: "not permitted" } },
+        { name: "process", params: { action: "list" } },
+        { name: "sessions_list", params: {} },
+        { name: "sessions_spawn", params: {} },
+        { name: "memory_get", params: {} },
+        { name: "memory_search", params: {} },
+        { name: "web_fetch", params: { url: "https://example.com" } },
+        { name: "web_search", params: { query: "not permitted" } },
+        { name: "message", params: { text: "not permitted" } },
+      ]) {
+        const execute = await callTool(blockedCall.name, blockedCall.params);
+        expect(execute).not.toHaveBeenCalled();
+      }
+      expect(guard.blockedToolCalls()).toBe(16);
+      expect(guard.readDispatches()).toBe(0);
+    } finally {
+      guard.restore();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("runs one raw streaming request without any tool-execution path", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "v1j-adapter-diff-raw-"));
     const journal = createV1JAdapterDifferentialJournal({
       repoRoot: root,

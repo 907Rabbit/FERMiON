@@ -8,6 +8,16 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { configureAiTransportHost, getAiTransportHost } from "@openclaw/ai";
 import { describe, expect, it, vi } from "vitest";
 import {
+  appendV1JSmokeRecord,
+  assertV1JFormalStateEmpty,
+  assertV1JSmokeProvenance,
+  buildV1JSmokeSchedule,
+  createV1JSmokeArtifactState,
+  finalizeV1JSmokeArtifacts,
+  V1J_SMOKE_PROVENANCE_PATH,
+  type V1JSmokeCell,
+} from "../../../test/helpers/agents/model-choice-action-initiation-smoke.js";
+import {
   assertV1JRuntimeGate,
   buildV1JSchedule,
   canonicalV1JToolNames,
@@ -109,6 +119,8 @@ const LIVE = process.env.OPENCLAW_V1I_LIVE_TEST === "1";
 const V1J_SCHEMA_CAPTURE_MODE = process.env.OPENCLAW_V1J_SCHEMA_CAPTURE;
 const V1J_ACTION_LIVE_TEST = process.env.OPENCLAW_V1J_LIVE_TEST === "1";
 const V1J_ACTION_LIVE_AUTHORIZED = process.env.OPENCLAW_V1J_LIVE_EXECUTION_AUTHORIZED === "1";
+const V1J_ACTION_SMOKE_TEST = process.env.OPENCLAW_V1J_LIVE_SMOKE === "1";
+const V1J_ACTION_SMOKE_AUTHORIZED = process.env.OPENCLAW_V1J_LIVE_SMOKE_AUTHORIZED === "1";
 import {
   ARM_B_INSTRUCTION,
   CONTEXT_LENGTH,
@@ -1194,20 +1206,143 @@ const SMOKE_TEST = LIVE && process.env.OPENCLAW_V1I_SMOKE_TEST === "1";
 const DIAGNOSTIC_TEST = LIVE && process.env.OPENCLAW_V1I_DIAGNOSTIC_TEST === "1";
 const describeV1JSchemaCapture = V1J_SCHEMA_CAPTURE_MODE === undefined ? describe.skip : describe;
 const describeV1JActionLive =
-  V1J_ACTION_LIVE_TEST && V1J_ACTION_LIVE_AUTHORIZED && V1J_SCHEMA_CAPTURE_MODE === undefined
+  V1J_ACTION_LIVE_TEST &&
+  V1J_ACTION_LIVE_AUTHORIZED &&
+  !V1J_ACTION_SMOKE_TEST &&
+  !V1J_ACTION_SMOKE_AUTHORIZED &&
+  V1J_SCHEMA_CAPTURE_MODE === undefined
     ? describe
     : describe.skip;
+const describeV1JActionSmoke =
+  V1J_ACTION_SMOKE_TEST || V1J_ACTION_SMOKE_AUTHORIZED ? describe : describe.skip;
 const describeFullLive =
   LIVE &&
   !SMOKE_TEST &&
   !DIAGNOSTIC_TEST &&
   V1J_SCHEMA_CAPTURE_MODE === undefined &&
-  !V1J_ACTION_LIVE_TEST
+  !V1J_ACTION_LIVE_TEST &&
+  !V1J_ACTION_SMOKE_TEST &&
+  !V1J_ACTION_SMOKE_AUTHORIZED
     ? describe
     : describe.skip;
 const describeSmokeLive = SMOKE_TEST ? describe : describe.skip;
 const describeDiagnosticLive = DIAGNOSTIC_TEST ? describe : describe.skip;
 const LIVE_MODE = resolveV1IMode(LIVE, process.env.OPENCLAW_V1I_MODE);
+
+describeV1JActionSmoke("v1J isolated live operational smoke", () => {
+  it(
+    "captures four smoke-only cells without touching formal v1J state",
+    { timeout: 600_000 },
+    async () => {
+      if (
+        !V1J_ACTION_SMOKE_TEST ||
+        !V1J_ACTION_SMOKE_AUTHORIZED ||
+        V1J_ACTION_LIVE_TEST ||
+        V1J_ACTION_LIVE_AUTHORIZED ||
+        LIVE ||
+        V1J_SCHEMA_CAPTURE_MODE !== undefined
+      ) {
+        throw new Error("v1J smoke requires only its two dedicated authorization flags");
+      }
+      const protocol = readV1JPreregistration();
+      const head = assertV1JCommittedHarness(protocol);
+      const repoRoot = process.cwd();
+      assertV1JFormalStateEmpty(repoRoot);
+      const provenancePath = path.resolve(repoRoot, V1J_SMOKE_PROVENANCE_PATH);
+      const provenance = JSON.parse(fs.readFileSync(provenancePath, "utf8")) as unknown;
+      assertV1JSmokeProvenance(provenance, protocol, head);
+      if (ACTIVE_FILTERING_ENABLED !== false) {
+        throw new Error("v1J smoke requires active filtering to remain disabled");
+      }
+      await assertLiveModelAvailable();
+      const surfaceA = await captureV1JPreflightSurface(protocol, "A", head);
+      const surfaceC = await captureV1JPreflightSurface(protocol, "C", head);
+      if (canonicalizeV1IValue(surfaceA) !== canonicalizeV1IValue(surfaceC)) {
+        throw new Error("v1J smoke A/C provider schema preflight mismatch");
+      }
+      const schedule = buildV1JSmokeSchedule(protocol);
+      const artifactState = createV1JSmokeArtifactState({
+        repoRoot,
+        harnessCommit: head,
+        protocol,
+        modelConfigHash: hashV1ICanonical(modelConfigIdentity()),
+        schemaFingerprints: surfaceA,
+        startedAt: new Date().toISOString(),
+      });
+      let hardStop: Error | undefined;
+      for (const cell of schedule) {
+        const workspaceDir = fs.mkdtempSync(path.join(os.tmpdir(), "v1j-smoke-cell-"));
+        let observation: V1JObservation;
+        let workspaceCleanupComplete: boolean;
+        try {
+          if (cell.caseId === "smoke-tool-required") {
+            fs.writeFileSync(path.join(workspaceDir, "smoke-reference.txt"), "smoke-token-47\n", {
+              encoding: "utf8",
+              flag: "wx",
+            });
+          }
+          observation = await executeV1JCell({
+            protocol,
+            cell,
+            attempt: 1,
+            head,
+            benchmarkOverride: v1jSmokeBenchmark(cell),
+            workspaceDirOverride: workspaceDir,
+            allowNoToolTerminalEvidence: true,
+            runIdPrefix: "v1j-smoke",
+          });
+        } finally {
+          try {
+            fs.rmSync(workspaceDir, {
+              recursive: true,
+              force: true,
+              maxRetries: 3,
+              retryDelay: 50,
+            });
+          } catch {
+            // Record cleanup failure with the smoke row; do not retry a live cell.
+          }
+          workspaceCleanupComplete = !fs.existsSync(workspaceDir);
+        }
+        const record = {
+          smokeCellId: cell.cellId,
+          caseId: cell.caseId,
+          arm: cell.arm,
+          replicate: 1 as const,
+          observation,
+          workspaceCleanupComplete,
+        };
+        appendV1JSmokeRecord(artifactState, record);
+        if (observation.invalidClass === "INTEGRITY_FAILURE" || !workspaceCleanupComplete) {
+          hardStop = new Error(
+            observation.invalidReason ??
+              "v1J smoke workspace cleanup failed after evidence capture",
+          );
+          break;
+        }
+      }
+      const modelRequestsSent = artifactState.records.reduce(
+        (total, record) => total + record.observation.modelRequestsSent,
+        0,
+      );
+      finalizeV1JSmokeArtifacts(artifactState, {
+        completedAt: new Date().toISOString(),
+        modelRequestsSent,
+        preflightPassed: true,
+      });
+      assertV1JFormalStateEmpty(repoRoot);
+      if (hardStop) {
+        throw hardStop;
+      }
+      if (
+        artifactState.records.length !== 4 ||
+        artifactState.records.some((record) => !record.observation.valid)
+      ) {
+        throw new Error("v1J operational smoke did not serialize four valid smoke observations");
+      }
+    },
+  );
+});
 
 describeV1JActionLive("v1J action-initiation experiment live", () => {
   it(
@@ -1411,6 +1546,26 @@ function requireV1JBenchmarkCase(protocol: V1JProtocol, caseId: string): ToolRan
   return benchmark;
 }
 
+function v1jSmokeBenchmark(cell: V1JSmokeCell): ToolRankingBenchmarkCase {
+  const benchmark = TOOL_RANKING_HELD_OUT_CASES.find((entry) =>
+    entry.tools.some((tool) => getBenchmarkRealToolMapping(tool.name).realTool === "read"),
+  );
+  const readBenchmarkName = benchmark?.tools.find(
+    (tool) => getBenchmarkRealToolMapping(tool.name).realTool === "read",
+  )?.name;
+  if (!benchmark || !readBenchmarkName) {
+    throw new Error(
+      "v1J smoke requires an existing benchmark mapping for the authorized read tool",
+    );
+  }
+  return {
+    ...benchmark,
+    id: cell.caseId,
+    query: cell.prompt,
+    expectedTopTools: cell.caseId === "smoke-tool-required" ? [readBenchmarkName] : [],
+  };
+}
+
 function parseV1JMaxCells(value: string | undefined): number | undefined {
   if (value === undefined) {
     return undefined;
@@ -1426,10 +1581,15 @@ async function executeV1JCell(input: {
   cell: V1JCell;
   attempt: number;
   head: string;
+  benchmarkOverride?: ToolRankingBenchmarkCase;
+  workspaceDirOverride?: string;
+  allowNoToolTerminalEvidence?: boolean;
+  runIdPrefix?: string;
 }): Promise<V1JObservation> {
   const { protocol, cell, attempt, head } = input;
   const benchmark =
-    cell.stratum === "TOOL_REQUIRED"
+    input.benchmarkOverride ??
+    (cell.stratum === "TOOL_REQUIRED"
       ? requireV1JBenchmarkCase(protocol, cell.caseId)
       : {
           id: cell.caseId,
@@ -1439,8 +1599,9 @@ async function executeV1JCell(input: {
           tools: [],
           expectedTopTools: [],
           topK: 8,
-        };
-  const workspaceDir = fs.mkdtempSync(path.join(os.tmpdir(), "v1j-cell-"));
+        });
+  const workspaceDir =
+    input.workspaceDirOverride ?? fs.mkdtempSync(path.join(os.tmpdir(), "v1j-cell-"));
   const authorizedTools: V1JAuthorizedToolSchema[] = [];
   const providerRequests: CapturedModelRequest[] = [];
   const responseSummaries: ProviderResponseSummary[] = [];
@@ -1466,7 +1627,7 @@ async function executeV1JCell(input: {
       workspaceDir,
       provider: protocol.model.provider,
       model: protocol.model.id,
-      runIdOverride: `v1j-${head.slice(0, 8)}-${cell.cellId}-attempt-${attempt}`,
+      runIdOverride: `${input.runIdPrefix ?? "v1j"}-${head.slice(0, 8)}-${cell.cellId}-attempt-${attempt}`,
       requestCapture: {
         capturePromptInstruction: v1jInstructionForArm(protocol, cell.arm),
         onAuthorizedToolsCaptured: (tools) =>
@@ -1526,10 +1687,12 @@ async function executeV1JCell(input: {
       gateFailure = error instanceof Error ? error : new Error("harness threw");
     }
   } finally {
-    try {
-      fs.rmSync(workspaceDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
-    } catch {
-      // Agent-local SQLite handles may outlive terminal evidence on Windows.
+    if (!input.workspaceDirOverride) {
+      try {
+        fs.rmSync(workspaceDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {
+        // Agent-local SQLite handles may outlive terminal evidence on Windows.
+      }
     }
   }
 
@@ -1546,13 +1709,37 @@ async function executeV1JCell(input: {
   const providerResponseObserved = responseSummaries.some(
     (summary) => summary.parserOutcome !== "body-pending",
   );
+  const correlationAudit = correlateToolCallsAndExecutions({
+    toolCalls: run?.toolCalls ?? [],
+    executions: run?.executions ?? [],
+  });
+  const noToolTerminalComplete =
+    input.allowNoToolTerminalEvidence === true &&
+    run?.toolCalls.length === 0 &&
+    run.executions.length === 0 &&
+    correlationAudit.status === "PROVABLE";
+  const terminalEvidenceComplete =
+    Boolean(run?.valid) &&
+    dispatchAttempts > 0 &&
+    providerResponseObserved &&
+    correlationAudit.status === "PROVABLE" &&
+    correlationAudit.unmatchedToolCalls === 0 &&
+    correlationAudit.unmatchedExecutions === 0 &&
+    (delegatedRequests > 0 || noToolTerminalComplete);
   const reason = gateFailure
     ? v1jHardStopReason(gateFailure)
     : run?.executions?.some(
           (execution) => !protocol.schemaBaseline.expectedRuntimeNames.includes(execution.toolName),
         )
       ? "AUTHORIZATION_DRIFT"
-      : run?.valid && dispatchAttempts > 0 && providerResponseObserved && delegatedRequests > 0
+      : (
+            input.allowNoToolTerminalEvidence === true
+              ? terminalEvidenceComplete
+              : run?.valid &&
+                dispatchAttempts > 0 &&
+                providerResponseObserved &&
+                delegatedRequests > 0
+          )
         ? null
         : (run?.invalidReason ??
           (dispatchAttempts === 0 ? "REQUEST_PREPARATION_ERROR" : "INCOMPLETE_TERMINAL_EVIDENCE"));
@@ -1587,9 +1774,11 @@ async function executeV1JCell(input: {
     executedToolSequence: run?.executedToolSequence ?? [],
     terminalSuccess: run?.terminalSuccess ?? false,
     rankingEpoch: run?.rankingEpoch ?? null,
-    terminalEvidenceComplete: Boolean(
-      run?.valid && dispatchAttempts > 0 && providerResponseObserved && delegatedRequests > 0,
-    ),
+    terminalEvidenceComplete: input.allowNoToolTerminalEvidence
+      ? terminalEvidenceComplete
+      : Boolean(
+          run?.valid && dispatchAttempts > 0 && providerResponseObserved && delegatedRequests > 0,
+        ),
     correlationStatus: run?.correlationStatus ?? "UNPROVABLE",
     toolCalls: run?.toolCalls ?? [],
     executions: run?.executions ?? [],

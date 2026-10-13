@@ -3,6 +3,18 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
+  appendV1JSmokeRecord,
+  assertV1JFormalStateEmpty,
+  assertV1JSmokeProvenance,
+  assertV1JSmokeWritePath,
+  buildV1JSmokeSchedule,
+  createV1JSmokeArtifactState,
+  finalizeV1JSmokeArtifacts,
+  resolveV1JSmokeRoot,
+  V1J_FORMAL_ARTIFACT_RELATIVE_PATH,
+  type V1JSmokeRecord,
+} from "../../../test/helpers/agents/model-choice-action-initiation-smoke.js";
+import {
   appendV1JInvalidAttempt,
   appendV1JObservation,
   assertV1JRuntimeGate,
@@ -686,5 +698,150 @@ describe("v1J action-initiation protocol and offline harness", () => {
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  it("builds exactly four non-scientific smoke cells with distinct IDs and prompts", () => {
+    const protocol = loadProtocol();
+    const smoke = buildV1JSmokeSchedule(protocol);
+    expect(smoke).toHaveLength(4);
+    expect(smoke.map((cell) => `${cell.caseId}:${cell.arm}:${cell.replicate}`)).toEqual([
+      "smoke-tool-required:A:1",
+      "smoke-tool-required:C:1",
+      "smoke-no-tool-control:A:1",
+      "smoke-no-tool-control:C:1",
+    ]);
+    expect(new Set(smoke.map((cell) => cell.cellId)).size).toBe(4);
+    expect(
+      smoke.every((cell) => !protocol.design.cells.some((entry) => entry.caseId === cell.caseId)),
+    ).toBe(true);
+    expect(
+      smoke.every((cell) => !protocol.design.cells.some((entry) => entry.prompt === cell.prompt)),
+    ).toBe(true);
+    expect(smoke.find((cell) => cell.caseId === "smoke-tool-required")?.requiredTools).toEqual([
+      "read",
+    ]);
+    expect(smoke.find((cell) => cell.caseId === "smoke-no-tool-control")?.requiredTools).toEqual(
+      [],
+    );
+  });
+
+  it("writes smoke records only beneath the commit-bound smoke root and preserves no-tool rows", () => {
+    const protocol = loadProtocol();
+    const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), "v1j-smoke-root-test-"));
+    const commit = "b".repeat(40);
+    try {
+      assertV1JFormalStateEmpty(repoRoot);
+      const state = createV1JSmokeArtifactState({
+        repoRoot,
+        harnessCommit: commit,
+        protocol,
+        modelConfigHash: protocol.model.modelConfigHash,
+        schemaFingerprints: protocol.schemaBaseline,
+        startedAt: "2026-01-01T00:00:00.000Z",
+      });
+      expect(state.root).toBe(resolveV1JSmokeRoot(repoRoot, commit));
+      const [toolCell, controlCell] = buildV1JSmokeSchedule(protocol);
+      const toolObservation = {
+        ...observation(protocol, toolCell!, { attempted: true }),
+        harnessCommit: commit,
+      };
+      const noToolObservation = {
+        ...observation(protocol, controlCell!),
+        harnessCommit: commit,
+      };
+      const toolRecord: V1JSmokeRecord = {
+        smokeCellId: toolCell!.cellId,
+        caseId: toolCell!.caseId,
+        arm: toolCell!.arm,
+        replicate: 1,
+        observation: toolObservation,
+        workspaceCleanupComplete: true,
+      };
+      const noToolRecord: V1JSmokeRecord = {
+        smokeCellId: controlCell!.cellId,
+        caseId: controlCell!.caseId,
+        arm: controlCell!.arm,
+        replicate: 1,
+        observation: noToolObservation,
+        workspaceCleanupComplete: true,
+      };
+      appendV1JSmokeRecord(state, toolRecord);
+      appendV1JSmokeRecord(state, noToolRecord);
+      expect(() => appendV1JSmokeRecord(state, noToolRecord)).toThrow(/duplicate identity/);
+      const summary = finalizeV1JSmokeArtifacts(state, {
+        completedAt: "2026-01-01T00:01:00.000Z",
+        modelRequestsSent: 2,
+        preflightPassed: true,
+      });
+      expect(summary).toMatchObject({
+        artifactKind: "v1J-live-operational-smoke",
+        scientificClassification: "NOT_CLASSIFIED",
+        validSmokeCells: 2,
+        noToolOutcomes: 1,
+        cleanupFailures: 0,
+      });
+      const stored = fs
+        .readFileSync(path.join(state.root, "smoke-observations.jsonl"), "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as V1JSmokeRecord);
+      expect(stored.map((record) => record.smokeCellId)).toEqual([
+        toolCell!.cellId,
+        controlCell!.cellId,
+      ]);
+      expect(stored[1]?.observation.toolCalls).toEqual([]);
+      expect(fs.existsSync(path.resolve(repoRoot, V1J_FORMAL_ARTIFACT_RELATIVE_PATH))).toBe(false);
+    } finally {
+      fs.rmSync(repoRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects formal v1J paths and refuses smoke when formal state already exists", () => {
+    const protocol = loadProtocol();
+    const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), "v1j-smoke-formal-guard-test-"));
+    const commit = "c".repeat(40);
+    try {
+      const smokeRoot = resolveV1JSmokeRoot(repoRoot, commit);
+      const formalRoot = path.resolve(repoRoot, V1J_FORMAL_ARTIFACT_RELATIVE_PATH);
+      expect(() =>
+        assertV1JSmokeWritePath(repoRoot, commit, path.join(formalRoot, "manifest.json")),
+      ).toThrow(/formal evidence path/);
+      expect(() =>
+        assertV1JSmokeWritePath(repoRoot, commit, path.join(smokeRoot, "observations.jsonl")),
+      ).toThrow(/formal evidence path/);
+      fs.mkdirSync(formalRoot, { recursive: true });
+      expect(() =>
+        createV1JSmokeArtifactState({
+          repoRoot,
+          harnessCommit: commit,
+          protocol,
+          modelConfigHash: protocol.model.modelConfigHash,
+          schemaFingerprints: protocol.schemaBaseline,
+          startedAt: "2026-01-01T00:00:00.000Z",
+        }),
+      ).toThrow(/requires absent formal state/);
+      expect(fs.existsSync(smokeRoot)).toBe(false);
+    } finally {
+      fs.rmSync(repoRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("accepts only a recognized harness-control amendment bound to the exact smoke HEAD", () => {
+    const protocol = loadProtocol();
+    const commit = "d".repeat(40);
+    const amendment = {
+      provenanceAmendment: true,
+      amendmentType: "observational/harness-control-only",
+      baseHarnessCommit: protocol.base.head,
+      continuationHarnessCommit: commit,
+      scientificProtocolChanged: false,
+      modelFacingBehaviorChanged: false,
+      runtimeBehaviorChanged: false,
+      runtimeExecutionSemanticsChanged: false,
+    };
+    expect(() => assertV1JSmokeProvenance(amendment, protocol, commit)).not.toThrow();
+    expect(() => assertV1JSmokeProvenance(amendment, protocol, "e".repeat(40))).toThrow(
+      /provenance amendment/,
+    );
   });
 });

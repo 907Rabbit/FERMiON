@@ -128,7 +128,8 @@ type CapturedModelRequest = {
   url: string;
 };
 
-type V1JSchemaCaptureName = "capture-1" | "capture-2" | "arm-a" | "arm-c";
+type V1JCanonicalSchemaCaptureName = "capture-1" | "capture-2" | "arm-a" | "arm-c";
+type V1JSchemaCaptureName = V1JCanonicalSchemaCaptureName | `capture-1-recheck-${string}`;
 type V1JSchemaCaptureArm = "A" | "C";
 type V1JAuthorizedToolSchema = { name: string; description?: string; parameters: unknown };
 type V1JCaptureCheckpoint =
@@ -271,12 +272,23 @@ function hashV1JNameSet(names: readonly string[]): string {
     .digest("hex");
 }
 
-const V1J_SCHEMA_CAPTURE_NAME_ARM: Record<V1JSchemaCaptureName, V1JSchemaCaptureArm> = {
+const V1J_SCHEMA_CAPTURE_NAME_ARM: Record<V1JCanonicalSchemaCaptureName, V1JSchemaCaptureArm> = {
   "capture-1": "A",
   "capture-2": "A",
   "arm-a": "A",
   "arm-c": "C",
 };
+
+function resolveV1JSchemaCaptureArm(
+  name: string,
+  harnessCommit = HARNESS_COMMIT,
+): V1JSchemaCaptureArm | undefined {
+  if (Object.hasOwn(V1J_SCHEMA_CAPTURE_NAME_ARM, name)) {
+    return V1J_SCHEMA_CAPTURE_NAME_ARM[name as V1JCanonicalSchemaCaptureName];
+  }
+  const recheck = /^capture-1-recheck-([0-9a-f]{8,40})$/.exec(name);
+  return recheck && harnessCommit.startsWith(recheck[1]!) ? "A" : undefined;
+}
 
 function createV1JCaptureLiveness(name: V1JSchemaCaptureName, diagnosticId?: string) {
   const root = path.resolve(
@@ -458,7 +470,7 @@ function prepareV1JPreSinkCapture(input: {
     record("capture-options-check-start");
     if (
       !input.captureName ||
-      V1J_SCHEMA_CAPTURE_NAME_ARM[input.captureName] !== arm ||
+      resolveV1JSchemaCaptureArm(input.captureName, input.harnessCommit) !== arm ||
       !input.surfaceMode ||
       !input.benchmarkCandidateNames
     ) {
@@ -561,6 +573,7 @@ function recordV1JRuntimeCheckpoint(
 
 function resolveV1JSchemaCaptureOptions(
   env: NodeJS.ProcessEnv,
+  harnessCommit = HARNESS_COMMIT,
 ): { name: V1JSchemaCaptureName; arm: V1JSchemaCaptureArm } | undefined {
   if (env.OPENCLAW_V1J_SCHEMA_CAPTURE === undefined) {
     return undefined;
@@ -569,14 +582,18 @@ function resolveV1JSchemaCaptureOptions(
     throw new Error("OPENCLAW_V1J_SCHEMA_CAPTURE must be 1 when set");
   }
   const name = env.OPENCLAW_V1J_SCHEMA_CAPTURE_NAME;
-  if (!name || !Object.hasOwn(V1J_SCHEMA_CAPTURE_NAME_ARM, name)) {
+  if (!name) {
+    throw new Error("OPENCLAW_V1J_SCHEMA_CAPTURE_NAME must be a recognized capture name");
+  }
+  const expectedArm = resolveV1JSchemaCaptureArm(name, harnessCommit);
+  if (!expectedArm) {
     throw new Error("OPENCLAW_V1J_SCHEMA_CAPTURE_NAME must be a recognized capture name");
   }
   const arm = env.OPENCLAW_V1J_SCHEMA_CAPTURE_ARM;
   if (arm !== "A" && arm !== "C") {
     throw new Error("OPENCLAW_V1J_SCHEMA_CAPTURE_ARM must be A or C");
   }
-  if (V1J_SCHEMA_CAPTURE_NAME_ARM[name as V1JSchemaCaptureName] !== arm) {
+  if (expectedArm !== arm) {
     throw new Error(`schema capture ${name} is not configured for Arm ${arm}`);
   }
   return { name: name as V1JSchemaCaptureName, arm };
@@ -660,6 +677,7 @@ function persistV1JSchemaCapture(input: {
   model: string;
   surfaceMode: "REAL_EXACT" | "SYNTHETIC";
   benchmarkCandidateNames: readonly string[];
+  harnessCommit?: string;
   imageFactory?: V1JImageFactoryObservation;
   invocation?: {
     index: number;
@@ -735,10 +753,7 @@ function persistV1JSchemaCapture(input: {
     return result;
   };
   try {
-    if (
-      !Object.hasOwn(V1J_SCHEMA_CAPTURE_NAME_ARM, input.name) ||
-      V1J_SCHEMA_CAPTURE_NAME_ARM[input.name] !== input.arm
-    ) {
+    if (resolveV1JSchemaCaptureArm(input.name, input.harnessCommit) !== input.arm) {
       throw new Error("v1J schema capture name/arm pair is invalid");
     }
     const authorizedTools = runOperation(
@@ -3162,6 +3177,7 @@ async function runOne(input: {
         model: runModel,
         surfaceMode: preSink.surfaceMode,
         benchmarkCandidateNames: preSink.benchmarkCandidateNames,
+        harnessCommit: input.requestCapture.headCommit ?? HARNESS_COMMIT,
         ...(preSink.imageFactory ? { imageFactory: preSink.imageFactory } : {}),
         invocation: preSink.invocation,
         recordCheckpoint: (checkpoint, metadata) =>
@@ -4010,6 +4026,42 @@ describe("v1I offline request preparation", () => {
           },
         }),
       ).toThrow("already exists");
+      const recheckHarnessCommit = "0123456789abcdef0123456789abcdef01234567";
+      const recheckName = `capture-1-recheck-${recheckHarnessCommit.slice(0, 8)}`;
+      const recheckInput = {
+        name: recheckName as V1JSchemaCaptureName,
+        arm: "A" as const,
+        model: "qwen/qwen3.5-9b",
+        surfaceMode: "REAL_EXACT" as const,
+        authorizedTools,
+        providerTools,
+        benchmarkCandidateNames,
+        harnessCommit: recheckHarnessCommit,
+        imageFactory: { eligible: false, constructed: false },
+        invocation: {
+          index: 4,
+          caseId: "test-case",
+          arm: "A" as const,
+          replicate: 1,
+          providerRequestPhase: "offline-test",
+          callSite: "offline-test",
+        },
+      };
+      persistV1JSchemaCapture(recheckInput);
+      const recheckToolsPath = path.join(root, `${recheckName}-provider-tools.json`);
+      const recheckMetadataPath = path.join(root, `${recheckName}-metadata.json`);
+      const recheckToolsBytes = fs.readFileSync(recheckToolsPath);
+      const recheckMetadataBytes = fs.readFileSync(recheckMetadataPath);
+      expect(JSON.parse(recheckToolsBytes.toString("utf8"))).toEqual({
+        authorizedTools,
+        providerTools,
+      });
+      expect(JSON.parse(recheckMetadataBytes.toString("utf8"))).toMatchObject({
+        modelRequestsSent: 0,
+      });
+      expect(() => persistV1JSchemaCapture(recheckInput)).toThrow("already exists");
+      expect(fs.readFileSync(recheckToolsPath)).toEqual(recheckToolsBytes);
+      expect(fs.readFileSync(recheckMetadataPath)).toEqual(recheckMetadataBytes);
       const rows = fs
         .readFileSync(liveness.filePath, "utf8")
         .trim()
@@ -4064,6 +4116,46 @@ describe("v1I offline request preparation", () => {
         OPENCLAW_V1J_SCHEMA_CAPTURE_ARM: "A",
       }),
     ).toThrow("recognized capture name");
+    const testHarnessCommit = "0123456789abcdef0123456789abcdef01234567";
+    for (const [name, arm] of [
+      ["capture-1", "A"],
+      ["capture-2", "A"],
+      ["arm-a", "A"],
+      ["arm-c", "C"],
+    ] as const) {
+      expect(
+        resolveV1JSchemaCaptureOptions(
+          {
+            OPENCLAW_V1J_SCHEMA_CAPTURE: "1",
+            OPENCLAW_V1J_SCHEMA_CAPTURE_NAME: name,
+            OPENCLAW_V1J_SCHEMA_CAPTURE_ARM: arm,
+          },
+          testHarnessCommit,
+        ),
+      ).toEqual({ name, arm });
+    }
+    expect(
+      resolveV1JSchemaCaptureOptions(
+        {
+          OPENCLAW_V1J_SCHEMA_CAPTURE: "1",
+          OPENCLAW_V1J_SCHEMA_CAPTURE_NAME: "capture-1-recheck-01234567",
+          OPENCLAW_V1J_SCHEMA_CAPTURE_ARM: "A",
+        },
+        testHarnessCommit,
+      ),
+    ).toEqual({ name: "capture-1-recheck-01234567", arm: "A" });
+    for (const name of ["capture-1-recheck-89abcdef", "fresh-capture"]) {
+      expect(() =>
+        resolveV1JSchemaCaptureOptions(
+          {
+            OPENCLAW_V1J_SCHEMA_CAPTURE: "1",
+            OPENCLAW_V1J_SCHEMA_CAPTURE_NAME: name,
+            OPENCLAW_V1J_SCHEMA_CAPTURE_ARM: "A",
+          },
+          testHarnessCommit,
+        ),
+      ).toThrow("recognized capture name");
+    }
 
     expect(() =>
       persistV1JSchemaCapture({

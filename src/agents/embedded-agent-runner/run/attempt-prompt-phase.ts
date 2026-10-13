@@ -272,6 +272,21 @@ export async function runEmbeddedAttemptPromptPhase(input: {
       ...input.context,
     });
     const { hookMessagesForCurrentPrompt, promptForModel, systemPromptForHook } = promptContext;
+    const armInstruction = attempt.extraSystemPrompt;
+    attempt.capabilityIntelligenceExperiment?.onPromptMessageTrace?.({
+      stage: "prompt-context-built",
+      messages: hookMessagesForCurrentPrompt,
+      source: "prepareEmbeddedAttemptPromptContext",
+      conversationHistorySource: "promptContext.hookMessagesForCurrentPrompt",
+      promptAssemblySource:
+        "prepareEmbeddedAttemptPromptAssembly -> prepareEmbeddedAttemptPromptContext",
+      armInstructionInsertionStage: armInstruction
+        ? "attempt.extraSystemPrompt -> systemPromptForHook"
+        : "none",
+      armInstructionPresent: Boolean(
+        armInstruction && systemPromptForHook.includes(armInstruction),
+      ),
+    });
     input.lifecycle.setPrePromptMessageCount(promptContext.prePromptMessageCount);
     input.lifecycle.setCurrentUserTimestampOverride(promptContext.currentUserTimestampOverride);
     const beforeAgentRunOutcome =

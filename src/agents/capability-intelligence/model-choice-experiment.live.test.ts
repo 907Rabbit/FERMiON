@@ -185,6 +185,49 @@ type CapturedModelRequest = {
   url: string;
 };
 
+type PromptMessageTraceEvent = Parameters<
+  NonNullable<RunEmbeddedAgentParams["capabilityIntelligenceExperiment"]>["onPromptMessageTrace"]
+>[0];
+
+function summarizePromptMessageTrace(
+  event: PromptMessageTraceEvent,
+  identity: (value: object) => number,
+) {
+  return {
+    stage: event.stage,
+    source: event.source,
+    ...(event.conversationHistorySource
+      ? { conversationHistorySource: event.conversationHistorySource }
+      : {}),
+    ...(event.promptAssemblySource ? { promptAssemblySource: event.promptAssemblySource } : {}),
+    ...(event.armInstructionInsertionStage
+      ? { armInstructionInsertionStage: event.armInstructionInsertionStage }
+      : {}),
+    ...(event.armInstructionPresent === undefined
+      ? {}
+      : { armInstructionPresent: event.armInstructionPresent }),
+    ...(event.callbackIndex === undefined ? {} : { callbackIndex: event.callbackIndex }),
+    messageArrayIdentity: identity(event.messages),
+    messageCount: event.messages.length,
+    messages: event.messages.map((message, index) => {
+      const row =
+        message && typeof message === "object" && !Array.isArray(message)
+          ? (message as Record<string, unknown>)
+          : {};
+      const content = row.content;
+      const canonicalContent = canonicalizeV1IValue(content);
+      return {
+        index,
+        role: typeof row.role === "string" ? row.role : null,
+        messageObjectIdentity: message && typeof message === "object" ? identity(message) : null,
+        contentObjectIdentity: content && typeof content === "object" ? identity(content) : null,
+        contentSha256: sha256V1J(canonicalContent),
+        contentLength: typeof content === "string" ? content.length : canonicalContent.length,
+      };
+    }),
+  };
+}
+
 type V1JCanonicalSchemaCaptureName = "capture-1" | "capture-2" | "arm-a" | "arm-c";
 type V1JSchemaCaptureName = V1JCanonicalSchemaCaptureName | `capture-1-recheck-${string}`;
 type V1JSchemaCaptureArm = "A" | "C";
@@ -1602,6 +1645,7 @@ async function captureV1JPreflightSurface(
     protocol.design.cells.find((entry) => entry.stratum === "TOOL_REQUIRED")?.caseId ?? "",
   );
   const workspaceDir = fs.mkdtempSync(path.join(os.tmpdir(), `v1j-preflight-${arm}-`));
+  const preflightStopController = new AbortController();
   const authorizedTools: V1JAuthorizedToolSchema[] = [];
   const requests: CapturedModelRequest[] = [];
   const requestObservations: V1JPreflightRequestObservation[] = [];
@@ -1626,6 +1670,7 @@ async function captureV1JPreflightSurface(
       scheduleSeed: protocol.schedule.seed,
       config: buildLiveConfig(workspaceDir),
       workspaceDir,
+      abortSignal: preflightStopController.signal,
       provider: protocol.model.provider,
       model: protocol.model.id,
       runIdOverride: `v1j-preflight-${arm}-${head.slice(0, 8)}-${process.pid}`,
@@ -1661,6 +1706,8 @@ async function captureV1JPreflightSurface(
             observationIndex: requestObservations.length,
             observation: requestObservation,
           });
+          // End the diagnostic run before its stop sentinel is treated as a retryable failure.
+          preflightStopController.abort(new V1IProviderRequestCapturedError());
         },
         onProviderDispatchAttempt: (count) => {
           dispatchAttempts = count;
@@ -2272,7 +2319,7 @@ describe("v1I diagnostic resource resolution", () => {
 });
 
 describe("v1J schema-capture dispatch guard", () => {
-  it("hard-stops when repeated Arm C preflight requests are not equivalent", async () => {
+  it("stops Arm C preflight before retrying a captured request", async () => {
     const protocol = readV1JPreregistration();
     const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), "v1j-preflight-path-test-"));
     const cwd = vi.spyOn(process, "cwd").mockReturnValue(repoRoot);
@@ -2290,15 +2337,15 @@ describe("v1J schema-capture dispatch guard", () => {
     try {
       await installOfflinePreparedRuntimeMock();
       await expect(captureV1JPreflightSurface(protocol, "C", head, journal)).rejects.toThrow(
-        /v1J schema preflight failed/,
+        /v1J preflight runtime tool names differ from the frozen exact set/,
       );
       expect(journal.counters()).toMatchObject({
-        requestObserverInvocations: 4,
-        providerRequestHookInvocations: 4,
+        requestObserverInvocations: 1,
+        providerRequestHookInvocations: 1,
         providerCallbackInvocations: 0,
         providerDispatchAttempts: 0,
         modelRequestCounter: 0,
-        preflightStopSignalRaised: 4,
+        preflightStopSignalRaised: 1,
         preflightStopSignalCaught: 1,
         preflightCompleted: 0,
       });
@@ -2316,7 +2363,7 @@ describe("v1J schema-capture dispatch guard", () => {
       expect(events).toContain("arm-c-request-observer-enter");
       expect(events).not.toContain("arm-c-schema-validated");
       expect(events).not.toContain("arm-c-preflight-complete");
-      expect(events).not.toContain("arm-c-preflight-observations-equivalent");
+      expect(events).toContain("arm-c-preflight-observations-equivalent");
       expect(events).toContain("arm-c-stop-before-dispatch-signal");
       expect(events).toContain("arm-c-preflight-stop-signal-caught");
       expect(events.some((event) => event.startsWith("arm-a-"))).toBe(false);
@@ -2324,43 +2371,115 @@ describe("v1J schema-capture dispatch guard", () => {
       const observationRows = rows.filter(
         (row) => row.event === "arm-c-request-observation-captured",
       );
-      expect(observationRows).toHaveLength(4);
-      expect(new Set(observationRows.map((row) => JSON.stringify(row.observation))).size).toBe(2);
+      expect(observationRows).toHaveLength(1);
+      expect(new Set(observationRows.map((row) => JSON.stringify(row.observation))).size).toBe(1);
       expect(JSON.stringify(observationRows)).not.toContain("## Tool use");
       expect(JSON.stringify(observationRows)).not.toContain(
         protocol.arms.C.experimentalInstruction,
       );
       expect(rows.find((row) => row.event === "preflight-stop-assertion-evaluated")).toMatchObject({
-        passed: false,
-        requestBodyDifferingPaths: [".messages[2]"],
+        passed: true,
+        requestBodyDifferingPaths: [],
         observationSummary: {
-          rawCallbackCount: 4,
-          uniqueCanonicalObservations: 2,
-          duplicateEquivalentCallbacks: 2,
-          differingFields: ["requestBodySha256"],
-          allCapturedObservationsEquivalent: false,
-          canonicalObservation: null,
+          rawCallbackCount: 1,
+          uniqueCanonicalObservations: 1,
+          duplicateEquivalentCallbacks: 0,
+          differingFields: [],
+          allCapturedObservationsEquivalent: true,
         },
         predicates: {
-          allCapturedObservationsEquivalent: false,
-          uniqueCanonicalObservationIsOne: false,
+          allCapturedObservationsEquivalent: true,
+          uniqueCanonicalObservationIsOne: true,
           providerCallbackCountIsZero: true,
           dispatchAttemptsIsZero: true,
           modelRequestCountIsZero: true,
         },
       });
       const hookRows = rows.filter((row) => row.event === "arm-c-provider-request-hook-enter");
-      expect(hookRows.map((row) => row.invocationIndex)).toEqual([1, 2, 3, 4]);
+      expect(hookRows.map((row) => row.invocationIndex)).toEqual([1]);
       expect(
         hookRows.every((row) => row.callSite === "runOne.diagnostics.hooks.onProviderRequest"),
       ).toBe(true);
+      const messageTraceRows = rows.filter((row) => row.event === "arm-c-prompt-message-trace");
+      const traceStages = messageTraceRows.map((row) => row.stage);
+      expect(traceStages).toContain("prompt-context-built");
+      expect(traceStages).toContain("prompt-submit-enter");
+      expect(traceStages).toContain("prompt-history-normalized");
+      const promptContexts = messageTraceRows.filter((row) => row.stage === "prompt-context-built");
+      expect(promptContexts.map((row) => row.callbackIndex)).toEqual([1]);
+      expect(promptContexts.map((row) => row.messageCount)).toEqual([0]);
+      expect(
+        promptContexts.every(
+          (row) =>
+            row.armInstructionInsertionStage ===
+              "attempt.extraSystemPrompt -> systemPromptForHook" &&
+            row.armInstructionPresent === true,
+        ),
+      ).toBe(true);
+      expect(
+        traceStages.filter((stage) => stage === "provider-onPayload-transform-enter"),
+      ).toHaveLength(1);
+      const observerEntries = messageTraceRows
+        .filter((row) => row.stage === "request-observer-enter")
+        .toSorted((left, right) => Number(left.callbackIndex) - Number(right.callbackIndex));
+      const observerExits = messageTraceRows
+        .filter((row) => row.stage === "request-observer-exit")
+        .toSorted((left, right) => Number(left.callbackIndex) - Number(right.callbackIndex));
+      expect(observerEntries).toHaveLength(1);
+      expect(observerExits).toHaveLength(1);
+      expect(observerEntries.map((row) => row.callbackIndex)).toEqual([1]);
+      expect(new Set(observerEntries.map((row) => row.messageArrayIdentity)).size).toBe(1);
+      expect(
+        observerExits.every((row) => row.arrayOrMessageStateChangedDuringObserver === false),
+      ).toBe(true);
+      expect(
+        observerEntries
+          .map((row) => row.messages)
+          .map((messages) => (messages as unknown[]).length),
+      ).toEqual([2]);
+      expect(observerEntries.every((row) => Number.isInteger(row.messageArrayIdentity))).toBe(true);
+      const promptSubmitEntries = messageTraceRows.filter(
+        (row) => row.stage === "prompt-submit-enter",
+      );
+      expect(promptSubmitEntries.map((row) => row.callbackIndex)).toEqual([1]);
+      expect(promptSubmitEntries.map((row) => row.messageCount)).toEqual([0]);
+      const promptTransformEntries = messageTraceRows.filter(
+        (row) => row.stage === "model-prompt-transform-enter",
+      );
+      expect(promptTransformEntries.map((row) => row.messageCount)).toEqual([1]);
+      const firstPromptTransform = promptTransformEntries[0]!;
+      expect(
+        (firstPromptTransform.messages as Array<Record<string, unknown>>).map(
+          (message) => message.role,
+        ),
+      ).toEqual(["user"]);
+      const settledAgentStates = messageTraceRows.filter(
+        (row) => row.stage === "prompt-agent-state-settled",
+      );
+      expect(settledAgentStates.map((row) => row.messageCount)).toEqual([1]);
+      expect(
+        messageTraceRows.some((row) => row.stage === "provider-onPayload-transform-complete"),
+      ).toBe(false);
+      const firstObserverMessages = observerEntries[0]!.messages as Array<Record<string, unknown>>;
+      expect(firstObserverMessages.map((message) => Object.keys(message).toSorted())).toEqual(
+        firstObserverMessages.map(() =>
+          [
+            "contentLength",
+            "contentObjectIdentity",
+            "contentSha256",
+            "index",
+            "messageObjectIdentity",
+            "role",
+          ].toSorted(),
+        ),
+      );
       expect(rows.find((row) => row.event === "preflight-stop-assertion-evaluated")).toMatchObject({
-        passed: false,
+        passed: true,
         predicates: {
           requestHookInvocationsAtLeastOne: true,
           requestObserverInvocationsAtLeastOne: true,
-          allCapturedObservationsEquivalent: false,
-          uniqueCanonicalObservationIsOne: false,
+          allCapturedObservationsEquivalent: true,
+          uniqueCanonicalObservationIsOne: true,
           providerCallbackCountIsZero: true,
           dispatchAttemptsIsZero: true,
           modelRequestCountIsZero: true,
@@ -4271,6 +4390,46 @@ async function runOne(input: {
   const runProvider = input.provider ?? PROVIDER;
   const runModel = input.model ?? MODEL_ID;
   const diagnostics = createExperimentDiagnostics();
+  const promptMessageIdentities = new WeakMap<object, number>();
+  let nextPromptMessageIdentity = 1;
+  const identifyPromptObject = (value: object) => {
+    const existing = promptMessageIdentities.get(value);
+    if (existing !== undefined) {
+      return existing;
+    }
+    const identity = nextPromptMessageIdentity++;
+    promptMessageIdentities.set(value, identity);
+    return identity;
+  };
+  let promptSubmissionTraceIndex = 0;
+  let providerPayloadTraceIndex = 0;
+  let currentProviderPayloadTraceIndex = 0;
+  const originalPromptMessageTrace = diagnostics.hooks.onPromptMessageTrace;
+  diagnostics.hooks.onPromptMessageTrace = (event) => {
+    originalPromptMessageTrace?.(event);
+    const journal = input.requestCapture?.preflightDiagnostics;
+    if (journal) {
+      if (event.stage === "prompt-context-built") {
+        promptSubmissionTraceIndex += 1;
+      }
+      if (event.stage === "provider-onPayload-transform-enter") {
+        currentProviderPayloadTraceIndex = ++providerPayloadTraceIndex;
+      }
+      const callbackIndex =
+        event.stage === "provider-onPayload-transform-enter" ||
+        event.stage === "provider-onPayload-transform-start" ||
+        event.stage === "provider-onPayload-transform-complete"
+          ? currentProviderPayloadTraceIndex
+          : (event.callbackIndex ?? promptSubmissionTraceIndex);
+      journal.record(
+        `arm-${journal.arm.toLowerCase()}-prompt-message-trace`,
+        summarizePromptMessageTrace(
+          callbackIndex === undefined ? event : { ...event, callbackIndex },
+          identifyPromptObject,
+        ),
+      );
+    }
+  };
   const postResponseLiveness: PostResponseLiveness | undefined = input.postResponseDiagnostics
     ? createPostResponseLiveness({
         onHeartbeat: (heartbeat) => {
@@ -4416,7 +4575,9 @@ async function runOne(input: {
     },
   });
   const diagnosticsProviderRequest = diagnostics.hooks.onProviderRequest;
+  let requestObserverInvocationIndex = 0;
   diagnostics.hooks.onProviderRequest = async ({ payload, model }) => {
+    const callbackIndex = ++requestObserverInvocationIndex;
     const preflightDiagnostics = input.requestCapture?.preflightDiagnostics;
     preflightDiagnostics?.increment(
       "providerRequestHookInvocations",
@@ -4432,6 +4593,21 @@ async function runOne(input: {
         ? (payload as Record<string, unknown>)
         : {};
     const request = { body, url: "provider-adapter" };
+    const requestMessages = Array.isArray(body.messages) ? body.messages : [];
+    const callbackEntry = summarizePromptMessageTrace(
+      {
+        stage: "request-observer-enter",
+        messages: requestMessages,
+        source: "runOne.diagnostics.hooks.onProviderRequest input",
+        promptAssemblySource: "provider request payload before observer callback",
+        callbackIndex,
+      },
+      identifyPromptObject,
+    );
+    preflightDiagnostics?.record(
+      `arm-${preflightDiagnostics.arm.toLowerCase()}-prompt-message-trace`,
+      callbackEntry,
+    );
     input.requestCapture?.liveness?.record("provider-tool-projection-complete");
     if (input.requestCapture?.schemaCaptureName) {
       preflightDiagnostics?.increment(
@@ -4506,6 +4682,27 @@ async function runOne(input: {
     try {
       await diagnosticsProviderRequest?.({ payload, model });
     } finally {
+      const callbackExit = summarizePromptMessageTrace(
+        {
+          stage: "request-observer-exit",
+          messages: Array.isArray(body.messages) ? body.messages : [],
+          source: "runOne.diagnostics.hooks.onProviderRequest after observer callback",
+          promptAssemblySource: "provider request payload before provider onPayload transforms",
+          callbackIndex,
+        },
+        identifyPromptObject,
+      );
+      preflightDiagnostics?.record(
+        `arm-${preflightDiagnostics.arm.toLowerCase()}-prompt-message-trace`,
+        {
+          ...callbackExit,
+          callbackEntry,
+          arrayOrMessageStateChangedDuringObserver:
+            callbackEntry.messageArrayIdentity !== callbackExit.messageArrayIdentity ||
+            callbackEntry.messageCount !== callbackExit.messageCount ||
+            JSON.stringify(callbackEntry.messages) !== JSON.stringify(callbackExit.messages),
+        },
+      );
       preflightDiagnostics?.record(
         `arm-${preflightDiagnostics.arm.toLowerCase()}-provider-request-hook-exit`,
         { callSite: "runOne.diagnostics.hooks.onProviderRequest" },

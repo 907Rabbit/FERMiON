@@ -83,6 +83,14 @@ type ToolSearchTargetTranscriptProjections = Parameters<
 >[1];
 type WithOwnedTranscriptWrite = <T>(operation: () => Promise<T> | T) => Promise<T>;
 
+function providerPayloadMessages(payload: unknown): readonly unknown[] {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return [];
+  }
+  const messages = (payload as Record<string, unknown>).messages;
+  return Array.isArray(messages) ? messages : [];
+}
+
 type StreamSettleResult = {
   promptError: unknown;
   promptErrorSource: AgentRunAttemptFailureSource | null;
@@ -537,12 +545,21 @@ export async function prepareEmbeddedAttemptTransport(input: {
     if (!streamFn || (!experiment?.onProviderRequest && !experiment?.onProviderResponse)) {
       return streamFn;
     }
+    let providerRequestCallbackIndex = 0;
     return (model, context, options) => {
       const existingOnPayload = options?.onPayload;
       const existingOnResponse = options?.onResponse;
       return streamFn(model, context, {
         ...options,
         onPayload: async (payload, payloadModel) => {
+          const callbackIndex = ++providerRequestCallbackIndex;
+          experiment.onPromptMessageTrace?.({
+            stage: "provider-onPayload-transform-enter",
+            messages: providerPayloadMessages(payload),
+            source: "observeProviderRequest.onPayload input",
+            promptAssemblySource: "provider stream onPayload chain",
+            callbackIndex,
+          });
           try {
             await experiment.onProviderRequest?.({ payload, model: payloadModel });
           } catch (error) {
@@ -552,7 +569,23 @@ export async function prepareEmbeddedAttemptTransport(input: {
             });
             throw error;
           }
-          return (await existingOnPayload?.(payload, payloadModel)) ?? payload;
+          experiment.onPromptMessageTrace?.({
+            stage: "provider-onPayload-transform-start",
+            messages: providerPayloadMessages(payload),
+            source: "observeProviderRequest before existing onPayload",
+            promptAssemblySource: "provider stream onPayload chain",
+            callbackIndex,
+          });
+          const replacement = await existingOnPayload?.(payload, payloadModel);
+          const finalPayload = replacement ?? payload;
+          experiment.onPromptMessageTrace?.({
+            stage: "provider-onPayload-transform-complete",
+            messages: providerPayloadMessages(finalPayload),
+            source: "observeProviderRequest final onPayload output",
+            promptAssemblySource: "provider stream onPayload chain",
+            callbackIndex,
+          });
+          return finalPayload;
         },
         onResponse: async (response, responseModel) => {
           try {

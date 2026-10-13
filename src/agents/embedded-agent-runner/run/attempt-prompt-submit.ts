@@ -96,10 +96,25 @@ export async function submitEmbeddedAttemptPrompt(input: {
   transcriptPrompt: string;
 }): Promise<void> {
   const { activeSession, attempt } = input;
+  const tracePromptMessages = attempt.capabilityIntelligenceExperiment?.onPromptMessageTrace;
+  tracePromptMessages?.({
+    stage: "prompt-submit-enter",
+    messages: activeSession.messages,
+    source: "submitEmbeddedAttemptPrompt.activeSession.messages",
+    conversationHistorySource: "AgentSession transcript",
+    promptAssemblySource: "submitEmbeddedAttemptPrompt",
+  });
   const normalizedReplayMessages = normalizeAssistantReplayContent(activeSession.messages);
   if (normalizedReplayMessages !== activeSession.messages) {
     activeSession.agent.state.messages = normalizedReplayMessages;
   }
+  tracePromptMessages?.({
+    stage: "prompt-history-normalized",
+    messages: normalizedReplayMessages,
+    source: "normalizeAssistantReplayContent",
+    conversationHistorySource: "AgentSession transcript",
+    promptAssemblySource: "submitEmbeddedAttemptPrompt",
+  });
 
   const installProviderPromptHistoryTransform = (): (() => void) => {
     const baseStreamFn = activeSession.agent.streamFn;
@@ -157,6 +172,29 @@ export async function submitEmbeddedAttemptPrompt(input: {
     appendContext: input.appendContext,
     shouldCapturePrompt: () => captureCurrentPromptForModel,
   });
+  const installedTransformContext = activeSession.agent.transformContext;
+  if (tracePromptMessages && installedTransformContext) {
+    activeSession.agent.transformContext = async (messages, signal) => {
+      tracePromptMessages({
+        stage: "model-prompt-transform-enter",
+        messages,
+        source: "AgentSession.agent.transformContext input",
+        promptAssemblySource: "installModelPromptTransform",
+      });
+      const transformed = await installedTransformContext.call(
+        activeSession.agent,
+        messages,
+        signal,
+      );
+      tracePromptMessages({
+        stage: "model-prompt-transform-complete",
+        messages: transformed,
+        source: "AgentSession.agent.transformContext output",
+        promptAssemblySource: "installModelPromptTransform",
+      });
+      return transformed;
+    };
+  }
   const armModelPromptTransform = (submitted: boolean) => {
     if (submitted) {
       captureCurrentPromptForModel = true;
@@ -198,6 +236,20 @@ export async function submitEmbeddedAttemptPrompt(input: {
       input.onSteeringAcknowledged();
     }
   } finally {
+    tracePromptMessages?.({
+      stage: "prompt-active-session-settled",
+      messages: activeSession.messages,
+      source: "submitEmbeddedAttemptPrompt after promptActiveSession",
+      conversationHistorySource: "AgentSession.messages",
+      promptAssemblySource: "AgentSession.prompt lifecycle",
+    });
+    tracePromptMessages?.({
+      stage: "prompt-agent-state-settled",
+      messages: activeSession.agent.state.messages,
+      source: "submitEmbeddedAttemptPrompt after promptActiveSession",
+      conversationHistorySource: "AgentSession.agent.state.messages",
+      promptAssemblySource: "AgentSession.prompt lifecycle",
+    });
     cleanupProviderPromptHistoryTransform();
     cleanupModelPromptTransform();
   }

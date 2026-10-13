@@ -160,6 +160,16 @@ export type EmbeddedCapabilityIntelligenceModelLoopHeartbeat = {
 };
 
 export type EmbeddedCapabilityIntelligenceExperimentHooks = {
+  onPromptMessageTrace?: (event: {
+    stage: string;
+    messages: readonly unknown[];
+    source: string;
+    conversationHistorySource?: string;
+    promptAssemblySource?: string;
+    armInstructionInsertionStage?: string;
+    armInstructionPresent?: boolean;
+    callbackIndex?: number;
+  }) => void;
   onCheckpoint?: (checkpoint: {
     stage: EmbeddedCapabilityIntelligenceCheckpointStage;
     toolCount: number;

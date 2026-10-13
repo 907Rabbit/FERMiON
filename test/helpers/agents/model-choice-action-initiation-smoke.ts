@@ -40,6 +40,159 @@ export type V1JSmokeArtifactState = {
   records: V1JSmokeRecord[];
 };
 
+export type V1JPreflightCounterName =
+  | "requestObserverInvocations"
+  | "providerRequestHookInvocations"
+  | "fetchWrapperInvocations"
+  | "providerCallbackInvocations"
+  | "providerDispatchAttempts"
+  | "modelRequestCounter"
+  | "schemaCaptureStarts"
+  | "schemaCaptureCompletes"
+  | "preflightStopSignalRaised"
+  | "preflightStopSignalCaught"
+  | "preflightCompleted";
+
+export type V1JPreflightCounters = Record<V1JPreflightCounterName, number>;
+
+export type V1JPreflightDiagnosticJournal = {
+  filePath: string;
+  arm: "A" | "C";
+  counters: () => V1JPreflightCounters;
+  record: (event: string, details?: Record<string, unknown>) => void;
+  increment: (
+    counter: V1JPreflightCounterName,
+    event: string,
+    details?: Record<string, unknown>,
+  ) => void;
+  evaluateStop: (input: {
+    requestObserverCount: number;
+    capturedRequestCount: number;
+    delegatedRequestCount: number;
+    providerDispatchAttempts: number;
+  }) => Record<string, boolean>;
+  close: () => void;
+};
+
+/** Writes count-only smoke-preflight diagnostics outside both smoke and formal evidence. */
+export function createV1JPreflightDiagnosticJournal(input: {
+  repoRoot: string;
+  harnessCommit: string;
+  arm: "A" | "C";
+  caseId: string;
+  preflightId: string;
+  pid: number;
+  startedAtMs?: number;
+}): V1JPreflightDiagnosticJournal {
+  assertV1JFormalStateEmpty(input.repoRoot);
+  if (!/^[0-9a-f]{40}$/i.test(input.harnessCommit)) {
+    throw new Error("v1J preflight diagnostics require the actual full harness SHA");
+  }
+  const root = path.resolve(
+    input.repoRoot,
+    V1J_SMOKE_ARTIFACT_PARENT,
+    "preflight-diagnostics",
+    input.harnessCommit,
+  );
+  const filePath = path.join(
+    root,
+    `preflight-${input.arm.toLowerCase()}-${input.pid}-${Date.now()}-${input.preflightId.replace(/[^a-zA-Z0-9_-]/gu, "_")}.jsonl`,
+  );
+  const relative = path.relative(path.resolve(input.repoRoot, V1J_SMOKE_ARTIFACT_PARENT), filePath);
+  if (relative.startsWith("..") || path.isAbsolute(relative)) {
+    throw new Error("v1J preflight diagnostics path escaped its artifact root");
+  }
+  fs.mkdirSync(root, { recursive: true });
+  const fd = fs.openSync(filePath, "wx");
+  const startedAtMs = input.startedAtMs ?? Date.now();
+  const counters: V1JPreflightCounters = {
+    requestObserverInvocations: 0,
+    providerRequestHookInvocations: 0,
+    fetchWrapperInvocations: 0,
+    providerCallbackInvocations: 0,
+    providerDispatchAttempts: 0,
+    modelRequestCounter: 0,
+    schemaCaptureStarts: 0,
+    schemaCaptureCompletes: 0,
+    preflightStopSignalRaised: 0,
+    preflightStopSignalCaught: 0,
+    preflightCompleted: 0,
+  };
+  let eventIndex = 0;
+  let closed = false;
+  const record = (event: string, details: Record<string, unknown> = {}) => {
+    assertV1JFormalStateEmpty(input.repoRoot);
+    if (closed) {
+      throw new Error("v1J preflight diagnostic journal is closed");
+    }
+    const row = {
+      event,
+      captureName: input.preflightId,
+      eventIndex: ++eventIndex,
+      observedAt: new Date().toISOString(),
+      elapsedMs: Date.now() - startedAtMs,
+      pid: input.pid,
+      harnessCommit: input.harnessCommit,
+      arm: input.arm,
+      caseId: input.caseId,
+      preflightId: input.preflightId,
+      counters: { ...counters },
+      ...details,
+    };
+    fs.writeSync(fd, `${JSON.stringify(row)}\n`, undefined, "utf8");
+    fs.fsyncSync(fd);
+  };
+  record(`arm-${input.arm.toLowerCase()}-preflight-start`);
+  return {
+    filePath,
+    arm: input.arm,
+    counters: () => ({ ...counters }),
+    record,
+    increment: (counter, event, details = {}) => {
+      const before = counters[counter];
+      counters[counter] += 1;
+      record(event, { counter, before, after: counters[counter], ...details });
+    },
+    evaluateStop: ({
+      requestObserverCount,
+      capturedRequestCount,
+      delegatedRequestCount,
+      providerDispatchAttempts,
+    }) => {
+      const predicates = {
+        requestObserverCountIsOne: requestObserverCount === 1,
+        requestObserverCounterMatches: counters.requestObserverInvocations === requestObserverCount,
+        providerRequestHookCountIsOne: counters.providerRequestHookInvocations === 1,
+        providerCallbackCountIsZero: counters.providerCallbackInvocations === 0,
+        dispatchAttemptsIsZero:
+          counters.providerDispatchAttempts === 0 && providerDispatchAttempts === 0,
+        modelRequestCountIsZero: counters.modelRequestCounter === 0,
+        stopSignalRaised: counters.preflightStopSignalRaised === 1,
+        stopSignalCaught: counters.preflightStopSignalCaught === 1,
+        schemaCaptureNotEntered:
+          counters.schemaCaptureStarts === 0 && counters.schemaCaptureCompletes === 0,
+        capturedRequestCountIsOne: capturedRequestCount === 1,
+        delegatedRequestCountIsZero: delegatedRequestCount === 0,
+      };
+      record("preflight-stop-assertion-evaluated", {
+        requestObserverCount,
+        capturedRequestCount,
+        delegatedRequestCount,
+        predicates,
+        passed: Object.values(predicates).every(Boolean),
+      });
+      return predicates;
+    },
+    close: () => {
+      if (!closed) {
+        fs.fsyncSync(fd);
+        fs.closeSync(fd);
+        closed = true;
+      }
+    },
+  };
+}
+
 const SMOKE_CASES = [
   {
     caseId: "smoke-tool-required",
@@ -99,6 +252,17 @@ export function buildV1JSmokeSchedule(protocol: V1JProtocol): V1JSmokeCell[] {
       cellId: `${smokeCase.caseId}:${arm}:1`,
     })),
   );
+}
+
+export function assertV1JPreflightPairComplete(completedArms: readonly ("A" | "C")[]): void {
+  if (
+    completedArms.length !== 2 ||
+    new Set(completedArms).size !== 2 ||
+    !completedArms.includes("A") ||
+    !completedArms.includes("C")
+  ) {
+    throw new Error("v1J smoke schedule requires completed A and C schema preflights");
+  }
 }
 
 export function resolveV1JSmokeRoot(repoRoot: string, harnessCommit: string): string {

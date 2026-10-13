@@ -5,10 +5,12 @@ import { describe, expect, it } from "vitest";
 import {
   appendV1JSmokeRecord,
   assertV1JFormalStateEmpty,
+  assertV1JPreflightPairComplete,
   assertV1JSmokeProvenance,
   assertV1JSmokeWritePath,
   buildV1JSmokeSchedule,
   createV1JSmokeArtifactState,
+  createV1JPreflightDiagnosticJournal,
   finalizeV1JSmokeArtifacts,
   resolveV1JSmokeRoot,
   runV1JSmokeSchedule,
@@ -724,6 +726,79 @@ describe("v1J action-initiation protocol and offline harness", () => {
     expect(smoke.find((cell) => cell.caseId === "smoke-no-tool-control")?.requiredTools).toEqual(
       [],
     );
+  });
+
+  it("durably records preflight stop predicates and keeps smoke scheduling closed until A/C complete", () => {
+    const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), "v1j-preflight-journal-test-"));
+    const commit = "9".repeat(40);
+    const journal = createV1JPreflightDiagnosticJournal({
+      repoRoot,
+      harnessCommit: commit,
+      arm: "C",
+      caseId: "diagnostic-case",
+      preflightId: "preflight-test-c",
+      pid: 123,
+      startedAtMs: 100,
+    });
+    try {
+      journal.increment("providerRequestHookInvocations", "arm-c-provider-request-hook-enter", {
+        callSite: "offline-test",
+      });
+      journal.increment("requestObserverInvocations", "arm-c-request-observer-enter", {
+        callSite: "offline-test",
+      });
+      journal.increment("preflightStopSignalRaised", "arm-c-stop-before-dispatch-signal");
+      journal.increment("preflightStopSignalCaught", "arm-c-preflight-stop-signal-caught");
+      const predicates = journal.evaluateStop({
+        requestObserverCount: 1,
+        capturedRequestCount: 1,
+        delegatedRequestCount: 0,
+        providerDispatchAttempts: 0,
+      });
+      expect(Object.values(predicates).every(Boolean)).toBe(true);
+      const completedArms: ("A" | "C")[] = ["A"];
+      let scheduleStarts = 0;
+      const startSchedule = () => {
+        assertV1JPreflightPairComplete(completedArms);
+        scheduleStarts += 1;
+      };
+      expect(startSchedule).toThrow(/requires completed A and C/);
+      expect(scheduleStarts).toBe(0);
+      completedArms.push("C");
+      expect(startSchedule).not.toThrow();
+      expect(scheduleStarts).toBe(1);
+    } finally {
+      journal.close();
+    }
+    try {
+      const rows = fs
+        .readFileSync(journal.filePath, "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      expect(rows.map((row) => row.event)).toEqual([
+        "arm-c-preflight-start",
+        "arm-c-provider-request-hook-enter",
+        "arm-c-request-observer-enter",
+        "arm-c-stop-before-dispatch-signal",
+        "arm-c-preflight-stop-signal-caught",
+        "preflight-stop-assertion-evaluated",
+      ]);
+      expect(rows.at(-1)).toMatchObject({
+        passed: true,
+        predicates: {
+          providerCallbackCountIsZero: true,
+          dispatchAttemptsIsZero: true,
+          modelRequestCountIsZero: true,
+          stopSignalRaised: true,
+          stopSignalCaught: true,
+        },
+      });
+      expect(fs.existsSync(path.resolve(repoRoot, V1J_FORMAL_ARTIFACT_RELATIVE_PATH))).toBe(false);
+      expect(fs.existsSync(resolveV1JSmokeRoot(repoRoot, commit))).toBe(false);
+    } finally {
+      fs.rmSync(repoRoot, { recursive: true, force: true });
+    }
   });
 
   it("writes smoke records only beneath the commit-bound smoke root and preserves no-tool rows", () => {

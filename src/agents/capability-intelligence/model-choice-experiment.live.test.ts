@@ -9,12 +9,17 @@ import { configureAiTransportHost, getAiTransportHost } from "@openclaw/ai";
 import { describe, expect, it, vi } from "vitest";
 import {
   assertV1JFormalStateEmpty,
+  assertV1JPreflightPairComplete,
   assertV1JSmokeProvenance,
   buildV1JSmokeSchedule,
+  createV1JPreflightDiagnosticJournal,
   createV1JSmokeArtifactState,
   finalizeV1JSmokeArtifacts,
+  resolveV1JSmokeRoot,
   runV1JSmokeSchedule,
+  V1J_FORMAL_ARTIFACT_RELATIVE_PATH,
   V1J_SMOKE_PROVENANCE_PATH,
+  type V1JPreflightDiagnosticJournal,
   type V1JSmokeCell,
 } from "../../../test/helpers/agents/model-choice-action-initiation-smoke.js";
 import {
@@ -1255,8 +1260,41 @@ describeV1JActionSmoke("v1J isolated live operational smoke", () => {
         throw new Error("v1J smoke requires active filtering to remain disabled");
       }
       await assertLiveModelAvailable();
-      const surfaceA = await captureV1JPreflightSurface(protocol, "A", head);
-      const surfaceC = await captureV1JPreflightSurface(protocol, "C", head);
+      const preflightJournals: V1JPreflightDiagnosticJournal[] = [];
+      let surfaceA: ReturnType<typeof fingerprintV1JToolSurface> | undefined;
+      let surfaceC: ReturnType<typeof fingerprintV1JToolSurface> | undefined;
+      const completedArms: ("A" | "C")[] = [];
+      try {
+        for (const arm of ["A", "C"] as const) {
+          const preflightId = `v1j-preflight-${arm}-${head.slice(0, 8)}-${process.pid}`;
+          const journal = createV1JPreflightDiagnosticJournal({
+            repoRoot,
+            harnessCommit: head,
+            arm,
+            caseId:
+              protocol.design.cells.find((entry) => entry.stratum === "TOOL_REQUIRED")?.caseId ??
+              "unknown",
+            preflightId,
+            pid: process.pid,
+          });
+          preflightJournals.push(journal);
+          const surface = await captureV1JPreflightSurface(protocol, arm, head, journal);
+          completedArms.push(arm);
+          if (arm === "A") {
+            surfaceA = surface;
+          } else {
+            surfaceC = surface;
+          }
+        }
+      } finally {
+        for (const journal of preflightJournals) {
+          journal.close();
+        }
+      }
+      assertV1JPreflightPairComplete(completedArms);
+      if (!surfaceA || !surfaceC) {
+        throw new Error("v1J smoke schema preflight pair completed without both surfaces");
+      }
       if (canonicalizeV1IValue(surfaceA) !== canonicalizeV1IValue(surfaceC)) {
         throw new Error("v1J smoke A/C provider schema preflight mismatch");
       }
@@ -1423,6 +1461,7 @@ async function captureV1JPreflightSurface(
   protocol: V1JProtocol,
   arm: "A" | "C",
   head: string,
+  preflightDiagnostics?: V1JPreflightDiagnosticJournal,
 ): Promise<ReturnType<typeof fingerprintV1JToolSurface>> {
   const benchmarkCase = requireV1JBenchmarkCase(
     protocol,
@@ -1431,10 +1470,12 @@ async function captureV1JPreflightSurface(
   const workspaceDir = fs.mkdtempSync(path.join(os.tmpdir(), `v1j-preflight-${arm}-`));
   const authorizedTools: V1JAuthorizedToolSchema[] = [];
   const requests: CapturedModelRequest[] = [];
+  let observation: ExperimentRun | undefined;
   let dispatchAttempts = 0;
   let delegatedRequests = 0;
+  let runtimeReadyRecorded = false;
   try {
-    await runOne({
+    observation = await runOne({
       mode: "real-exact",
       surfaceMode: "REAL_EXACT_ONLY",
       benchmarkCase,
@@ -1454,6 +1495,7 @@ async function captureV1JPreflightSurface(
       runIdOverride: `v1j-preflight-${arm}-${head.slice(0, 8)}-${process.pid}`,
       requestCapture: {
         stopAfterCapture: true,
+        ...(preflightDiagnostics ? { preflightDiagnostics } : {}),
         capturePromptInstruction: v1jInstructionForArm(protocol, arm),
         onAuthorizedToolsCaptured: (tools) =>
           authorizedTools.splice(0, authorizedTools.length, ...tools),
@@ -1465,7 +1507,39 @@ async function captureV1JPreflightSurface(
           delegatedRequests += 1;
         },
       },
+      onCheckpoint: (checkpoint) => {
+        if (
+          preflightDiagnostics &&
+          !runtimeReadyRecorded &&
+          checkpoint.stage === "client-preparation-completed"
+        ) {
+          runtimeReadyRecorded = true;
+          preflightDiagnostics.record(`arm-${arm.toLowerCase()}-runtime-ready`, {
+            sourceCheckpoint: checkpoint.stage,
+          });
+        }
+      },
     });
+    const failureName = observation.requestPreparationDiagnostics?.failure?.errorName;
+    if (failureName === V1IProviderRequestCapturedError.name) {
+      preflightDiagnostics?.increment(
+        "preflightStopSignalCaught",
+        `arm-${arm.toLowerCase()}-preflight-stop-signal-caught`,
+        { caughtAt: "requestPreparationDiagnostics", failureName },
+      );
+    }
+  } catch (error) {
+    preflightDiagnostics?.record(`arm-${arm.toLowerCase()}-preflight-error`, {
+      errorName: error instanceof Error ? error.name : typeof error,
+    });
+    if (error instanceof V1IProviderRequestCapturedError) {
+      preflightDiagnostics?.increment(
+        "preflightStopSignalCaught",
+        `arm-${arm.toLowerCase()}-preflight-stop-signal-caught`,
+        { caughtAt: "runOne-rejection", failureName: error.name },
+      );
+    }
+    throw error;
   } finally {
     try {
       fs.rmSync(workspaceDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
@@ -1473,8 +1547,46 @@ async function captureV1JPreflightSurface(
       // Prepared agent stores may remain open until this test process exits on Windows.
     }
   }
-  if (requests.length !== 1 || dispatchAttempts !== 0 || delegatedRequests !== 0) {
-    throw new Error("v1J schema preflight did not stop before provider dispatch");
+  const predicates = preflightDiagnostics?.evaluateStop({
+    requestObserverCount: requests.length,
+    capturedRequestCount: requests.length,
+    delegatedRequestCount: delegatedRequests,
+    providerDispatchAttempts: dispatchAttempts,
+  });
+  const stopFailureName = observation?.requestPreparationDiagnostics?.failure?.errorName;
+  if (stopFailureName === V1IProviderRequestCapturedError.name && preflightDiagnostics) {
+    preflightDiagnostics.record(`arm-${arm.toLowerCase()}-preflight-stop-caught`, {
+      failureName: stopFailureName,
+    });
+  }
+  const passed =
+    requests.length === 1 &&
+    dispatchAttempts === 0 &&
+    delegatedRequests === 0 &&
+    (!predicates || Object.values(predicates).every(Boolean));
+  if (!passed) {
+    throw new Error(
+      `v1J schema preflight failed: ${JSON.stringify({
+        arm,
+        requestObserverInvocations: preflightDiagnostics?.counters().requestObserverInvocations,
+        providerRequestHookInvocations:
+          preflightDiagnostics?.counters().providerRequestHookInvocations,
+        fetchWrapperInvocations: preflightDiagnostics?.counters().fetchWrapperInvocations,
+        providerCallbackInvocations: preflightDiagnostics?.counters().providerCallbackInvocations,
+        providerDispatchAttempts: dispatchAttempts,
+        providerDispatchCallbackCount: dispatchAttempts,
+        capturedRequestCount: requests.length,
+        delegatedRequestCount: delegatedRequests,
+        stopFailureName,
+        modelRequestCounter: preflightDiagnostics?.counters().modelRequestCounter,
+        schemaCaptureStarts: preflightDiagnostics?.counters().schemaCaptureStarts,
+        schemaCaptureCompletes: preflightDiagnostics?.counters().schemaCaptureCompletes,
+        preflightStopSignalRaised: preflightDiagnostics?.counters().preflightStopSignalRaised,
+        preflightStopSignalCaught: preflightDiagnostics?.counters().preflightStopSignalCaught,
+        preflightCompleted: preflightDiagnostics?.counters().preflightCompleted,
+        predicates,
+      })}`,
+    );
   }
   const actionInstruction = v1jInstructionForArm(protocol, "C");
   const systemText = v1jSystemMessageText(requests[0]!.body);
@@ -1507,6 +1619,13 @@ async function captureV1JPreflightSurface(
     activeFilteringEnabled: ACTIVE_FILTERING_ENABLED,
     surface: actual,
   });
+  preflightDiagnostics?.record(`arm-${arm.toLowerCase()}-schema-validated`, {
+    requestObserverCallSite: "runOne.diagnostics.hooks.onProviderRequest",
+  });
+  preflightDiagnostics?.increment(
+    "preflightCompleted",
+    `arm-${arm.toLowerCase()}-preflight-complete`,
+  );
   return actual;
 }
 
@@ -1903,6 +2022,187 @@ describe("v1I diagnostic resource resolution", () => {
 });
 
 describe("v1J schema-capture dispatch guard", () => {
+  it("records repeated Arm C preflight callbacks and keeps the smoke schedule closed", async () => {
+    const protocol = readV1JPreregistration();
+    const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), "v1j-preflight-path-test-"));
+    const cwd = vi.spyOn(process, "cwd").mockReturnValue(repoRoot);
+    const head = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+    const journal = createV1JPreflightDiagnosticJournal({
+      repoRoot,
+      harnessCommit: head,
+      arm: "C",
+      caseId:
+        protocol.design.cells.find((entry) => entry.stratum === "TOOL_REQUIRED")?.caseId ??
+        "unknown",
+      preflightId: `offline-arm-c-${process.pid}`,
+      pid: process.pid,
+    });
+    try {
+      await installOfflinePreparedRuntimeMock();
+      let preflightError: unknown;
+      try {
+        await captureV1JPreflightSurface(protocol, "C", head, journal);
+      } catch (error) {
+        preflightError = error;
+      }
+      expect(preflightError).toBeInstanceOf(Error);
+      expect((preflightError as Error).message).toContain('"requestObserverInvocations":4');
+      expect(journal.counters()).toMatchObject({
+        requestObserverInvocations: 4,
+        providerRequestHookInvocations: 4,
+        providerCallbackInvocations: 0,
+        providerDispatchAttempts: 0,
+        modelRequestCounter: 0,
+        preflightStopSignalRaised: 4,
+        preflightStopSignalCaught: 1,
+        preflightCompleted: 0,
+      });
+      expect(() => assertV1JPreflightPairComplete(["C"])).toThrow(/requires completed A and C/);
+      expect(fs.existsSync(path.resolve(repoRoot, V1J_FORMAL_ARTIFACT_RELATIVE_PATH))).toBe(false);
+      expect(fs.existsSync(resolveV1JSmokeRoot(repoRoot, head))).toBe(false);
+      const rows = fs
+        .readFileSync(journal.filePath, "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      const events = rows.map((row) => row.event);
+      expect(events).toContain("arm-c-preflight-start");
+      expect(events).toContain("arm-c-runtime-ready");
+      expect(events).toContain("arm-c-request-observer-enter");
+      expect(events).not.toContain("arm-c-schema-validated");
+      expect(events).toContain("arm-c-stop-before-dispatch-signal");
+      expect(events).toContain("arm-c-preflight-stop-signal-caught");
+      expect(events).not.toContain("arm-c-preflight-complete");
+      const hookRows = rows.filter((row) => row.event === "arm-c-provider-request-hook-enter");
+      expect(hookRows.map((row) => row.invocationIndex)).toEqual([1, 2, 3, 4]);
+      expect(
+        hookRows.every((row) => row.callSite === "runOne.diagnostics.hooks.onProviderRequest"),
+      ).toBe(true);
+      expect(rows.find((row) => row.event === "preflight-stop-assertion-evaluated")).toMatchObject({
+        passed: false,
+        predicates: {
+          requestObserverCountIsOne: false,
+          providerRequestHookCountIsOne: false,
+          providerCallbackCountIsZero: true,
+          dispatchAttemptsIsZero: true,
+          modelRequestCountIsZero: true,
+          stopSignalRaised: false,
+          stopSignalCaught: true,
+          capturedRequestCountIsOne: false,
+        },
+      });
+    } finally {
+      journal.close();
+      cwd.mockRestore();
+      fs.rmSync(repoRoot, { recursive: true, force: true });
+    }
+  }, 120_000);
+
+  it("records a blocked preflight separately from a provider dispatch and keeps the schedule closed", async () => {
+    const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), "v1j-preflight-dispatch-test-"));
+    const commit = "8".repeat(40);
+    const blockedJournal = createV1JPreflightDiagnosticJournal({
+      repoRoot,
+      harnessCommit: commit,
+      arm: "C",
+      caseId: "offline-preflight",
+      preflightId: "offline-preflight-c-blocked",
+      pid: process.pid,
+    });
+    const blockedFetch = captureModelPayloads(undefined, {
+      stopAfterCapture: true,
+      preflightDiagnostics: blockedJournal,
+    });
+    blockedJournal.increment(
+      "providerRequestHookInvocations",
+      "arm-c-provider-request-hook-enter",
+      {
+        callSite: "offline-regression-test",
+      },
+    );
+    let blockedProviderCallbackCalls = 0;
+    try {
+      await expect(
+        blockedFetch.wrapFetch(async () => {
+          blockedProviderCallbackCalls += 1;
+          return new Response("{}");
+        })(`${LM_STUDIO_BASE_URL}/chat/completions`, {
+          method: "POST",
+          body: JSON.stringify({ model: MODEL_ID, tools: [] }),
+        }),
+      ).rejects.toBeInstanceOf(V1IProviderRequestCapturedError);
+      blockedJournal.increment("preflightStopSignalCaught", "arm-c-preflight-stop-signal-caught", {
+        caughtAt: "offline-regression-test",
+      });
+      const blockedPredicates = blockedJournal.evaluateStop({
+        requestObserverCount: blockedJournal.counters().requestObserverInvocations,
+        capturedRequestCount: blockedFetch.requests.length,
+        delegatedRequestCount: blockedFetch.delegatedRequests,
+        providerDispatchAttempts: blockedFetch.providerDispatchAttempts,
+      });
+      expect(Object.values(blockedPredicates).every(Boolean)).toBe(true);
+      expect(blockedProviderCallbackCalls).toBe(0);
+      expect(blockedJournal.counters()).toMatchObject({
+        providerDispatchAttempts: 0,
+        modelRequestCounter: 0,
+        preflightStopSignalRaised: 1,
+        preflightStopSignalCaught: 1,
+      });
+      let scheduleStarted = false;
+      expect(() => {
+        assertV1JPreflightPairComplete(["A"]);
+        scheduleStarted = true;
+      }).toThrow(/requires completed A and C/);
+      expect(scheduleStarted).toBe(false);
+    } finally {
+      blockedFetch.restore();
+      blockedJournal.close();
+    }
+
+    const dispatchJournal = createV1JPreflightDiagnosticJournal({
+      repoRoot,
+      harnessCommit: commit,
+      arm: "C",
+      caseId: "offline-preflight",
+      preflightId: "offline-preflight-c-dispatched",
+      pid: process.pid,
+    });
+    const dispatchFetch = captureModelPayloads(undefined, {
+      preflightDiagnostics: dispatchJournal,
+    });
+    dispatchJournal.increment(
+      "providerRequestHookInvocations",
+      "arm-c-provider-request-hook-enter",
+      {
+        callSite: "offline-regression-test",
+      },
+    );
+    let dispatchedProviderCallbackCalls = 0;
+    try {
+      await dispatchFetch.wrapFetch(async () => {
+        dispatchedProviderCallbackCalls += 1;
+        return new Response("{}", { headers: { "content-type": "application/json" } });
+      })(`${LM_STUDIO_BASE_URL}/chat/completions`, {
+        method: "POST",
+        body: JSON.stringify({ model: MODEL_ID, tools: [] }),
+      });
+      const dispatchPredicates = dispatchJournal.evaluateStop({
+        requestObserverCount: dispatchJournal.counters().requestObserverInvocations,
+        capturedRequestCount: dispatchFetch.requests.length,
+        delegatedRequestCount: dispatchFetch.delegatedRequests,
+        providerDispatchAttempts: dispatchFetch.providerDispatchAttempts,
+      });
+      expect(dispatchPredicates.providerCallbackCountIsZero).toBe(false);
+      expect(dispatchPredicates.dispatchAttemptsIsZero).toBe(false);
+      expect(dispatchPredicates.modelRequestCountIsZero).toBe(false);
+      expect(dispatchedProviderCallbackCalls).toBe(1);
+    } finally {
+      dispatchFetch.restore();
+      dispatchJournal.close();
+      fs.rmSync(repoRoot, { recursive: true, force: true });
+    }
+  });
+
   it("blocks the wrapped provider fetch in capture mode and preserves normal dispatch", async () => {
     let captureFetchCalls = 0;
     const capture = captureModelPayloads(undefined, {
@@ -3635,6 +3935,7 @@ async function runOne(input: {
   requestCapture?: {
     stopAfterCapture?: boolean;
     holdAfterCapture?: boolean;
+    preflightDiagnostics?: V1JPreflightDiagnosticJournal;
     schemaCaptureName?: V1JSchemaCaptureName;
     schemaCaptureArm?: V1JSchemaCaptureArm;
     headCommit?: string;
@@ -3837,6 +4138,16 @@ async function runOne(input: {
   });
   const diagnosticsProviderRequest = diagnostics.hooks.onProviderRequest;
   diagnostics.hooks.onProviderRequest = async ({ payload, model }) => {
+    const preflightDiagnostics = input.requestCapture?.preflightDiagnostics;
+    preflightDiagnostics?.increment(
+      "providerRequestHookInvocations",
+      `arm-${preflightDiagnostics.arm.toLowerCase()}-provider-request-hook-enter`,
+      {
+        invocationIndex: preflightDiagnostics.counters().providerRequestHookInvocations + 1,
+        providerRequestPhase: "request-hook-enter",
+        callSite: "runOne.diagnostics.hooks.onProviderRequest",
+      },
+    );
     const body =
       payload && typeof payload === "object" && !Array.isArray(payload)
         ? (payload as Record<string, unknown>)
@@ -3844,6 +4155,14 @@ async function runOne(input: {
     const request = { body, url: "provider-adapter" };
     input.requestCapture?.liveness?.record("provider-tool-projection-complete");
     if (input.requestCapture?.schemaCaptureName) {
+      preflightDiagnostics?.increment(
+        "schemaCaptureStarts",
+        `arm-${input.arm.toLowerCase()}-schema-capture-start`,
+        {
+          captureName: input.requestCapture.schemaCaptureName,
+          invocationIndex: schemaSinkInvocationIndex + 1,
+        },
+      );
       const preSink = prepareV1JPreSinkCapture({
         captureName: input.requestCapture.schemaCaptureName,
         captureArm: input.requestCapture.schemaCaptureArm,
@@ -3872,17 +4191,58 @@ async function runOne(input: {
           input.requestCapture?.liveness?.record(checkpoint, metadata),
       });
       input.requestCapture.liveness?.record("schema-sink-complete", preSink.sinkMetadata);
+      preflightDiagnostics?.increment(
+        "schemaCaptureCompletes",
+        `arm-${input.arm.toLowerCase()}-schema-capture-complete`,
+        {
+          captureName: input.requestCapture.schemaCaptureName,
+          invocationIndex: schemaSinkInvocationIndex,
+        },
+      );
     }
     capture.recordProviderRequest(request);
+    preflightDiagnostics?.increment(
+      "requestObserverInvocations",
+      `arm-${preflightDiagnostics.arm.toLowerCase()}-request-observer-enter`,
+      {
+        invocationIndex: capture.requests.length,
+        providerRequestPhase: "request-observer-enter",
+        callSite: "runOne.diagnostics.hooks.onProviderRequest",
+      },
+    );
     input.requestCapture?.onRequestCaptured?.(request);
+    preflightDiagnostics?.record(
+      `arm-${preflightDiagnostics.arm.toLowerCase()}-request-observer-exit`,
+      {
+        callSite: "runOne.diagnostics.hooks.onProviderRequest",
+        invocationIndex: capture.requests.length,
+      },
+    );
     const toolNames = toolNamesFromBody(body);
     diagnostics.hooks.onCheckpoint?.({
       stage: "provider-request-constructed",
       toolCount: toolNames.length,
       representativeToolNames: toolNames,
     });
-    await diagnosticsProviderRequest?.({ payload, model });
+    try {
+      await diagnosticsProviderRequest?.({ payload, model });
+    } finally {
+      preflightDiagnostics?.record(
+        `arm-${preflightDiagnostics.arm.toLowerCase()}-provider-request-hook-exit`,
+        { callSite: "runOne.diagnostics.hooks.onProviderRequest" },
+      );
+    }
     if (input.requestCapture?.stopAfterCapture) {
+      preflightDiagnostics?.increment(
+        "preflightStopSignalRaised",
+        `arm-${preflightDiagnostics?.arm.toLowerCase() ?? input.arm.toLowerCase()}-stop-before-dispatch-signal`,
+        {
+          invocationIndex: capture.requests.length,
+          providerRequestPhase: "stop-before-dispatch",
+          callSite: "runOne.diagnostics.hooks.onProviderRequest",
+          signalName: V1IProviderRequestCapturedError.name,
+        },
+      );
       input.requestCapture.liveness?.record("provider-dispatch-guard-reached", {
         providerDispatchAttempts: capture.providerDispatchAttempts,
       });
@@ -5521,6 +5881,7 @@ function captureModelPayloads(
     stopAfterCapture?: boolean;
     holdAfterCapture?: boolean;
     schemaCaptureName?: V1JSchemaCaptureName;
+    preflightDiagnostics?: V1JPreflightDiagnosticJournal;
     liveness?: V1JCaptureLiveness;
     onProviderDispatchAttempt?: (count: number) => void;
     onRequestCaptured?: (request: CapturedModelRequest) => void;
@@ -5534,6 +5895,7 @@ function captureModelPayloads(
   let delegatedRequests = 0;
   let providerDispatchAttempts = 0;
   const originalFetch = globalThis.fetch;
+  const wrappedFetches = new WeakSet<typeof globalThis.fetch>();
   const wrapFetch = (baseFetch: typeof globalThis.fetch): typeof globalThis.fetch => {
     const emitResponseSummary = (summary: ProviderResponseSummary) => {
       hooks?.onPostResponseSnapshot?.({
@@ -5545,7 +5907,16 @@ function captureModelPayloads(
       });
       options?.onResponseSummary?.(summary);
     };
-    return async (input, init) => {
+    const wrappedFetch: typeof globalThis.fetch = async (input, init) => {
+      const preflightEvent = (event: string) =>
+        options?.preflightDiagnostics
+          ? `arm-${options.preflightDiagnostics.arm.toLowerCase()}-${event}`
+          : event;
+      options?.preflightDiagnostics?.increment(
+        "fetchWrapperInvocations",
+        preflightEvent("fetch-wrapper-invocation"),
+        { callSite: "captureModelPayloads.wrapFetch" },
+      );
       const url =
         typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
       const body = await readCapturedFetchBody(input, init);
@@ -5560,7 +5931,16 @@ function captureModelPayloads(
         const request = { body: parsed, url };
         if (!providerRequestRecorded) {
           requests.push(request);
+          options?.preflightDiagnostics?.increment(
+            "requestObserverInvocations",
+            preflightEvent("request-observer-enter"),
+            { callSite: "captureModelPayloads.wrapFetch", invocationIndex: requests.length },
+          );
           options?.onRequestCaptured?.(request);
+          options?.preflightDiagnostics?.record(preflightEvent("request-observer-exit"), {
+            callSite: "captureModelPayloads.wrapFetch",
+            invocationIndex: requests.length,
+          });
         }
         const toolNames = toolNamesFromBody(parsed);
         hooks?.onCheckpoint?.({
@@ -5571,12 +5951,25 @@ function captureModelPayloads(
         if (options?.schemaCaptureName) {
           providerDispatchAttempts += 1;
           options.onProviderDispatchAttempt?.(providerDispatchAttempts);
+          options?.preflightDiagnostics?.increment(
+            "providerDispatchAttempts",
+            preflightEvent("dispatch-counter-increment"),
+            { callSite: "captureModelPayloads.wrapFetch", captureName: options.schemaCaptureName },
+          );
           options.liveness?.record("provider-dispatch-guard-reached", {
             providerDispatchAttempts,
           });
           throw new V1IProviderDispatchAttemptError();
         }
         if (options?.stopAfterCapture) {
+          options?.preflightDiagnostics?.increment(
+            "preflightStopSignalRaised",
+            preflightEvent("stop-before-dispatch-signal"),
+            {
+              callSite: "captureModelPayloads.wrapFetch",
+              signalName: V1IProviderRequestCapturedError.name,
+            },
+          );
           throw new V1IProviderRequestCapturedError();
         }
         if (options?.holdAfterCapture) {
@@ -5589,11 +5982,28 @@ function captureModelPayloads(
             signal?.addEventListener("abort", () => reject(abortReason(signal)), { once: true });
           });
         }
-        providerDispatchAttempts += 1;
-        options?.onProviderDispatchAttempt?.(providerDispatchAttempts);
       }
       options?.onDelegatedRequest?.();
       delegatedRequests += 1;
+      providerDispatchAttempts += 1;
+      options?.onProviderDispatchAttempt?.(providerDispatchAttempts);
+      if (isProviderRequest && !wrappedFetches.has(baseFetch)) {
+        options?.preflightDiagnostics?.increment(
+          "providerDispatchAttempts",
+          preflightEvent("dispatch-counter-increment"),
+          { callSite: "captureModelPayloads.wrapFetch" },
+        );
+        options?.preflightDiagnostics?.increment(
+          "providerCallbackInvocations",
+          preflightEvent("provider-callback-enter"),
+          { callSite: "captureModelPayloads.wrapFetch.baseFetch" },
+        );
+        options?.preflightDiagnostics?.increment(
+          "modelRequestCounter",
+          preflightEvent("model-request-counter-increment"),
+          { callSite: "captureModelPayloads.wrapFetch.baseFetch" },
+        );
+      }
       const response = await baseFetch(input, init);
       if (!isProviderRequest) {
         return response;
@@ -5631,6 +6041,8 @@ function captureModelPayloads(
         headers: response.headers,
       });
     };
+    wrappedFetches.add(wrappedFetch);
+    return wrappedFetch;
   };
   globalThis.fetch = wrapFetch(originalFetch);
   return {

@@ -60,6 +60,11 @@ function responseWithChunks(chunks: readonly string[], delayMs = 0): Response {
 describe("v1J LM Studio provider transport controls", () => {
   it("requires exact commit-bound authorization and frozen preflight values", () => {
     expect(() => assertV1JProviderControlPreflight(preflightInput())).not.toThrow();
+    const unauthorizedInput = preflightInput();
+    delete unauthorizedInput.env[V1J_PROVIDER_CONTROL_AUTHORIZED_FLAG];
+    expect(() => assertV1JProviderControlPreflight(unauthorizedInput)).toThrow(
+      /exact commit-bound authorization flags/,
+    );
     expect(() =>
       assertV1JProviderControlPreflight({
         ...preflightInput(),

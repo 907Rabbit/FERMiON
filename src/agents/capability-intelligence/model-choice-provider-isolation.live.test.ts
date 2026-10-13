@@ -14,6 +14,7 @@ import {
   V1J_PROVIDER_CONTROL_PREREGISTRATION_SHA256,
   V1J_PROVIDER_CONTROL_RUN_FLAG,
   V1J_PROVIDER_CONTROL_TIMEOUT_MS,
+  V1J_PROVIDER_CONTROL_SCHEMA_BASELINE,
 } from "../../../test/helpers/agents/model-choice-provider-isolation.js";
 import { hashV1ICanonical } from "./model-choice-experiment-evidence.js";
 import {

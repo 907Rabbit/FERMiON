@@ -52,8 +52,10 @@ import {
   assertV1JAdapterDifferentialRequestBudget,
   createV1JAdapterDifferentialJournal,
   installV1JAdapterDifferentialToolGuard,
+  reportV1JAdapterDifferentialProgress,
   runV1JAdapterDifferentialRawTransport,
   summarizeV1JAdapterDifferentialRequest,
+  withV1JAdapterDifferentialProgress,
   V1J_ADAPTER_DIFFERENTIAL_AUTHORIZED_FLAG,
   V1J_ADAPTER_DIFFERENTIAL_COMMIT_FLAG,
   V1J_ADAPTER_DIFFERENTIAL_MAX_ADAPTER_REQUESTS,
@@ -281,6 +283,9 @@ type V1JLifecycleJournal = Pick<V1JProviderResponseDiagnosticJournal, "record">;
 
 type PromptMessageTraceEvent = Parameters<
   NonNullable<RunEmbeddedAgentParams["capabilityIntelligenceExperiment"]>["onPromptMessageTrace"]
+>[0];
+type EmbeddedCapabilityCheckpoint = Parameters<
+  NonNullable<RunEmbeddedAgentParams["capabilityIntelligenceExperiment"]>["onCheckpoint"]
 >[0];
 
 function summarizePromptMessageTrace(
@@ -1791,6 +1796,11 @@ describeV1JAdapterDifferential("v1J raw-transport versus adapter differential", 
       ) {
         throw new Error("v1J adapter differential requires only its dedicated authorization flags");
       }
+      reportV1JAdapterDifferentialProgress({
+        event: "checkpoint",
+        stage: "live-config-test-start",
+        elapsedMs: 0,
+      });
       const protocol = readV1JPreregistration();
       const head = assertV1JCommittedHarness(protocol);
       const repoRoot = process.cwd();
@@ -1825,7 +1835,10 @@ describeV1JAdapterDifferential("v1J raw-transport versus adapter differential", 
         artifactExists: fs.existsSync(artifactRoot),
       });
       assertV1JFormalStateEmpty(repoRoot);
-      await assertLiveModelAvailable();
+      await withV1JAdapterDifferentialProgress({
+        stage: "lmstudio-discovery",
+        operation: () => assertLiveModelAvailable(),
+      });
 
       const cell = buildV1JSmokeSchedule(protocol).find(
         (candidate) => candidate.cellId === "smoke-tool-required:A:1",
@@ -1835,15 +1848,30 @@ describeV1JAdapterDifferential("v1J raw-transport versus adapter differential", 
       }
       const benchmark = v1jSmokeBenchmark(cell);
       const capturedBodies: Record<string, unknown>[] = [];
-      const schemaSurface = await captureV1JPreflightSurface(protocol, "A", head, undefined, {
-        benchmarkCase: benchmark,
-        prepareWorkspace: (preparedWorkspace) =>
-          fs.writeFileSync(
-            path.join(preparedWorkspace, "smoke-reference.txt"),
-            "smoke-token-47\n",
-            { encoding: "utf8", flag: "wx" },
-          ),
-        onCapturedRequest: (request) => capturedBodies.push(structuredClone(request.body)),
+      const schemaSurface = await withV1JAdapterDifferentialProgress({
+        stage: "schema-preflight",
+        operation: (checkpoint) => {
+          checkpoint("prepared-runtime-acquisition-start");
+          return captureV1JPreflightSurface(protocol, "A", head, undefined, {
+            benchmarkCase: benchmark,
+            prepareWorkspace: (preparedWorkspace) =>
+              fs.writeFileSync(
+                path.join(preparedWorkspace, "smoke-reference.txt"),
+                "smoke-token-47\n",
+                { encoding: "utf8", flag: "wx" },
+              ),
+            onCapturedRequest: (request) => capturedBodies.push(structuredClone(request.body)),
+            onCheckpoint: (runtimeCheckpoint) => {
+              if (
+                runtimeCheckpoint.stage.startsWith("prepared-runtime-") ||
+                runtimeCheckpoint.stage.startsWith("plugin-prep-")
+              ) {
+                checkpoint(runtimeCheckpoint.stage);
+              }
+            },
+            onProgress: checkpoint,
+          });
+        },
       });
       const expectedSurface = protocol.schemaBaseline;
       if (
@@ -1882,13 +1910,17 @@ describeV1JAdapterDifferential("v1J raw-transport versus adapter differential", 
         flag: "wx",
       });
       const requestMetrics = summarizeV1JAdapterDifferentialRequest(controlC.body);
-      const journal = createV1JAdapterDifferentialJournal({
-        repoRoot,
-        harnessCommit: head,
-        modelId: protocol.model.id,
-        modelConfigHash: hashV1ICanonical(modelConfigIdentity()),
-        schemaFingerprint: schemaSurface,
-        startedAt: new Date().toISOString(),
+      const journal = await withV1JAdapterDifferentialProgress({
+        stage: "differential-journal-creation",
+        operation: () =>
+          createV1JAdapterDifferentialJournal({
+            repoRoot,
+            harnessCommit: head,
+            modelId: protocol.model.id,
+            modelConfigHash: hashV1ICanonical(modelConfigIdentity()),
+            schemaFingerprint: schemaSurface,
+            startedAt: new Date().toISOString(),
+          }),
       });
       let rawResult: Awaited<ReturnType<typeof runV1JAdapterDifferentialRawTransport>> | undefined;
       let observation: V1JObservation | undefined;
@@ -1899,12 +1931,16 @@ describeV1JAdapterDifferential("v1J raw-transport versus adapter differential", 
         | undefined;
       try {
         journal.record("captured-arm-a-request-ready", requestMetrics);
-        rawResult = await runV1JAdapterDifferentialRawTransport({
-          endpoint: `${LM_STUDIO_BASE_URL}/chat/completions`,
-          authorization: `Bearer ${process.env.LM_API_TOKEN ?? "lmstudio"}`,
-          requestBody: controlC.body,
-          fetchImpl: fetch,
-          journal,
+        rawResult = await withV1JAdapterDifferentialProgress({
+          stage: "raw-control-c-dispatch",
+          operation: () =>
+            runV1JAdapterDifferentialRawTransport({
+              endpoint: `${LM_STUDIO_BASE_URL}/chat/completions`,
+              authorization: `Bearer ${process.env.LM_API_TOKEN ?? "lmstudio"}`,
+              requestBody: controlC.body,
+              fetchImpl: fetch,
+              journal,
+            }),
         });
         journal.record("raw-transport-complete", {
           httpStatus: rawResult.httpStatus,
@@ -1923,48 +1959,52 @@ describeV1JAdapterDifferential("v1J raw-transport versus adapter differential", 
           journal,
         });
         journal.record("adapter-path-start", { requestIndex: 1, outcome: "started" });
-        observation = await executeV1JCell({
-          protocol,
-          cell,
-          attempt: 1,
-          head,
-          benchmarkOverride: benchmark,
-          workspaceDirOverride: workspaceDir,
-          allowNoToolTerminalEvidence: true,
-          runIdPrefix: "v1j-adapter-differential",
-          lifecycleJournal: journal,
-          onAssistantMessage: () => adapterToolGuard?.ensureInstalled(),
-          onRequestCaptured: (request, requestIndex) => {
-            if (requestIndex === 1) {
-              adapterRequestMatch = assertV1JAdapterDifferentialRequestMatch(
-                controlC.body,
-                request.body,
-              );
-              journal.record("adapter-request-body-matched", {
-                ...adapterRequestMatch,
-                ...summarizeV1JAdapterDifferentialRequest(request.body),
-              });
-              return;
-            }
-            journal.record("adapter-followup-request", {
-              requestIndex,
-              ...summarizeV1JAdapterDifferentialRequest(request.body),
-            });
-          },
-          onProviderDispatchAttempt: (count) => {
-            adapterDispatches = count;
-            assertV1JAdapterDifferentialRequestBudget({
-              rawRequests: rawResult?.requestDispatchStarted ? 1 : 0,
-              adapterRequests: count,
-            });
-            journal.record("adapter-dispatch-attempt", {
-              requestIndex: count,
-              outcome:
-                count <= V1J_ADAPTER_DIFFERENTIAL_MAX_ADAPTER_REQUESTS
-                  ? "within-bound"
-                  : "hard-stop",
-            });
-          },
+        observation = await withV1JAdapterDifferentialProgress({
+          stage: "adapter-model-loop",
+          operation: () =>
+            executeV1JCell({
+              protocol,
+              cell,
+              attempt: 1,
+              head,
+              benchmarkOverride: benchmark,
+              workspaceDirOverride: workspaceDir,
+              allowNoToolTerminalEvidence: true,
+              runIdPrefix: "v1j-adapter-differential",
+              lifecycleJournal: journal,
+              onAssistantMessage: () => adapterToolGuard?.ensureInstalled(),
+              onRequestCaptured: (request, requestIndex) => {
+                if (requestIndex === 1) {
+                  adapterRequestMatch = assertV1JAdapterDifferentialRequestMatch(
+                    controlC.body,
+                    request.body,
+                  );
+                  journal.record("adapter-request-body-matched", {
+                    ...adapterRequestMatch,
+                    ...summarizeV1JAdapterDifferentialRequest(request.body),
+                  });
+                  return;
+                }
+                journal.record("adapter-followup-request", {
+                  requestIndex,
+                  ...summarizeV1JAdapterDifferentialRequest(request.body),
+                });
+              },
+              onProviderDispatchAttempt: (count) => {
+                adapterDispatches = count;
+                assertV1JAdapterDifferentialRequestBudget({
+                  rawRequests: rawResult?.requestDispatchStarted ? 1 : 0,
+                  adapterRequests: count,
+                });
+                journal.record("adapter-dispatch-attempt", {
+                  requestIndex: count,
+                  outcome:
+                    count <= V1J_ADAPTER_DIFFERENTIAL_MAX_ADAPTER_REQUESTS
+                      ? "within-bound"
+                      : "hard-stop",
+                });
+              },
+            }),
         });
         if (adapterToolGuard.blockedToolCalls() > 0) {
           throw new Error("v1J adapter differential blocked an unapproved tool selection");
@@ -2264,6 +2304,8 @@ async function captureV1JPreflightSurface(
     benchmarkCase?: ToolRankingBenchmarkCase;
     prepareWorkspace?: (workspaceDir: string) => void;
     onCapturedRequest?: (request: CapturedModelRequest) => void;
+    onCheckpoint?: (checkpoint: EmbeddedCapabilityCheckpoint) => void;
+    onProgress?: (stage: string) => void;
   },
 ): Promise<ReturnType<typeof fingerprintV1JToolSurface>> {
   const benchmarkCase =
@@ -2347,6 +2389,7 @@ async function captureV1JPreflightSurface(
         },
       },
       onCheckpoint: (checkpoint) => {
+        options?.onCheckpoint?.(checkpoint);
         if (
           preflightDiagnostics &&
           !runtimeReadyRecorded &&
@@ -2359,6 +2402,7 @@ async function captureV1JPreflightSurface(
         }
       },
     });
+    options?.onProgress?.("schema-preflight-validation-start");
     const failureName = observation.requestPreparationDiagnostics?.failure?.errorName;
     if (failureName === V1IProviderRequestCapturedError.name) {
       preflightDiagnostics?.increment(
@@ -2474,6 +2518,7 @@ async function captureV1JPreflightSurface(
     activeFilteringEnabled: ACTIVE_FILTERING_ENABLED,
     surface: actual,
   });
+  options?.onProgress?.("schema-preflight-validation-complete");
   preflightDiagnostics?.record(`arm-${arm.toLowerCase()}-schema-validated`, {
     requestObserverCallSite: "runOne.diagnostics.hooks.onProviderRequest",
   });

@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { performance } from "node:perf_hooks";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import {
   getGlobalPluginRegistry,
@@ -43,6 +44,73 @@ export type V1JAdapterDifferentialRequestMetrics = {
 export const V1J_ADAPTER_DIFFERENTIAL_MAX_RAW_REQUESTS = 1;
 export const V1J_ADAPTER_DIFFERENTIAL_MAX_ADAPTER_REQUESTS = 2;
 export const V1J_ADAPTER_DIFFERENTIAL_MAX_TOTAL_REQUESTS = 3;
+export const V1J_ADAPTER_DIFFERENTIAL_HEARTBEAT_MS = 25_000;
+
+export type V1JAdapterDifferentialProgressEvent = {
+  event: "stage-start" | "checkpoint" | "heartbeat" | "stage-complete" | "stage-failed";
+  stage: string;
+  elapsedMs: number;
+};
+
+export function reportV1JAdapterDifferentialProgress(
+  event: V1JAdapterDifferentialProgressEvent,
+  write: (line: string) => void = (line) => process.stdout.write(line),
+): void {
+  if (!/^[a-z][a-z0-9-]{0,63}$/.test(event.stage)) {
+    throw new Error("v1J adapter differential progress stage is invalid");
+  }
+  write(`[v1J adapter differential] ${JSON.stringify(event)}\n`);
+}
+
+export async function withV1JAdapterDifferentialProgress<T>(input: {
+  stage: string;
+  operation: (checkpoint: (stage: string) => void) => Promise<T> | T;
+  heartbeatMs?: number;
+  onProgress?: (event: V1JAdapterDifferentialProgressEvent) => void;
+  now?: () => number;
+  setInterval?: typeof globalThis.setInterval;
+  clearInterval?: typeof globalThis.clearInterval;
+}): Promise<T> {
+  if (!/^[a-z][a-z0-9-]{0,63}$/.test(input.stage)) {
+    throw new Error("v1J adapter differential progress stage is invalid");
+  }
+  const heartbeatMs = input.heartbeatMs ?? V1J_ADAPTER_DIFFERENTIAL_HEARTBEAT_MS;
+  if (!Number.isSafeInteger(heartbeatMs) || heartbeatMs <= 0) {
+    throw new Error("v1J adapter differential heartbeat interval is invalid");
+  }
+  const now = input.now ?? (() => performance.now());
+  const setIntervalFn = input.setInterval ?? globalThis.setInterval;
+  const clearIntervalFn = input.clearInterval ?? globalThis.clearInterval;
+  const startedAt = now();
+  let activeStage = input.stage;
+  const report = (event: V1JAdapterDifferentialProgressEvent["event"], stage = activeStage) => {
+    const progressEvent = {
+      event,
+      stage,
+      elapsedMs: Math.max(0, Math.round(now() - startedAt)),
+    } satisfies V1JAdapterDifferentialProgressEvent;
+    (input.onProgress ?? reportV1JAdapterDifferentialProgress)(progressEvent);
+  };
+  report("stage-start");
+  const interval = setIntervalFn(() => report("heartbeat"), heartbeatMs);
+  interval.unref?.();
+  try {
+    const result = await input.operation((stage) => {
+      if (!/^[a-z][a-z0-9-]{0,63}$/.test(stage)) {
+        throw new Error("v1J adapter differential progress stage is invalid");
+      }
+      activeStage = stage;
+      report("checkpoint");
+    });
+    report("stage-complete", input.stage);
+    return result;
+  } catch (error) {
+    report("stage-failed");
+    throw error;
+  } finally {
+    clearIntervalFn(interval);
+  }
+}
 
 export type V1JAdapterDifferentialToolGuard = {
   ensureInstalled: () => void;

@@ -8,8 +8,10 @@ import {
   assertV1JAdapterDifferentialPreflight,
   createV1JAdapterDifferentialJournal,
   installV1JAdapterDifferentialToolGuard,
+  reportV1JAdapterDifferentialProgress,
   runV1JAdapterDifferentialRawTransport,
   summarizeV1JAdapterDifferentialRequest,
+  withV1JAdapterDifferentialProgress,
   V1J_ADAPTER_DIFFERENTIAL_AUTHORIZED_FLAG,
   V1J_ADAPTER_DIFFERENTIAL_COMMIT_FLAG,
   V1J_ADAPTER_DIFFERENTIAL_MAX_ADAPTER_REQUESTS,
@@ -130,6 +132,80 @@ describe("v1J adapter differential diagnostics", () => {
     ]) {
       expect(() => assertV1JAdapterDifferentialRequestBudget(budget)).toThrow(/request budget/);
     }
+  });
+
+  it("emits content-free progress heartbeats and clears them when a stage completes", async () => {
+    const events: Array<{ event: string; stage: string; elapsedMs: number }> = [];
+    let tick: (() => void) | undefined;
+    let elapsedMs = 0;
+    const pending = Promise.withResolvers<string>();
+    const stage = withV1JAdapterDifferentialProgress({
+      stage: "schema-preflight",
+      operation: async (checkpoint) => {
+        checkpoint("prepared-runtime-acquisition-entered");
+        return await pending.promise;
+      },
+      heartbeatMs: 25_000,
+      now: () => elapsedMs,
+      setInterval: (callback) => {
+        tick = callback;
+        return { unref: vi.fn() } as unknown as ReturnType<typeof globalThis.setInterval>;
+      },
+      clearInterval: vi.fn(),
+      onProgress: (event) => events.push(event),
+    });
+
+    elapsedMs = 25_000;
+    tick?.();
+    pending.resolve("schema-ready");
+    await expect(stage).resolves.toBe("schema-ready");
+
+    expect(events.map(({ event, stage: name }) => [event, name])).toEqual([
+      ["stage-start", "schema-preflight"],
+      ["checkpoint", "prepared-runtime-acquisition-entered"],
+      ["heartbeat", "prepared-runtime-acquisition-entered"],
+      ["stage-complete", "schema-preflight"],
+    ]);
+    expect(events.map((event) => event.elapsedMs)).toEqual([0, 0, 25_000, 25_000]);
+
+    const output: string[] = [];
+    reportV1JAdapterDifferentialProgress(
+      { event: "heartbeat", stage: "schema-preflight", elapsedMs: 25_000 },
+      (line) => output.push(line),
+    );
+    expect(output.join("")).not.toMatch(/prompt|message|response|credential|secret/i);
+    expect(() =>
+      reportV1JAdapterDifferentialProgress(
+        { event: "heartbeat", stage: "schema preflight", elapsedMs: 25_000 },
+        (line) => output.push(line),
+      ),
+    ).toThrow(/stage is invalid/);
+  });
+
+  it("preserves stage failures and always stops its heartbeat", async () => {
+    const events: Array<{ event: string; stage: string; elapsedMs: number }> = [];
+    const failure = new Error("expected diagnostic failure");
+    const clearInterval = vi.fn();
+    const tick = vi.fn();
+    const stage = withV1JAdapterDifferentialProgress({
+      stage: "lmstudio-discovery",
+      operation: (checkpoint) => {
+        checkpoint("lmstudio-discovery-request");
+        throw failure;
+      },
+      setInterval: () =>
+        ({ unref: vi.fn(), tick }) as unknown as ReturnType<typeof globalThis.setInterval>,
+      clearInterval,
+      onProgress: (event) => events.push(event),
+    });
+
+    await expect(stage).rejects.toBe(failure);
+    expect(events.at(-1)).toMatchObject({
+      event: "stage-failed",
+      stage: "lmstudio-discovery-request",
+    });
+    expect(clearInterval).toHaveBeenCalledOnce();
+    expect(tick).not.toHaveBeenCalled();
   });
 
   it("guards adapter tool execution before the tool body runs", async () => {

@@ -146,6 +146,17 @@ type V1JCaptureCheckpoint =
   | "authorized-catalog-complete"
   | "provider-tool-projection-start"
   | "provider-tool-projection-complete"
+  | "capture-options-check-start"
+  | "capture-options-check-complete"
+  | "image-observation-read-start"
+  | "image-observation-read-complete"
+  | "capture-provenance-check-start"
+  | "capture-provenance-check-complete"
+  | "invocation-metadata-build-start"
+  | "invocation-metadata-build-complete"
+  | "sink-start-checkpoint-write-start"
+  | "sink-start-checkpoint-write-complete"
+  | "pre-sink-error"
   | "schema-sink-start"
   | "schema-sink-authorized-copy-start"
   | "schema-sink-authorized-copy-complete"
@@ -296,6 +307,8 @@ function createV1JCaptureLiveness(name: V1JSchemaCaptureName, diagnosticId?: str
         sinkInvocationIndex?: number;
         captureName?: string;
         caseId?: string;
+        harnessCommit?: string;
+        headCommit?: string;
         arm?: string;
         replicate?: number;
         providerRequestPhase?: string;
@@ -303,6 +316,7 @@ function createV1JCaptureLiveness(name: V1JSchemaCaptureName, diagnosticId?: str
         operation?: string;
         errorCode?: string | number;
         errorMessage?: string;
+        error?: { name: string; code?: string | number; message: string };
         targetPath?: string;
         validationAudit?: V1JSchemaValidationAudit;
         imageFactoryCalled?: boolean;
@@ -321,10 +335,13 @@ function createV1JCaptureLiveness(name: V1JSchemaCaptureName, diagnosticId?: str
       if (checkpoint === "selected-runtime-load-complete" && metadata.runtimeId) {
         lastLoadedRuntime = metadata.runtimeId;
       }
+      const elapsedMs = Number(process.hrtime.bigint() - startedAt) / 1_000_000;
       const row = {
         timestamp: new Date().toISOString(),
+        event: checkpoint,
         checkpoint,
-        elapsedMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000,
+        elapsedMs,
+        elapsed_ms: elapsedMs,
         pid: process.pid,
         eventLoopPhase: null,
         ...(metadata.eventLoopDelayMs === undefined
@@ -341,9 +358,13 @@ function createV1JCaptureLiveness(name: V1JSchemaCaptureName, diagnosticId?: str
           ? {}
           : { sinkInvocationIndex: metadata.sinkInvocationIndex }),
         ...(metadata.captureName === undefined ? {} : { captureName: metadata.captureName }),
+        ...(metadata.captureName === undefined ? {} : { capture_name: metadata.captureName }),
         ...(metadata.caseId === undefined ? {} : { caseId: metadata.caseId }),
+        ...(metadata.caseId === undefined ? {} : { case_id: metadata.caseId }),
         ...(metadata.arm === undefined ? {} : { arm: metadata.arm }),
         ...(metadata.replicate === undefined ? {} : { replicate: metadata.replicate }),
+        ...(metadata.harnessCommit === undefined ? {} : { harness_commit: metadata.harnessCommit }),
+        ...(metadata.headCommit === undefined ? {} : { head_commit: metadata.headCommit }),
         ...(metadata.providerRequestPhase === undefined
           ? {}
           : { providerRequestPhase: metadata.providerRequestPhase }),
@@ -351,6 +372,7 @@ function createV1JCaptureLiveness(name: V1JSchemaCaptureName, diagnosticId?: str
         ...(metadata.operation === undefined ? {} : { operation: metadata.operation }),
         ...(metadata.errorCode === undefined ? {} : { errorCode: metadata.errorCode }),
         ...(metadata.errorMessage === undefined ? {} : { errorMessage: metadata.errorMessage }),
+        ...(metadata.error === undefined ? {} : { error: metadata.error }),
         ...(metadata.targetPath === undefined ? {} : { targetPath: metadata.targetPath }),
         ...(metadata.validationAudit === undefined
           ? {}
@@ -380,6 +402,136 @@ function createV1JCaptureLiveness(name: V1JSchemaCaptureName, diagnosticId?: str
       }
     },
   };
+}
+
+function prepareV1JPreSinkCapture(input: {
+  captureName: V1JSchemaCaptureName | undefined;
+  captureArm: V1JSchemaCaptureArm | undefined;
+  caseId: string;
+  replicate: number;
+  surfaceMode: "REAL_EXACT" | "SYNTHETIC" | undefined;
+  benchmarkCandidateNames: readonly string[] | undefined;
+  getImageFactoryObservation: (() => V1JImageFactoryObservation | undefined) | undefined;
+  harnessCommit: string;
+  headCommit: string;
+  invocationIndex: number;
+  liveness?: Pick<V1JCaptureLiveness, "record">;
+}): {
+  name: V1JSchemaCaptureName;
+  arm: V1JSchemaCaptureArm;
+  surfaceMode: "REAL_EXACT" | "SYNTHETIC";
+  benchmarkCandidateNames: readonly string[];
+  imageFactory: V1JImageFactoryObservation | undefined;
+  invocation: {
+    index: number;
+    caseId: string;
+    arm: V1JSchemaCaptureArm;
+    replicate: number;
+    providerRequestPhase: string;
+    callSite: string;
+  };
+  sinkMetadata: {
+    sinkInvocationIndex: number;
+    captureName: string;
+    caseId: string;
+    arm: string;
+    replicate: number;
+    providerRequestPhase: string;
+    callSite: string;
+  };
+} {
+  let operation = "capture-options-check";
+  const arm = input.captureArm ?? "A";
+  const commonMetadata = {
+    ...(input.captureName ? { captureName: input.captureName } : {}),
+    caseId: input.caseId,
+    arm,
+    replicate: input.replicate,
+    harnessCommit: input.harnessCommit,
+    headCommit: input.headCommit,
+  };
+  const record = (
+    checkpoint: V1JCaptureCheckpoint,
+    extra: Parameters<V1JCaptureLiveness["record"]>[1] = {},
+  ) => input.liveness?.record(checkpoint, { ...commonMetadata, ...extra });
+  try {
+    record("capture-options-check-start");
+    if (
+      !input.captureName ||
+      V1J_SCHEMA_CAPTURE_NAME_ARM[input.captureName] !== arm ||
+      !input.surfaceMode ||
+      !input.benchmarkCandidateNames
+    ) {
+      throw new Error("v1J capture options are incomplete");
+    }
+    record("capture-options-check-complete");
+
+    operation = "image-observation-read";
+    record("image-observation-read-start");
+    const imageFactory = input.getImageFactoryObservation?.();
+    record("image-observation-read-complete");
+
+    operation = "capture-provenance-check";
+    record("capture-provenance-check-start");
+    if (input.surfaceMode === "REAL_EXACT" && !imageFactory) {
+      throw new Error("v1J capture is missing REAL_EXACT surface provenance");
+    }
+    record("capture-provenance-check-complete");
+
+    operation = "invocation-metadata-build";
+    record("invocation-metadata-build-start");
+    const invocation = {
+      index: input.invocationIndex,
+      caseId: input.caseId,
+      arm,
+      replicate: input.replicate,
+      providerRequestPhase: "provider-request-constructed-before-dispatch",
+      callSite: "runOne.diagnostics.hooks.onProviderRequest",
+    };
+    const sinkMetadata = {
+      sinkInvocationIndex: invocation.index,
+      captureName: input.captureName,
+      caseId: invocation.caseId,
+      arm: invocation.arm,
+      replicate: invocation.replicate,
+      providerRequestPhase: invocation.providerRequestPhase,
+      callSite: invocation.callSite,
+    };
+    record("invocation-metadata-build-complete", sinkMetadata);
+
+    operation = "sink-start-checkpoint-write";
+    record("sink-start-checkpoint-write-start", sinkMetadata);
+    record("schema-sink-start", sinkMetadata);
+    record("sink-start-checkpoint-write-complete", sinkMetadata);
+    return {
+      name: input.captureName,
+      arm,
+      surfaceMode: input.surfaceMode,
+      benchmarkCandidateNames: input.benchmarkCandidateNames,
+      imageFactory,
+      invocation,
+      sinkMetadata,
+    };
+  } catch (error) {
+    const candidate = error instanceof Error ? error : new Error(String(error));
+    const code = (error as NodeJS.ErrnoException | undefined)?.code;
+    const message = candidate.message
+      .replace(/(?:bearer\s+)[^\s,]+/gi, "Bearer [REDACTED]")
+      .slice(0, 500);
+    try {
+      record("pre-sink-error", {
+        operation,
+        error: {
+          name: candidate.name.slice(0, 100),
+          ...(typeof code === "string" || typeof code === "number" ? { code } : {}),
+          message,
+        },
+      });
+    } catch {
+      // Preserve the pre-sink error if writing its diagnostic row also fails.
+    }
+    throw error;
+  }
 }
 
 function recordV1JRuntimeCheckpoint(
@@ -474,7 +626,7 @@ function buildV1JSchemaCaptureRequestOptions(input: {
   };
 }
 
-function assertV1JCaptureProvenance(): void {
+function assertV1JCaptureProvenance(): string {
   if (process.env.OPENCLAW_V1I_HARNESS_COMMIT?.trim()) {
     throw new Error("v1J schema capture does not allow OPENCLAW_V1I_HARNESS_COMMIT overrides");
   }
@@ -497,6 +649,7 @@ function assertV1JCaptureProvenance(): void {
   ) {
     throw new Error("v1J schema capture model configuration drifted");
   }
+  return head;
 }
 
 function persistV1JSchemaCapture(input: {
@@ -2781,6 +2934,7 @@ async function runOne(input: {
     holdAfterCapture?: boolean;
     schemaCaptureName?: V1JSchemaCaptureName;
     schemaCaptureArm?: V1JSchemaCaptureArm;
+    headCommit?: string;
     capturePromptInstruction?: string;
     surfaceMode?: "REAL_EXACT" | "SYNTHETIC";
     benchmarkCandidateNames?: readonly string[];
@@ -2987,48 +3141,33 @@ async function runOne(input: {
     const request = { body, url: "provider-adapter" };
     input.requestCapture?.liveness?.record("provider-tool-projection-complete");
     if (input.requestCapture?.schemaCaptureName) {
-      const surfaceMode = input.requestCapture.surfaceMode;
-      const benchmarkCandidateNames = input.requestCapture.benchmarkCandidateNames;
-      const imageFactory = input.requestCapture.getImageFactoryObservation?.();
-      if (
-        !surfaceMode ||
-        !benchmarkCandidateNames ||
-        (surfaceMode === "REAL_EXACT" && !imageFactory)
-      ) {
-        throw new Error("v1J capture is missing REAL_EXACT surface provenance");
-      }
-      const invocation = {
-        index: ++schemaSinkInvocationIndex,
-        caseId: input.benchmarkCase.id,
-        arm: input.requestCapture.schemaCaptureArm ?? "A",
-        replicate: input.replicate,
-        providerRequestPhase: "provider-request-constructed-before-dispatch",
-        callSite: "runOne.diagnostics.hooks.onProviderRequest",
-      };
-      const sinkMetadata = {
-        sinkInvocationIndex: invocation.index,
+      const preSink = prepareV1JPreSinkCapture({
         captureName: input.requestCapture.schemaCaptureName,
-        caseId: invocation.caseId,
-        arm: invocation.arm,
-        replicate: invocation.replicate,
-        providerRequestPhase: invocation.providerRequestPhase,
-        callSite: invocation.callSite,
-      };
-      input.requestCapture.liveness?.record("schema-sink-start", sinkMetadata);
+        captureArm: input.requestCapture.schemaCaptureArm,
+        caseId: input.benchmarkCase.id,
+        replicate: input.replicate,
+        surfaceMode: input.requestCapture.surfaceMode,
+        benchmarkCandidateNames: input.requestCapture.benchmarkCandidateNames,
+        getImageFactoryObservation: input.requestCapture.getImageFactoryObservation,
+        harnessCommit: HARNESS_COMMIT,
+        headCommit: input.requestCapture.headCommit ?? HARNESS_COMMIT,
+        invocationIndex: ++schemaSinkInvocationIndex,
+        liveness: input.requestCapture.liveness,
+      });
       persistV1JSchemaCapture({
-        name: input.requestCapture.schemaCaptureName,
-        arm: invocation.arm,
+        name: preSink.name,
+        arm: preSink.arm,
         authorizedTools: authorizedToolSchemas,
         providerTools: body.tools,
         model: runModel,
-        surfaceMode,
-        benchmarkCandidateNames,
-        ...(imageFactory ? { imageFactory } : {}),
-        invocation,
+        surfaceMode: preSink.surfaceMode,
+        benchmarkCandidateNames: preSink.benchmarkCandidateNames,
+        ...(preSink.imageFactory ? { imageFactory: preSink.imageFactory } : {}),
+        invocation: preSink.invocation,
         recordCheckpoint: (checkpoint, metadata) =>
           input.requestCapture?.liveness?.record(checkpoint, metadata),
       });
-      input.requestCapture.liveness?.record("schema-sink-complete", sinkMetadata);
+      input.requestCapture.liveness?.record("schema-sink-complete", preSink.sinkMetadata);
     }
     capture.recordProviderRequest(request);
     input.requestCapture?.onRequestCaptured?.(request);
@@ -3532,6 +3671,124 @@ function buildOfflineRequestConfig(workspaceDir: string): OpenClawConfig {
 }
 
 describe("v1I offline request preparation", () => {
+  it("durably localizes each pre-sink operation with the capture and commit identity", () => {
+    const workspaceDir = fs.mkdtempSync(path.join(os.tmpdir(), "v1j-pre-sink-checkpoints-"));
+    const cwd = vi.spyOn(process, "cwd").mockReturnValue(workspaceDir);
+    const liveness = createV1JCaptureLiveness("capture-1", "pre-sink-test");
+    try {
+      const prepared = prepareV1JPreSinkCapture({
+        captureName: "capture-1",
+        captureArm: "A",
+        caseId: "file-write-notes",
+        replicate: 1,
+        surfaceMode: "REAL_EXACT",
+        benchmarkCandidateNames: ["write"],
+        getImageFactoryObservation: () => ({ eligible: false, constructed: false }),
+        harnessCommit: "harness-sha",
+        headCommit: "head-sha",
+        invocationIndex: 1,
+        liveness,
+      });
+      expect(prepared.sinkMetadata).toMatchObject({
+        captureName: "capture-1",
+        caseId: "file-write-notes",
+        arm: "A",
+        replicate: 1,
+      });
+      const rows = fs
+        .readFileSync(liveness.filePath, "utf8")
+        .trim()
+        .split("\n")
+        .map((row) => JSON.parse(row) as Record<string, unknown>);
+      expect(rows.map((row) => row.event)).toEqual([
+        "capture-options-check-start",
+        "capture-options-check-complete",
+        "image-observation-read-start",
+        "image-observation-read-complete",
+        "capture-provenance-check-start",
+        "capture-provenance-check-complete",
+        "invocation-metadata-build-start",
+        "invocation-metadata-build-complete",
+        "sink-start-checkpoint-write-start",
+        "schema-sink-start",
+        "sink-start-checkpoint-write-complete",
+      ]);
+      for (const row of rows) {
+        expect(row).toMatchObject({
+          event: expect.any(String),
+          elapsed_ms: expect.any(Number),
+          capture_name: "capture-1",
+          case_id: "file-write-notes",
+          arm: "A",
+          replicate: 1,
+          harness_commit: "harness-sha",
+          head_commit: "head-sha",
+        });
+      }
+      expect(fs.readFileSync(liveness.filePath, "utf8")).not.toMatch(
+        /prompt|messages|credential|provider payload|schema body/i,
+      );
+    } finally {
+      liveness.close();
+      cwd.mockRestore();
+      fs.rmSync(workspaceDir, { recursive: true, force: true });
+    }
+  });
+
+  it("records pre-sink errors durably and rethrows the original error", () => {
+    const workspaceDir = fs.mkdtempSync(path.join(os.tmpdir(), "v1j-pre-sink-error-"));
+    const cwd = vi.spyOn(process, "cwd").mockReturnValue(workspaceDir);
+    const liveness = createV1JCaptureLiveness("capture-2", "pre-sink-error-test");
+    const originalError = Object.assign(new Error("image observation unavailable"), {
+      code: "EIMAGE",
+    });
+    try {
+      let thrown: unknown;
+      try {
+        prepareV1JPreSinkCapture({
+          captureName: "capture-2",
+          captureArm: "A",
+          caseId: "read-memory",
+          replicate: 2,
+          surfaceMode: "REAL_EXACT",
+          benchmarkCandidateNames: ["read"],
+          getImageFactoryObservation: () => {
+            throw originalError;
+          },
+          harnessCommit: "harness-sha",
+          headCommit: "head-sha",
+          invocationIndex: 1,
+          liveness,
+        });
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBe(originalError);
+      const rows = fs
+        .readFileSync(liveness.filePath, "utf8")
+        .trim()
+        .split("\n")
+        .map((row) => JSON.parse(row) as Record<string, unknown>);
+      expect(rows.at(-1)).toMatchObject({
+        event: "pre-sink-error",
+        operation: "image-observation-read",
+        capture_name: "capture-2",
+        case_id: "read-memory",
+        harness_commit: "harness-sha",
+        head_commit: "head-sha",
+        error: {
+          name: "Error",
+          code: "EIMAGE",
+          message: "image observation unavailable",
+        },
+      });
+    } finally {
+      liveness.close();
+      cwd.mockRestore();
+      fs.rmSync(workspaceDir, { recursive: true, force: true });
+    }
+  });
+
   it("persists only authorized and provider tool schemas with safe metadata", () => {
     const workspaceDir = fs.mkdtempSync(path.join(os.tmpdir(), "v1j-schema-capture-test-"));
     const cwd = vi.spyOn(process, "cwd").mockReturnValue(workspaceDir);
@@ -4208,7 +4465,7 @@ describeV1JSchemaCapture("v1J provider schema capture-only entrypoint", () => {
       if (!captureOptions) {
         throw new Error("v1J schema capture mode is not enabled");
       }
-      assertV1JCaptureProvenance();
+      const headCommit = assertV1JCaptureProvenance();
       const mappingSummary = summarizeBenchmarkRealToolMappings(TOOL_RANKING_HELD_OUT_CASES);
       const sets = splitV1IExperimentSets(TOOL_RANKING_HELD_OUT_CASES, mappingSummary);
       const benchmarkCase = sets.realExact[0];
@@ -4261,6 +4518,7 @@ describeV1JSchemaCapture("v1J provider schema capture-only entrypoint", () => {
           abortSignal: abortController.signal,
           requestCapture: {
             stopAfterCapture: true,
+            headCommit,
             surfaceMode: "REAL_EXACT",
             benchmarkCandidateNames: benchmarkCase.tools.map((tool) => tool.name),
             getImageFactoryObservation: () => imageFactoryObservation,

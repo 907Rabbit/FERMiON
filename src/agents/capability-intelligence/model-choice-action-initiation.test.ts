@@ -11,6 +11,7 @@ import {
   createV1JSmokeArtifactState,
   finalizeV1JSmokeArtifacts,
   resolveV1JSmokeRoot,
+  runV1JSmokeSchedule,
   V1J_FORMAL_ARTIFACT_RELATIVE_PATH,
   type V1JSmokeRecord,
 } from "../../../test/helpers/agents/model-choice-action-initiation-smoke.js";
@@ -821,6 +822,54 @@ describe("v1J action-initiation protocol and offline harness", () => {
         }),
       ).toThrow(/requires absent formal state/);
       expect(fs.existsSync(smokeRoot)).toBe(false);
+    } finally {
+      fs.rmSync(repoRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("persists one invalid smoke result and stops without retrying or opening formal state", async () => {
+    const protocol = loadProtocol();
+    const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), "v1j-smoke-stop-test-"));
+    const commit = "f".repeat(40);
+    try {
+      assertV1JFormalStateEmpty(repoRoot);
+      const state = createV1JSmokeArtifactState({
+        repoRoot,
+        harnessCommit: commit,
+        protocol,
+        modelConfigHash: protocol.model.modelConfigHash,
+        schemaFingerprints: protocol.schemaBaseline,
+        startedAt: "2026-01-01T00:00:00.000Z",
+      });
+      const schedule = buildV1JSmokeSchedule(protocol);
+      const executed: string[] = [];
+      const stopReason = await runV1JSmokeSchedule(state, schedule, async (cell) => {
+        executed.push(cell.cellId);
+        return {
+          observation: {
+            ...observation(protocol, cell, {
+              valid: false,
+              invalidClass: "INFRASTRUCTURE_RETRY_ELIGIBLE",
+            }),
+            harnessCommit: commit,
+          },
+          workspaceCleanupComplete: true,
+        };
+      });
+
+      expect(stopReason).toBe("INVALID_SMOKE_OBSERVATION");
+      expect(executed).toEqual([schedule[0]!.cellId]);
+      expect(state.records).toHaveLength(1);
+      const invalidRows = fs
+        .readFileSync(path.join(state.root, "smoke-invalid-attempts.jsonl"), "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as V1JSmokeRecord);
+      expect(invalidRows).toHaveLength(1);
+      expect(invalidRows[0]?.smokeCellId).toBe(schedule[0]!.cellId);
+      expect(fs.readFileSync(path.join(state.root, "smoke-observations.jsonl"), "utf8")).toBe("");
+      assertV1JFormalStateEmpty(repoRoot);
+      expect(fs.existsSync(path.resolve(repoRoot, V1J_FORMAL_ARTIFACT_RELATIVE_PATH))).toBe(false);
     } finally {
       fs.rmSync(repoRoot, { recursive: true, force: true });
     }

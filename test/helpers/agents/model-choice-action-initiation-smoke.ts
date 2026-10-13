@@ -233,6 +233,35 @@ export function appendV1JSmokeRecord(state: V1JSmokeArtifactState, record: V1JSm
   state.records.push(record);
 }
 
+export async function runV1JSmokeSchedule(
+  state: V1JSmokeArtifactState,
+  schedule: readonly V1JSmokeCell[],
+  executeCell: (cell: V1JSmokeCell) => Promise<{
+    observation: V1JObservation;
+    workspaceCleanupComplete: boolean;
+  }>,
+): Promise<"INVALID_SMOKE_OBSERVATION" | "CLEANUP_FAILURE" | null> {
+  for (const cell of schedule) {
+    const result = await executeCell(cell);
+    const record: V1JSmokeRecord = {
+      smokeCellId: cell.cellId,
+      caseId: cell.caseId,
+      arm: cell.arm,
+      replicate: 1,
+      ...result,
+    };
+    // Persist the outcome before stopping so a failed cell is never lost or retried.
+    appendV1JSmokeRecord(state, record);
+    if (!record.observation.valid) {
+      return "INVALID_SMOKE_OBSERVATION";
+    }
+    if (!record.workspaceCleanupComplete) {
+      return "CLEANUP_FAILURE";
+    }
+  }
+  return null;
+}
+
 export function finalizeV1JSmokeArtifacts(
   state: V1JSmokeArtifactState,
   input: { completedAt: string; modelRequestsSent: number; preflightPassed: boolean },

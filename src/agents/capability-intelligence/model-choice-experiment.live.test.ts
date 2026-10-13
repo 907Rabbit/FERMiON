@@ -8,12 +8,12 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { configureAiTransportHost, getAiTransportHost } from "@openclaw/ai";
 import { describe, expect, it, vi } from "vitest";
 import {
-  appendV1JSmokeRecord,
   assertV1JFormalStateEmpty,
   assertV1JSmokeProvenance,
   buildV1JSmokeSchedule,
   createV1JSmokeArtifactState,
   finalizeV1JSmokeArtifacts,
+  runV1JSmokeSchedule,
   V1J_SMOKE_PROVENANCE_PATH,
   type V1JSmokeCell,
 } from "../../../test/helpers/agents/model-choice-action-initiation-smoke.js";
@@ -1269,8 +1269,7 @@ describeV1JActionSmoke("v1J isolated live operational smoke", () => {
         schemaFingerprints: surfaceA,
         startedAt: new Date().toISOString(),
       });
-      let hardStop: Error | undefined;
-      for (const cell of schedule) {
+      const stopReason = await runV1JSmokeSchedule(artifactState, schedule, async (cell) => {
         const workspaceDir = fs.mkdtempSync(path.join(os.tmpdir(), "v1j-smoke-cell-"));
         let observation: V1JObservation;
         let workspaceCleanupComplete: boolean;
@@ -1304,23 +1303,11 @@ describeV1JActionSmoke("v1J isolated live operational smoke", () => {
           }
           workspaceCleanupComplete = !fs.existsSync(workspaceDir);
         }
-        const record = {
-          smokeCellId: cell.cellId,
-          caseId: cell.caseId,
-          arm: cell.arm,
-          replicate: 1 as const,
+        return {
           observation,
           workspaceCleanupComplete,
         };
-        appendV1JSmokeRecord(artifactState, record);
-        if (observation.invalidClass === "INTEGRITY_FAILURE" || !workspaceCleanupComplete) {
-          hardStop = new Error(
-            observation.invalidReason ??
-              "v1J smoke workspace cleanup failed after evidence capture",
-          );
-          break;
-        }
-      }
+      });
       const modelRequestsSent = artifactState.records.reduce(
         (total, record) => total + record.observation.modelRequestsSent,
         0,
@@ -1331,8 +1318,8 @@ describeV1JActionSmoke("v1J isolated live operational smoke", () => {
         preflightPassed: true,
       });
       assertV1JFormalStateEmpty(repoRoot);
-      if (hardStop) {
-        throw hardStop;
+      if (stopReason) {
+        throw new Error(`v1J smoke hard stop: ${stopReason}`);
       }
       if (
         artifactState.records.length !== 4 ||

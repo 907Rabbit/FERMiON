@@ -6,12 +6,143 @@ import {
   createV1JProviderResponseDiagnosticJournal,
   isV1JCleanupFailureSecondary,
   observeV1JAdapterResponse,
+  observeV1JProviderResponseBody,
   resolveV1JProviderResponseDiagnosticRoot,
   V1J_PROVIDER_RESPONSE_DIAGNOSTIC_FORMAL_PATH,
   V1J_PROVIDER_RESPONSE_DIAGNOSTIC_PREFIX,
+  type V1JProviderResponseDiagnosticJournal,
 } from "../../../test/helpers/agents/model-choice-provider-response-diagnostic.js";
 
+type TestJournal = V1JProviderResponseDiagnosticJournal & {
+  readRows: () => Record<string, unknown>[];
+  dispose: () => void;
+};
+
 describe("v1J provider-response diagnostic artifacts", () => {
+  it("passes stream bytes through unchanged and durably records monotonic progress", async () => {
+    const diagnostic = createTestJournal();
+    const chunks = [new Uint8Array([0, 1, 2]), new Uint8Array([3, 4])];
+    const source = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (const chunk of chunks) {
+          controller.enqueue(chunk);
+        }
+        controller.close();
+      },
+    });
+    try {
+      const observed = observeV1JProviderResponseBody({
+        body: source,
+        journal: diagnostic,
+        requestIndex: 1,
+      });
+      const output = new Uint8Array(await new Response(observed).arrayBuffer());
+      expect(Array.from(output)).toEqual([0, 1, 2, 3, 4]);
+      const rows = readRows(diagnostic);
+      const progress = rows.filter((row) => row.event === "response-stream-progress");
+      expect(progress.map((row) => row.responseChunkCount)).toEqual([1, 2]);
+      expect(progress.map((row) => row.responseByteCount)).toEqual([3, 5]);
+      expect(rows.find((row) => row.event === "response-first-byte")).toMatchObject({
+        responseChunkCount: 1,
+        responseByteCount: 3,
+      });
+      expect(rows.find((row) => row.event === "stream-end")).toMatchObject({
+        outcome: "complete",
+        responseChunkCount: 2,
+        responseByteCount: 5,
+      });
+      expect(JSON.stringify(rows)).not.toContain("0,1,2");
+    } finally {
+      diagnostic.dispose();
+    }
+  });
+
+  it("heartbeats only while a read is pending and stops on stream completion", async () => {
+    const diagnostic = createTestJournal();
+    const manualTimer = createManualTimer();
+    let sourceController!: ReadableStreamDefaultController<Uint8Array>;
+    const source = new ReadableStream<Uint8Array>({
+      start(controller) {
+        sourceController = controller;
+      },
+    });
+    const heartbeats: string[] = [];
+    let now = 100;
+    try {
+      const observed = observeV1JProviderResponseBody({
+        body: source,
+        journal: diagnostic,
+        requestIndex: 1,
+        heartbeatIntervalMs: 25_000,
+        writeHeartbeat: (line) => heartbeats.push(line),
+        now: () => now,
+        setInterval: manualTimer.setInterval,
+        clearInterval: manualTimer.clearInterval,
+      });
+      const reader = observed.getReader();
+      const firstRead = reader.read();
+      await manualTimer.ready;
+      now = 25_100;
+      manualTimer.tick();
+      expect(heartbeats).toEqual([
+        "v1J provider diagnostic still awaiting stream completion elapsedMs=25000 chunks=0 bytes=0\n",
+      ]);
+      sourceController.enqueue(new Uint8Array([9, 8]));
+      expect((await firstRead).value).toEqual(new Uint8Array([9, 8]));
+      const endRead = reader.read();
+      sourceController.close();
+      expect(await endRead).toMatchObject({ done: true });
+      const heartbeatCountAtEnd = heartbeats.length;
+      manualTimer.tick();
+      expect(heartbeats).toHaveLength(heartbeatCountAtEnd);
+      expect(manualTimer.active).toBe(false);
+      expect(readRows(diagnostic).find((row) => row.event === "stream-end")).toMatchObject({
+        outcome: "complete",
+        responseChunkCount: 1,
+        responseByteCount: 2,
+      });
+    } finally {
+      diagnostic.dispose();
+    }
+  });
+
+  it("stops heartbeat on stream error and preserves the original failure", async () => {
+    const diagnostic = createTestJournal();
+    const manualTimer = createManualTimer();
+    let sourceController!: ReadableStreamDefaultController<Uint8Array>;
+    const source = new ReadableStream<Uint8Array>({
+      start(controller) {
+        sourceController = controller;
+      },
+    });
+    try {
+      const reader = observeV1JProviderResponseBody({
+        body: source,
+        journal: diagnostic,
+        requestIndex: 1,
+        writeHeartbeat: () => undefined,
+        setInterval: manualTimer.setInterval,
+        clearInterval: manualTimer.clearInterval,
+      }).getReader();
+      const pendingRead = reader.read();
+      await manualTimer.ready;
+      const streamError = Object.assign(new Error("private stream error"), {
+        code: "ECONNRESET",
+      });
+      sourceController.error(streamError);
+      await expect(pendingRead).rejects.toBe(streamError);
+      expect(manualTimer.active).toBe(false);
+      expect(readRows(diagnostic).find((row) => row.event === "stream-end")).toMatchObject({
+        outcome: "error",
+        errorClass: "Error",
+        errorCode: "ECONNRESET",
+      });
+      expect(JSON.stringify(readRows(diagnostic))).not.toContain("private stream error");
+    } finally {
+      diagnostic.dispose();
+    }
+  });
+
   it("writes commit-bound diagnostics outside smoke/formal state and redacts payload fields", () => {
     const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), "v1j-provider-response-diagnostic-"));
     const commit = "a".repeat(40);
@@ -174,3 +305,66 @@ describe("v1J provider-response diagnostic artifacts", () => {
     }
   });
 });
+
+function createTestJournal(): TestJournal {
+  const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), "v1j-stream-progress-"));
+  const journal = createV1JProviderResponseDiagnosticJournal({
+    repoRoot,
+    harnessCommit: "a".repeat(40),
+    modelId: "test-model",
+    modelConfigHash: "b".repeat(64),
+    schemaFingerprint: {
+      authorizedToolCount: 15,
+      providerToolCount: 15,
+      authorizedToolNameSha256: "c".repeat(64),
+      providerToolNameSha256: "c".repeat(64),
+      authorizedToolSchemaSha256: "d".repeat(64),
+      providerToolSchemaSha256: "e".repeat(64),
+    },
+    startedAt: "2026-10-13T00:00:00.000Z",
+  });
+  return Object.assign(journal, {
+    readRows: () =>
+      fs
+        .readFileSync(journal.filePath, "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as Record<string, unknown>),
+    dispose: () => {
+      journal.close();
+      fs.rmSync(repoRoot, { recursive: true, force: true });
+    },
+  });
+}
+
+function readRows(journal: TestJournal): Record<string, unknown>[] {
+  return journal.readRows();
+}
+
+function createManualTimer() {
+  let callback: (() => void) | undefined;
+  let resolveReady!: () => void;
+  const ready = new Promise<void>((resolve) => {
+    resolveReady = resolve;
+  });
+  let active = false;
+  return {
+    ready,
+    get active() {
+      return active;
+    },
+    setInterval: (next: () => void) => {
+      callback = next;
+      active = true;
+      resolveReady();
+      return 1;
+    },
+    clearInterval: () => {
+      active = false;
+      callback = undefined;
+    },
+    tick: () => {
+      callback?.();
+    },
+  };
+}

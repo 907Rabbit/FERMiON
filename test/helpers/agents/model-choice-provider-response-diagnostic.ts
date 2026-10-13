@@ -14,6 +14,10 @@ const SAFE_DETAIL_KEYS = new Set([
   "requestIndex",
   "httpStatus",
   "responseBytes",
+  "responseChunkCount",
+  "responseByteCount",
+  "lastChunkAt",
+  "streamElapsedMs",
   "contentType",
   "errorClass",
   "errorCode",
@@ -44,6 +48,116 @@ export type V1JProviderResponseDiagnosticJournal = {
   record: (event: string, details?: Record<string, unknown>) => void;
   close: () => void;
 };
+
+const DEFAULT_STREAM_HEARTBEAT_INTERVAL_MS = 25_000;
+
+/** Observes byte counts and liveness without retaining or decoding provider content. */
+export function observeV1JProviderResponseBody(input: {
+  body: ReadableStream<Uint8Array>;
+  journal: V1JProviderResponseDiagnosticJournal;
+  requestIndex: number;
+  heartbeatIntervalMs?: number;
+  writeHeartbeat?: (line: string) => void;
+  now?: () => number;
+  setInterval?: (callback: () => void, delayMs: number) => unknown;
+  clearInterval?: (handle: unknown) => void;
+}): ReadableStream<Uint8Array> {
+  const reader = input.body.getReader();
+  const now = input.now ?? Date.now;
+  const startedAt = now();
+  const heartbeatIntervalMs = input.heartbeatIntervalMs ?? DEFAULT_STREAM_HEARTBEAT_INTERVAL_MS;
+  const setIntervalFn =
+    input.setInterval ?? ((callback, delayMs) => globalThis.setInterval(callback, delayMs));
+  const clearIntervalFn =
+    input.clearInterval ?? ((handle) => globalThis.clearInterval(handle as NodeJS.Timeout));
+  let chunks = 0;
+  let bytes = 0;
+  let firstByteRecorded = false;
+  let lastChunkAt: string | undefined;
+  let heartbeatTimer: unknown;
+  let ended = false;
+
+  const stopHeartbeat = () => {
+    if (heartbeatTimer !== undefined) {
+      clearIntervalFn(heartbeatTimer);
+      heartbeatTimer = undefined;
+    }
+  };
+  const progressDetails = () => ({
+    requestIndex: input.requestIndex,
+    responseChunkCount: chunks,
+    responseByteCount: bytes,
+    ...(lastChunkAt === undefined ? {} : { lastChunkAt }),
+    streamElapsedMs: Math.max(0, now() - startedAt),
+  });
+  const startHeartbeat = () => {
+    if (!input.writeHeartbeat || heartbeatTimer !== undefined || ended) {
+      return;
+    }
+    heartbeatTimer = setIntervalFn(() => {
+      if (ended) {
+        stopHeartbeat();
+        return;
+      }
+      const elapsedMs = Math.max(0, now() - startedAt);
+      input.journal.record("response-stream-heartbeat", progressDetails());
+      input.writeHeartbeat?.(
+        `v1J provider diagnostic still awaiting stream completion elapsedMs=${elapsedMs} chunks=${chunks} bytes=${bytes}\n`,
+      );
+    }, heartbeatIntervalMs);
+  };
+  const finish = (outcome: "complete" | "error" | "cancelled", error?: unknown) => {
+    if (ended) {
+      return;
+    }
+    ended = true;
+    stopHeartbeat();
+    const failure = error instanceof Error ? error : undefined;
+    const code = failure && "code" in failure ? failure.code : undefined;
+    input.journal.record("stream-end", {
+      ...progressDetails(),
+      outcome,
+      ...(failure ? { errorClass: failure.name } : {}),
+      ...(typeof code === "string" || typeof code === "number" ? { errorCode: String(code) } : {}),
+    });
+  };
+
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      if (ended) {
+        return;
+      }
+      startHeartbeat();
+      try {
+        const part = await reader.read();
+        stopHeartbeat();
+        if (part.done) {
+          finish("complete");
+          controller.close();
+          return;
+        }
+        chunks += 1;
+        bytes += part.value.byteLength;
+        lastChunkAt = new Date(now()).toISOString();
+        if (!firstByteRecorded && part.value.byteLength > 0) {
+          firstByteRecorded = true;
+          input.journal.record("response-first-byte", {
+            ...progressDetails(),
+          });
+        }
+        input.journal.record("response-stream-progress", progressDetails());
+        controller.enqueue(part.value);
+      } catch (error) {
+        finish("error", error);
+        controller.error(error);
+      }
+    },
+    async cancel(reason) {
+      finish("cancelled", reason);
+      await reader.cancel(reason);
+    },
+  });
+}
 
 export async function observeV1JAdapterResponse<T>(input: {
   journal: V1JProviderResponseDiagnosticJournal;

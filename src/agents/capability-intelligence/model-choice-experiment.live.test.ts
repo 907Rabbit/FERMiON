@@ -49,6 +49,7 @@ import {
   createV1JProviderResponseDiagnosticJournal,
   isV1JCleanupFailureSecondary,
   observeV1JAdapterResponse,
+  observeV1JProviderResponseBody,
   V1J_PROVIDER_RESPONSE_DIAGNOSTIC_CELL,
   type V1JProviderResponseDiagnosticJournal,
 } from "../../../test/helpers/agents/model-choice-provider-response-diagnostic.js";
@@ -3405,6 +3406,9 @@ describe("v1I harness evidence repair", () => {
           "http-response-headers",
           "provider-response-observed",
           "http-response-body-start",
+          "response-first-byte",
+          "response-stream-progress",
+          "stream-end",
           "http-response-body-complete",
         ]),
       );
@@ -3415,6 +3419,11 @@ describe("v1I harness evidence repair", () => {
       expect(lifecycle.find((row) => row.event === "http-response-body-complete")).toMatchObject({
         responseBytes: new TextEncoder().encode(fixture).byteLength,
         parserOutcome: "tool-call-complete",
+      });
+      expect(lifecycle.find((row) => row.event === "stream-end")).toMatchObject({
+        responseChunkCount: expect.any(Number),
+        responseByteCount: new TextEncoder().encode(fixture).byteLength,
+        outcome: "complete",
       });
       expect(JSON.stringify(lifecycle)).not.toContain("git_status");
       expect(capture.providerDispatchAttempts).toBe(1);
@@ -7030,7 +7039,15 @@ function captureModelPayloads(
         return response;
       }
       const state = createResponseSummaryState(response.headers.get("content-type"));
-      const reader = response.body.getReader();
+      const providerBody = options?.lifecycleJournal
+        ? observeV1JProviderResponseBody({
+            body: response.body,
+            journal: options.lifecycleJournal,
+            requestIndex,
+            writeHeartbeat: (line) => process.stdout.write(line),
+          })
+        : response.body;
+      const reader = providerBody.getReader();
       let responseBytes = 0;
       options?.lifecycleJournal?.record("http-response-body-start", {
         requestId: correlationId,

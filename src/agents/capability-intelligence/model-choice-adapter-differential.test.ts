@@ -467,6 +467,7 @@ describe("v1J adapter differential diagnostics", () => {
       startedAt: new Date().toISOString(),
     });
     let calls = 0;
+    let dispatchStartSignals = 0;
     const serializedRequestBody = ` ${JSON.stringify(requestBody)}\n`;
     try {
       const result = await runV1JAdapterDifferentialRawTransport({
@@ -487,8 +488,12 @@ describe("v1J adapter differential diagnostics", () => {
         },
         timeoutMs: 1_000,
         heartbeatMs: 1_000,
+        onDispatchStarted: () => {
+          dispatchStartSignals += 1;
+        },
       });
       expect(calls).toBe(1);
+      expect(dispatchStartSignals).toBe(1);
       expect(JSON.parse(serializedRequestBody)).toEqual(requestBody);
       expect(result.dispatchStarted).toBe(true);
       expect(result.result).toMatchObject({
@@ -552,6 +557,7 @@ describe("v1J adapter differential diagnostics", () => {
       schemaFingerprint: schema,
       startedAt: new Date().toISOString(),
     });
+    let dispatchStarted = false;
     try {
       const outcome = await runV1JAdapterDifferentialRawTransport({
         endpoint: "http://127.0.0.1:1234/v1/chat/completions",
@@ -561,6 +567,9 @@ describe("v1J adapter differential diagnostics", () => {
         journal,
         timeoutMs: 20,
         heartbeatMs: 1_000,
+        onDispatchStarted: () => {
+          dispatchStarted = true;
+        },
         fetchImpl: async (_request, init) =>
           new Response(
             new ReadableStream<Uint8Array>({
@@ -577,6 +586,7 @@ describe("v1J adapter differential diagnostics", () => {
       });
 
       expect(outcome).toMatchObject({ dispatchStarted: true, helperErrorName: null });
+      expect(dispatchStarted).toBe(true);
       expect(outcome.result).toMatchObject({
         requestDispatchStarted: true,
         requestDispatchCompleted: true,

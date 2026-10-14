@@ -72,6 +72,7 @@ import {
 import { recordV1JPromptAwaitDiagnostic } from "../../../test/helpers/agents/model-choice-prompt-await-diagnostic.js";
 import {
   diffV1JPromptMaterializationBoundaries,
+  diffV1JPromptMaterializationTransition,
   fingerprintV1JSystemPromptParagraphs,
   fingerprintV1JSystemPromptSections,
   V1J_PROMPT_MATERIALIZATION_BOUNDARY_ORDER,
@@ -5417,19 +5418,21 @@ describe("v1J schema-capture dispatch guard", () => {
           )
         : undefined;
       expect(normalizedUserDelta).toBeDefined();
-      if (normalizedUserDelta?.pairingStatus === "PAIRED") {
-        expect(normalizedUserDelta).toMatchObject({
-          beforeContentSha256: inputUserMessage?.contentSha256,
-          afterContentSha256: normalizedUserMessage?.contentSha256,
-        });
-        expect(normalizedUserDelta.delta).toMatchObject({
+      expect(normalizedUserDelta).toMatchObject({
+        sourceBoundary: "agent-llm-boundary-input",
+        destinationBoundary: "agent-llm-boundary-normalized",
+        ordinalWithinRole: 0,
+        pairingStatus: "PAIRED",
+        delta: {
           beforeBytes: inputUserMessage?.contentBytes,
           afterBytes: normalizedUserMessage?.contentBytes,
-        });
-      } else {
-        expect(normalizedUserDelta?.pairingReason).toEqual(expect.any(String));
-        expect(normalizedUserDelta?.delta).toBeUndefined();
-      }
+        },
+      });
+      expect(normalizedBoundary?.contentDeltaPairing).toMatchObject({
+        transitionInstanceId: expect.any(Number),
+      });
+      expect(normalizedUserDelta?.beforeContentSha256).toMatch(/^[a-f0-9]{64}$/u);
+      expect(normalizedUserDelta?.afterContentSha256).toMatch(/^[a-f0-9]{64}$/u);
       expect(normalizedBoundary?.systemPromptSections).toEqual(
         expect.arrayContaining([
           expect.objectContaining({
@@ -8467,16 +8470,30 @@ async function runOne(input: {
         const differingPaths = previousTrace
           ? diffPromptMaterializationSnapshots(previousTrace, summary)
           : [];
-        const materializationContent = event.messages.map((message) => {
-          const row =
-            message && typeof message === "object" && !Array.isArray(message)
-              ? (message as Record<string, unknown>)
-              : {};
-          return {
-            role: typeof row.role === "string" ? row.role : null,
-            content: typeof row.content === "string" ? row.content : null,
-          };
-        });
+        const materializationContent = (messages: readonly unknown[]) =>
+          messages.map((message, index) => {
+            const row =
+              message && typeof message === "object" && !Array.isArray(message)
+                ? (message as Record<string, unknown>)
+                : {};
+            const content = (() => {
+              try {
+                // Keep text bytes raw and canonically serialize structured content, matching the
+                // summary's byte-count rule without retaining either side in the journal.
+                return typeof row.content === "string"
+                  ? row.content
+                  : canonicalizeV1IValue(row.content);
+              } catch {
+                return null;
+              }
+            })();
+            return {
+              index,
+              role: typeof row.role === "string" ? row.role : null,
+              content,
+            };
+          });
+        const outputContent = materializationContent(event.messages);
         const contentBoundary: V1JPromptMaterializationBoundary = {
           stage: event.stage as V1JPromptMaterializationBoundary["stage"],
           identity: {
@@ -8486,13 +8503,23 @@ async function runOne(input: {
             promptSubmissionIndex: promptSubmissionTraceIndex,
             modelLoopIterationIndex: currentProviderPayloadTraceIndex || promptSubmissionTraceIndex,
           },
-          messages: materializationContent.map((message, index) => ({ ...message, index })),
+          messages: outputContent,
         };
-        const deltaPairing = diffV1JPromptMaterializationBoundaries(
-          previousMaterializationBoundary?.content,
-          contentBoundary,
-        );
-        const systemMessage = materializationContent.find((message) => message.role === "system");
+        const deltaPairing = event.transition
+          ? diffV1JPromptMaterializationTransition({
+              transitionInstanceId: event.transition.instanceId,
+              sourceBoundary: event.transition.sourceStage,
+              destinationBoundary: event.stage,
+              inputMessages: event.transition.inputMessages
+                ? materializationContent(event.transition.inputMessages)
+                : undefined,
+              outputMessages: outputContent,
+            })
+          : diffV1JPromptMaterializationBoundaries(
+              previousMaterializationBoundary?.content,
+              contentBoundary,
+            );
+        const systemMessage = outputContent.find((message) => message.role === "system");
         journal.record("prompt-materialization-boundary", {
           materializationRequestIndex,
           previousStage: previousTrace?.stage ?? null,

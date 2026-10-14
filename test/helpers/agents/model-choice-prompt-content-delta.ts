@@ -82,8 +82,17 @@ export type V1JPromptMaterializationDeltaSummary = {
   pairingStatus: "PAIRED" | "DELTA_PAIRING_UNAVAILABLE";
   sourceBoundary: string | null;
   destinationBoundary: string;
+  transitionInstanceId?: string | number;
   pairingReason?: string;
   deltas: V1JPromptMaterializationContentDelta[];
+};
+
+export type V1JPromptMaterializationTransition = {
+  transitionInstanceId: string | number;
+  sourceBoundary: string;
+  destinationBoundary: string;
+  inputMessages?: readonly (V1JPromptMessageContent & { index: number })[];
+  outputMessages?: readonly (V1JPromptMessageContent & { index: number })[];
 };
 
 export type V1JPromptSectionFingerprint = {
@@ -237,38 +246,34 @@ function roleCounts(messages: V1JPromptMaterializationBoundary["messages"]): Map
   return counts;
 }
 
-/** Pairs only adjacent snapshots from the same run and role-relative message identity. */
-export function diffV1JPromptMaterializationBoundaries(
-  previous: V1JPromptMaterializationBoundary | undefined,
-  current: V1JPromptMaterializationBoundary,
+function diffV1JPromptMessageContents(
+  sourceBoundary: string,
+  destinationBoundary: string,
+  beforeMessages: V1JPromptMaterializationBoundary["messages"] | undefined,
+  afterMessages: V1JPromptMaterializationBoundary["messages"] | undefined,
+  transitionInstanceId?: string | number,
 ): V1JPromptMaterializationDeltaSummary {
-  const sourceBoundary = previous?.stage ?? null;
-  const destinationBoundary = current.stage;
-  const sourceIndex = previous
-    ? V1J_PROMPT_MATERIALIZATION_BOUNDARY_ORDER.indexOf(previous.stage)
-    : -1;
-  const destinationIndex = V1J_PROMPT_MATERIALIZATION_BOUNDARY_ORDER.indexOf(current.stage);
-  const unavailableReason = !previous
-    ? "no-adjacent-boundary-predecessor"
-    : !sameMaterializationIdentity(previous.identity, current.identity)
-      ? "materialization-identity-mismatch"
-      : destinationIndex !== sourceIndex + 1
-        ? "predecessor-is-not-adjacent-boundary"
-        : undefined;
-
-  if (!previous || unavailableReason) {
+  const unavailableReason = !beforeMessages
+    ? "transition-input-unavailable"
+    : !afterMessages
+      ? "transition-output-unavailable"
+      : undefined;
+  if (unavailableReason) {
+    const availableMessages = beforeMessages ?? afterMessages ?? [];
+    const isBefore = beforeMessages !== undefined;
     return {
       pairingStatus: "DELTA_PAIRING_UNAVAILABLE",
       sourceBoundary,
       destinationBoundary,
+      ...(transitionInstanceId === undefined ? {} : { transitionInstanceId }),
       pairingReason: unavailableReason,
-      deltas: roleOrdinals(current.messages).map(({ message, ordinalWithinRole }) => ({
+      deltas: roleOrdinals(availableMessages).map(({ message, ordinalWithinRole }) => ({
         sourceBoundary,
         destinationBoundary,
         role: message.role,
         ordinalWithinRole,
-        beforeIndex: null,
-        afterIndex: message.index,
+        beforeIndex: isBefore ? message.index : null,
+        afterIndex: isBefore ? null : message.index,
         pairingStatus: "DELTA_PAIRING_UNAVAILABLE",
         pairingReason: unavailableReason,
       })),
@@ -276,19 +281,19 @@ export function diffV1JPromptMaterializationBoundaries(
   }
 
   const beforeByIdentity = new Map(
-    roleOrdinals(previous.messages).map(({ message, ordinalWithinRole }) => [
+    roleOrdinals(beforeMessages).map(({ message, ordinalWithinRole }) => [
       `${message.role ?? "<unknown>"}\u0000${ordinalWithinRole}`,
       { message, ordinalWithinRole },
     ]),
   );
   const afterByIdentity = new Map(
-    roleOrdinals(current.messages).map(({ message, ordinalWithinRole }) => [
+    roleOrdinals(afterMessages).map(({ message, ordinalWithinRole }) => [
       `${message.role ?? "<unknown>"}\u0000${ordinalWithinRole}`,
       { message, ordinalWithinRole },
     ]),
   );
-  const beforeRoleCounts = roleCounts(previous.messages);
-  const afterRoleCounts = roleCounts(current.messages);
+  const beforeRoleCounts = roleCounts(beforeMessages);
+  const afterRoleCounts = roleCounts(afterMessages);
   const deltas: V1JPromptMaterializationContentDelta[] = [];
   for (const [key, before] of beforeByIdentity) {
     const after = afterByIdentity.get(key);
@@ -385,11 +390,70 @@ export function diffV1JPromptMaterializationBoundaries(
     pairingStatus,
     sourceBoundary,
     destinationBoundary,
+    ...(transitionInstanceId === undefined ? {} : { transitionInstanceId }),
     ...(pairingStatus === "DELTA_PAIRING_UNAVAILABLE"
       ? { pairingReason: "one-or-more-message-identities-could-not-be-paired" }
       : {}),
     deltas,
   };
+}
+
+/** Diffs the two snapshots attached to one transformation event, without journal lookup. */
+export function diffV1JPromptMaterializationTransition(
+  transition: V1JPromptMaterializationTransition,
+): V1JPromptMaterializationDeltaSummary {
+  return diffV1JPromptMessageContents(
+    transition.sourceBoundary,
+    transition.destinationBoundary,
+    transition.inputMessages,
+    transition.outputMessages,
+    transition.transitionInstanceId,
+  );
+}
+
+/** Pairs only adjacent snapshots from the same run and role-relative message identity. */
+export function diffV1JPromptMaterializationBoundaries(
+  previous: V1JPromptMaterializationBoundary | undefined,
+  current: V1JPromptMaterializationBoundary,
+): V1JPromptMaterializationDeltaSummary {
+  const sourceBoundary = previous?.stage ?? null;
+  const destinationBoundary = current.stage;
+  const sourceIndex = previous
+    ? V1J_PROMPT_MATERIALIZATION_BOUNDARY_ORDER.indexOf(previous.stage)
+    : -1;
+  const destinationIndex = V1J_PROMPT_MATERIALIZATION_BOUNDARY_ORDER.indexOf(current.stage);
+  const unavailableReason = !previous
+    ? "no-adjacent-boundary-predecessor"
+    : !sameMaterializationIdentity(previous.identity, current.identity)
+      ? "materialization-identity-mismatch"
+      : destinationIndex !== sourceIndex + 1
+        ? "predecessor-is-not-adjacent-boundary"
+        : undefined;
+
+  if (!previous || unavailableReason) {
+    return {
+      pairingStatus: "DELTA_PAIRING_UNAVAILABLE",
+      sourceBoundary,
+      destinationBoundary,
+      pairingReason: unavailableReason,
+      deltas: roleOrdinals(current.messages).map(({ message, ordinalWithinRole }) => ({
+        sourceBoundary,
+        destinationBoundary,
+        role: message.role,
+        ordinalWithinRole,
+        beforeIndex: null,
+        afterIndex: message.index,
+        pairingStatus: "DELTA_PAIRING_UNAVAILABLE",
+        pairingReason: unavailableReason,
+      })),
+    };
+  }
+  return diffV1JPromptMessageContents(
+    sourceBoundary,
+    destinationBoundary,
+    previous.messages,
+    current.messages,
+  );
 }
 
 /** Fingerprints named system-prompt inputs without retaining their text. */

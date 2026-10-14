@@ -37,6 +37,7 @@ describe("prepareEmbeddedAttemptSessionBoundary", () => {
     const privateSystem = "private system prompt";
     const privateUser = "private user prompt";
     const traceEvents: Array<Record<string, unknown>> = [];
+    const transitionInputs: (readonly unknown[])[] = [];
     const messages: AgentMessage[] = [
       {
         role: "user",
@@ -53,12 +54,25 @@ describe("prepareEmbeddedAttemptSessionBoundary", () => {
         prompt: privateUser,
         trigger: "user",
         capabilityIntelligenceExperiment: {
-          onPromptMessageTrace: (event) =>
+          onPromptMessageTrace: (event) => {
+            if (event.transition) {
+              transitionInputs.push(event.transition.inputMessages);
+            }
             traceEvents.push({
               stage: event.stage,
               source: event.source,
               systemPromptFingerprint: event.systemPromptFingerprint,
               materializationFactors: event.materializationFactors,
+              ...(event.transition
+                ? {
+                    transition: {
+                      instanceId: event.transition.instanceId,
+                      sourceStage: event.transition.sourceStage,
+                      inputMessageCount: event.transition.inputMessages.length,
+                      inputIsSnapshot: event.transition.inputMessages !== messages,
+                    },
+                  }
+                : {}),
               messages: event.messages.map((message) => {
                 const row = message as { role?: unknown; content?: unknown };
                 const content =
@@ -70,7 +84,8 @@ describe("prepareEmbeddedAttemptSessionBoundary", () => {
                   contentFingerprint: fingerprintPromptText(content),
                 };
               }),
-            }),
+            });
+          },
         },
       },
       getUserTranscriptContexts: () => undefined,
@@ -90,6 +105,32 @@ describe("prepareEmbeddedAttemptSessionBoundary", () => {
       "agent-llm-boundary-converted",
     ];
     expect(traceEvents.map((event) => event.stage)).toEqual([...expectedStages, ...expectedStages]);
+    const normalizationTransitions = traceEvents.filter(
+      (event) => event.stage === "agent-llm-boundary-normalized",
+    );
+    expect(normalizationTransitions.map((event) => event.transition)).toEqual([
+      {
+        instanceId: 1,
+        sourceStage: "agent-llm-boundary-input",
+        inputMessageCount: 1,
+        inputIsSnapshot: true,
+      },
+      {
+        instanceId: 2,
+        sourceStage: "agent-llm-boundary-input",
+        inputMessageCount: 1,
+        inputIsSnapshot: true,
+      },
+    ]);
+    expect(transitionInputs.map((input) => input[0])).toEqual([
+      { role: "user", content: [{ type: "text", text: privateUser }] },
+      { role: "user", content: [{ type: "text", text: privateUser }] },
+    ]);
+    (messages[0] as { content: unknown }).content = "mutated after normalization";
+    expect(transitionInputs.map((input) => input[0])).toEqual([
+      { role: "user", content: [{ type: "text", text: privateUser }] },
+      { role: "user", content: [{ type: "text", text: privateUser }] },
+    ]);
     expect(traceEvents[0]?.systemPromptFingerprint).toEqual(fingerprintPromptText(privateSystem));
     expect(traceEvents[0]?.materializationFactors).toMatchObject({
       boundaryTimestampEnabled: true,
@@ -101,8 +142,20 @@ describe("prepareEmbeddedAttemptSessionBoundary", () => {
       randomOrNonceTextInjected: "unknown",
       dynamicCapabilityOrToolTextInjected: "unknown",
     });
-    expect(traceEvents.slice(0, expectedStages.length)).toEqual(
-      traceEvents.slice(expectedStages.length),
+    const withoutTransitionInstanceIds = (events: Array<Record<string, unknown>>) =>
+      events.map((event) => ({
+        ...event,
+        ...(event.transition && typeof event.transition === "object"
+          ? {
+              transition: {
+                ...(event.transition as Record<string, unknown>),
+                instanceId: 0,
+              },
+            }
+          : {}),
+      }));
+    expect(withoutTransitionInstanceIds(traceEvents.slice(0, expectedStages.length))).toEqual(
+      withoutTransitionInstanceIds(traceEvents.slice(expectedStages.length)),
     );
     expect(JSON.stringify(traceEvents)).not.toContain(privateSystem);
     expect(JSON.stringify(traceEvents)).not.toContain(privateUser);

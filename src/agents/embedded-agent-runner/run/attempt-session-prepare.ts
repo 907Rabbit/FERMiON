@@ -350,6 +350,7 @@ export function prepareEmbeddedAttemptSessionBoundary(input: {
 
   if (typeof activeSession.agent.convertToLlm === "function") {
     const baseConvertToLlm = activeSession.agent.convertToLlm.bind(activeSession.agent);
+    let normalizationTransitionInstanceId = 0;
     activeSession.agent.convertToLlm = async (messages) => {
       const trace = attempt.capabilityIntelligenceExperiment?.onPromptMessageTrace;
       const systemPromptFingerprint = fingerprintPromptText(activeSession.agent.state.systemPrompt);
@@ -358,6 +359,11 @@ export function prepareEmbeddedAttemptSessionBoundary(input: {
         observed: readonly unknown[],
         source: string,
         materializationFactors?: Record<string, string | number | boolean | null>,
+        transition?: {
+          instanceId: number;
+          sourceStage: string;
+          inputMessages?: readonly unknown[];
+        },
       ) =>
         trace?.({
           stage,
@@ -365,6 +371,7 @@ export function prepareEmbeddedAttemptSessionBoundary(input: {
           source,
           systemPromptFingerprint,
           ...(materializationFactors ? { materializationFactors } : {}),
+          ...(transition ? { transition } : {}),
         });
       const boundaryOptions = buildBoundaryOptions();
       const boundaryFactors = {
@@ -378,15 +385,42 @@ export function prepareEmbeddedAttemptSessionBoundary(input: {
         randomOrNonceTextInjected: "unknown",
         dynamicCapabilityOrToolTextInjected: "unknown",
       } as const;
+      const transitionInputMessages = trace
+        ? (() => {
+            try {
+              return messages.map((message) => {
+                const row = message as { role?: unknown; content?: unknown };
+                return { role: row.role, content: structuredClone(row.content) };
+              });
+            } catch {
+              return undefined;
+            }
+          })()
+        : undefined;
       traceStage("agent-llm-boundary-input", messages, "convertToLlm input", {
         ...boundaryFactors,
         runtimeContextCarrierCount: countRuntimeContextCarriers(messages),
       });
       const normalized = normalizeMessagesForLlmBoundary(messages, boundaryOptions);
-      traceStage("agent-llm-boundary-normalized", normalized, "normalizeMessagesForLlmBoundary", {
-        ...boundaryFactors,
-        runtimeContextCarrierCount: countRuntimeContextCarriers(normalized),
-      });
+      const transition = trace
+        ? {
+            instanceId: ++normalizationTransitionInstanceId,
+            sourceStage: "agent-llm-boundary-input",
+            inputMessages: transitionInputMessages,
+          }
+        : undefined;
+      // Keep the exact call input attached to this completion event: adjacent hook identities can
+      // shift during model-loop bookkeeping, while journaling either side's content is prohibited.
+      traceStage(
+        "agent-llm-boundary-normalized",
+        normalized,
+        "normalizeMessagesForLlmBoundary",
+        {
+          ...boundaryFactors,
+          runtimeContextCarrierCount: countRuntimeContextCarriers(normalized),
+        },
+        transition,
+      );
       // Wire-only relocation keeps the request append-only through the active
       // user turn without changing position-sensitive precheck normalization.
       const relocated = relocateCurrentRuntimeContextCarrierToTail(normalized);

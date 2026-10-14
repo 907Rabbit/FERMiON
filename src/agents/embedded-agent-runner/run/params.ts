@@ -163,6 +163,11 @@ export type EmbeddedCapabilityIntelligenceExperimentHooks = {
   onPromptMessageTrace?: (event: {
     stage: string;
     messages: readonly unknown[];
+    transition?: {
+      instanceId: number;
+      sourceStage: string;
+      inputMessages?: readonly unknown[];
+    };
     source: string;
     systemPromptFingerprint?: { sha256: string; utf8Bytes: number };
     materializationFactors?: Record<string, string | number | boolean | null>;

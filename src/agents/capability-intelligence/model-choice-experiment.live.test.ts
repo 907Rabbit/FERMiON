@@ -2642,24 +2642,75 @@ describeV1JProviderCapturePreflight("v1J provider-bound capture preflight only",
       let providerBoundCaptureCount = 0;
       let requestSummary: ReturnType<typeof summarizeV1JRawRepeatabilityRequest> | undefined;
       const providerCaptureStages: string[] = [];
+      const callbackStageStartedAt = new Map<string, string>();
       const recordCaptureStage = (event: V1JProviderControlEvent) => {
         preflightStage = event.event;
         providerCaptureStages.push(event.event);
+        const observedAt = new Date().toISOString();
+        const stageName = event.event.replace(
+          /-(?:start|complete|failed|enter|exit|raised|caught)$/,
+          "",
+        );
+        const phase =
+          event.event.match(/(?:start|complete|failed|enter|exit|raised|caught)$/)?.[0] ?? "event";
+        const enteredAt =
+          phase === "start" || phase === "enter"
+            ? observedAt
+            : callbackStageStartedAt.get(stageName);
+        if (phase === "start" || phase === "enter") {
+          callbackStageStartedAt.set(stageName, observedAt);
+        }
+        if (
+          phase === "complete" ||
+          phase === "failed" ||
+          phase === "exit" ||
+          phase === "raised" ||
+          phase === "caught"
+        ) {
+          callbackStageStartedAt.delete(stageName);
+        }
         const allowedDetails = new Set([
           "canonicalRequestSha256",
+          "callbackIndex",
           "contentBytes",
           "errorName",
           "messageCount",
           "requestJsonBytes",
+          "stageName",
+          "awaited",
+          "awaitTargetClass",
+          "phase",
+          "enteredAt",
+          "completedAt",
+          "targetEvent",
           "toolCount",
         ]);
         const details = Object.fromEntries(
           Object.entries(event.details ?? {}).filter(([key]) => allowedDetails.has(key)),
         );
         journal.record(`provider-capture-${event.event}`, {
+          stageName,
+          phase,
+          enteredAt: enteredAt ?? observedAt,
+          completedAt:
+            phase === "complete" ||
+            phase === "failed" ||
+            phase === "exit" ||
+            phase === "raised" ||
+            phase === "caught"
+              ? observedAt
+              : null,
+          awaited: event.details?.awaited === true,
+          awaitTargetClass:
+            typeof event.details?.awaitTargetClass === "string"
+              ? event.details.awaitTargetClass
+              : null,
           ...(event.elapsedMs === undefined ? {} : { elapsedMs: event.elapsedMs }),
           ...(Object.keys(details).length === 0 ? {} : { details }),
         });
+      };
+      const recordCallbackJournalEvent = (event: string, details: Record<string, unknown> = {}) => {
+        recordV1JPreflightCallbackJournalEvent(journal, event, details, recordCaptureStage);
       };
       try {
         journal.record("provider-capture-preflight-start", {
@@ -2714,15 +2765,37 @@ describeV1JProviderCapturePreflight("v1J provider-bound capture preflight only",
                 ) {
                   throw new Error("v1J provider capture preflight exceeded its one-request bound");
                 }
-                journal.record("capture-record-build-start");
+                recordCallbackJournalEvent("capture-record-build-start", {
+                  awaited: false,
+                  stageName: "capture-record-build",
+                });
                 requestSummary = summarizeV1JRawRepeatabilityRequest(
                   { endpoint: request.url, rawBody, requestObject: request.body },
                   recordCaptureStage,
                 );
-                journal.record("capture-record-build-complete", requestSummary);
+                recordCallbackJournalEvent("capture-record-build-complete", {
+                  awaited: false,
+                  stageName: "capture-record-build",
+                  messageCount: requestSummary.messageCount,
+                  toolCount: requestSummary.toolCount,
+                  requestJsonBytes: requestSummary.requestJsonBytes,
+                  canonicalRequestSha256: requestSummary.requestCanonicalSha256,
+                });
               },
-              onPreflightStopRaised: () => journal.record("preflight-stop-signal-raised"),
-              onPreflightStopCaught: () => journal.record("preflight-stop-signal-caught"),
+              onPreflightStopRaised: () => {
+                recordCaptureStage({
+                  event: "stop-signal-raise",
+                  details: { stageName: "preflight-stop-signal", awaited: false },
+                });
+                recordCallbackJournalEvent("preflight-stop-signal-raised");
+              },
+              onPreflightStopCaught: () => {
+                recordCaptureStage({
+                  event: "stop-signal-caught",
+                  details: { stageName: "preflight-stop-signal", awaited: false },
+                });
+                recordCallbackJournalEvent("preflight-stop-signal-caught");
+              },
             }),
           stage: () => preflightStage,
           record: (event) => journal.record(event.event, event.details),
@@ -2788,10 +2861,22 @@ describeV1JProviderCapturePreflight("v1J provider-bound capture preflight only",
           })}\n`,
         );
       } catch (error) {
-        journal.record("provider-capture-preflight-failed", {
-          errorName: error instanceof Error ? error.name : "NonErrorThrown",
-          lastCheckpoint: preflightStage,
-        });
+        try {
+          recordCaptureStage({
+            event: "outer-catch-enter",
+            details: {
+              stageName: "provider-capture-preflight",
+              awaited: false,
+              errorName: error instanceof Error ? error.name : "NonErrorThrown",
+            },
+          });
+          journal.record("provider-capture-preflight-failed", {
+            errorName: error instanceof Error ? error.name : "NonErrorThrown",
+            lastCheckpoint: preflightStage,
+          });
+        } catch {
+          // A failed diagnostic sink must not replace the callback's original failure.
+        }
         throw error;
       } finally {
         journal.close();
@@ -3354,6 +3439,14 @@ async function captureV1JPreflightSurface(
         onAuthorizedToolsCaptured: (tools) =>
           authorizedTools.splice(0, authorizedTools.length, ...tools),
         onRequestCaptured: (request) => {
+          options?.onProviderCaptureStage?.({
+            event: "capture-record-build-start",
+            details: {
+              stageName: "request-object-observation",
+              awaited: false,
+              awaitTargetClass: null,
+            },
+          });
           requests.push(request);
           options?.onCapturedRequest?.(request);
           const surface = fingerprintV1JToolSurface({
@@ -3376,10 +3469,27 @@ async function captureV1JPreflightSurface(
             providerToolSchemaSha256: surface.providerToolSchemaSha256,
           };
           requestObservations.push(requestObservation);
-          preflightDiagnostics?.record(`arm-${arm.toLowerCase()}-request-observation-captured`, {
-            observationIndex: requestObservations.length,
-            observation: requestObservation,
+          options?.onProviderCaptureStage?.({
+            event: "capture-record-build-complete",
+            details: {
+              stageName: "request-object-observation",
+              awaited: false,
+              awaitTargetClass: null,
+              messageCount: Array.isArray(request.body.messages) ? request.body.messages.length : 0,
+              toolCount: surface.providerToolCount,
+            },
           });
+          if (preflightDiagnostics) {
+            recordV1JPreflightCallbackJournalEvent(
+              preflightDiagnostics,
+              `arm-${arm.toLowerCase()}-request-observation-captured`,
+              {
+                observationIndex: requestObservations.length,
+                observation: requestObservation,
+              },
+              options?.onProviderCaptureStage ?? (() => undefined),
+            );
+          }
           // The request observer runs before final provider serialization. Keep the run alive until
           // the exact wire body is captured by the pre-dispatch hook below.
           if (!options?.onProviderBoundRequest) {
@@ -3557,6 +3667,50 @@ async function captureV1JPreflightSurface(
     `arm-${arm.toLowerCase()}-preflight-complete`,
   );
   return actual;
+}
+
+function recordV1JPreflightCallbackJournalEvent(
+  journal: Pick<V1JPreflightDiagnosticJournal, "record">,
+  event: string,
+  details: Record<string, unknown>,
+  recordStage: (event: V1JProviderControlEvent) => void,
+): void {
+  const startedAt = performance.now();
+  const enteredAt = new Date().toISOString();
+  recordStage({
+    event: "journal-write-start",
+    details: { stageName: "journal-write", awaited: false, targetEvent: event },
+  });
+  try {
+    journal.record(event, details);
+  } catch (error) {
+    try {
+      recordStage({
+        event: "journal-write-failed",
+        elapsedMs: Math.max(0, Math.round(performance.now() - startedAt)),
+        details: {
+          stageName: "journal-write",
+          awaited: false,
+          targetEvent: event,
+          errorName: error instanceof Error ? error.name : "NonErrorThrown",
+        },
+      });
+    } catch {
+      // Preserve the journal failure if the diagnostic sink itself is unavailable.
+    }
+    throw error;
+  }
+  recordStage({
+    event: "journal-write-complete",
+    elapsedMs: Math.max(0, Math.round(performance.now() - startedAt)),
+    details: {
+      stageName: "journal-write",
+      awaited: false,
+      awaitTargetClass: null,
+      targetEvent: event,
+      enteredAt,
+    },
+  });
 }
 
 function assertV1JPreflightRuntimeNames(
@@ -4182,14 +4336,23 @@ describe("v1J schema-capture dispatch guard", () => {
         "request-serialization-start",
         "request-serialization-complete",
         "request-object-received",
+        "provider-bound-callback-enter",
+        "callback-return-or-throw",
+        "provider-bound-callback-enter",
         "request-canonicalization-start",
         "request-canonicalization-complete",
         "capture-record-build-start",
         "capture-record-build-complete",
+        "callback-return-or-throw",
         "provider-bound-request-captured",
+        "stop-signal-prepare",
         "preflight-stop-signal-raised",
+        "stop-signal-raise",
       ]);
       expect(events[1]?.details).toMatchObject({
+        stageName: "body-serialization",
+        awaited: true,
+        awaitTargetClass: "readCapturedFetchBody",
         requestJsonBytes: Buffer.byteLength(requestBody),
       });
       expect(events[2]?.details).toMatchObject({ messageCount: 1, toolCount: 15 });
@@ -4228,7 +4391,12 @@ describe("v1J schema-capture dispatch guard", () => {
         "request-serialization-start",
         "request-serialization-failed",
       ]);
-      expect(events[1]?.details).toEqual({ errorName: "TypeError" });
+      expect(events[1]?.details).toMatchObject({
+        stageName: "body-serialization",
+        awaited: true,
+        awaitTargetClass: "readCapturedFetchBody",
+        errorName: "TypeError",
+      });
       expect(JSON.stringify(events)).not.toContain("private body failure detail");
       expect(underlyingFetches).toBe(0);
       expect(payloadCapture.providerDispatchAttempts).toBe(0);
@@ -4276,13 +4444,107 @@ describe("v1J schema-capture dispatch guard", () => {
         }),
       ).rejects.toThrow(/does not match its provider object/);
       expect(events.map((event) => event.event)).toContain("request-canonicalization-failed");
+      expect(events.map((event) => event.event)).toContain("provider-bound-callback-enter");
+      expect(events.map((event) => event.event)).toContain("outer-catch-enter");
+      expect(
+        events.find(
+          (event) =>
+            event.event === "callback-return-or-throw" &&
+            event.details?.stageName === "provider-bound-callback",
+        )?.details,
+      ).toMatchObject({
+        phase: "throw",
+        awaited: true,
+        awaitTargetClass: "onProviderRequestBeforeDispatch",
+      });
       expect(events.map((event) => event.event)).not.toContain("capture-record-build-start");
+      expect(events.map((event) => event.event)).not.toContain("stop-signal-raise");
       expect(events.map((event) => event.event)).not.toContain("provider-bound-request-captured");
       expect(JSON.stringify(events)).not.toContain("private canonicalization prompt");
       expect(underlyingFetches).toBe(0);
       expect(payloadCapture.providerDispatchAttempts).toBe(0);
     } finally {
       payloadCapture.restore();
+    }
+  });
+
+  it("journals callback-write start and failure without dispatching or masking the sink error", async () => {
+    const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), "v1j-callback-journal-failure-"));
+    const journal = createV1JPreflightDiagnosticJournal({
+      repoRoot,
+      harnessCommit: "7".repeat(40),
+      arm: "A",
+      caseId: "offline-callback-journal-failure",
+      preflightId: `offline-callback-journal-failure-${process.pid}`,
+      pid: process.pid,
+    });
+    const events: V1JProviderControlEvent[] = [];
+    const originalRecord = journal.record.bind(journal);
+    const failure = new Error("private journal failure detail");
+    journal.record = (event, details) => {
+      if (event === "capture-record-build-complete") {
+        throw failure;
+      }
+      originalRecord(event, details);
+    };
+    const recordStage = (event: V1JProviderControlEvent) => {
+      events.push(event);
+      originalRecord(`provider-capture-${event.event}`, {
+        ...(event.elapsedMs === undefined ? {} : { elapsedMs: event.elapsedMs }),
+        ...(event.details === undefined ? {} : { details: event.details }),
+      });
+    };
+    let underlyingFetches = 0;
+    const payloadCapture = captureModelPayloads(undefined, {
+      stopAfterProviderBoundCapture: true,
+      onProviderCaptureStage: recordStage,
+      onProviderRequestBeforeDispatch: () =>
+        recordV1JPreflightCallbackJournalEvent(
+          journal,
+          "capture-record-build-complete",
+          { messageCount: 1, toolCount: 15 },
+          recordStage,
+        ),
+    });
+
+    try {
+      await expect(
+        payloadCapture.wrapFetch(async () => {
+          underlyingFetches += 1;
+          return new Response("{}");
+        })(`${LM_STUDIO_BASE_URL}/chat/completions`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ model: MODEL_ID, messages: [], tools: [], stream: true }),
+        }),
+      ).rejects.toBe(failure);
+      expect(events.map((event) => event.event)).toEqual([
+        "request-serialization-start",
+        "request-serialization-complete",
+        "request-object-received",
+        "provider-bound-callback-enter",
+        "callback-return-or-throw",
+        "provider-bound-callback-enter",
+        "journal-write-start",
+        "journal-write-failed",
+        "outer-catch-enter",
+        "callback-return-or-throw",
+      ]);
+      expect(events[6]?.details).toMatchObject({
+        awaited: false,
+        targetEvent: "capture-record-build-complete",
+      });
+      expect(events[7]?.details).toMatchObject({ awaited: false, errorName: "Error" });
+      expect(payloadCapture.providerDispatchAttempts).toBe(0);
+      expect(underlyingFetches).toBe(0);
+      const journalText = fs.readFileSync(journal.filePath, "utf8");
+      expect(journalText).toContain("journal-write-start");
+      expect(journalText).not.toContain("private journal failure detail");
+      expect(journalText).not.toContain('"event":"capture-record-build-complete"');
+    } finally {
+      payloadCapture.restore();
+      journal.close();
+      fs.rmSync(repoRoot, { recursive: true, force: true });
     }
   });
 
@@ -4664,13 +4926,31 @@ describe("v1J schema-capture dispatch guard", () => {
         "request-serialization-start",
         "request-serialization-complete",
         "request-object-received",
+        "provider-bound-callback-enter",
+        "callback-return-or-throw",
+        "provider-bound-callback-enter",
         "capture-record-build-start",
         "request-canonicalization-start",
         "request-canonicalization-complete",
         "capture-record-build-complete",
+        "callback-return-or-throw",
         "provider-bound-request-captured",
+        "stop-signal-prepare",
         "preflight-stop-signal-raised",
+        "stop-signal-raise",
       ]);
+      expect(events[1]?.details).toMatchObject({
+        stageName: "body-serialization",
+        awaited: true,
+        awaitTargetClass: "readCapturedFetchBody",
+        requestJsonBytes: Buffer.byteLength(requestBody),
+      });
+      expect(events[5]?.details).toMatchObject({
+        stageName: "provider-bound-callback",
+        awaited: true,
+        awaitTargetClass: "onProviderRequestBeforeDispatch",
+      });
+      expect(events[10]?.details).toMatchObject({ phase: "return", awaited: true });
       expect(JSON.stringify(events)).not.toContain(privateText);
       expect(events.map((event) => event.event)).not.toContain("tool-execution-started");
       expect(journal.counters()).toMatchObject({
@@ -7090,9 +7370,19 @@ async function runOne(input: {
       recordProviderCaptureStage("provider-payload-transform-start", {
         callbackIndex: event.callbackIndex ?? null,
       });
+      recordProviderCaptureStage("payload-transform-start", {
+        callbackIndex: event.callbackIndex ?? null,
+        awaited: false,
+        awaitTargetClass: null,
+      });
     } else if (event.stage === "provider-onPayload-transform-complete") {
       recordProviderCaptureStage("provider-payload-transform-complete", {
         callbackIndex: event.callbackIndex ?? null,
+      });
+      recordProviderCaptureStage("payload-transform-complete", {
+        callbackIndex: event.callbackIndex ?? null,
+        awaited: false,
+        awaitTargetClass: null,
       });
     }
     const journal = input.requestCapture?.preflightDiagnostics;
@@ -7516,16 +7806,27 @@ async function runOne(input: {
       representativeToolNames: toolNames,
     });
     const observerStartedAt = performance.now();
+    const observerEnteredAt = new Date().toISOString();
+    const observerAwaitTargetClass = diagnosticsProviderRequest?.constructor.name ?? null;
     recordProviderCaptureStage("request-observer-await-start", {
       callbackIndex,
       messageCount: requestMessages.length,
       toolCount: toolNames.length,
+      awaited: diagnosticsProviderRequest !== undefined,
+      awaitTargetClass: observerAwaitTargetClass,
+      enteredAt: observerEnteredAt,
     });
     try {
       await diagnosticsProviderRequest?.({ payload, model });
       recordProviderCaptureStage(
         "request-observer-await-complete",
-        { callbackIndex },
+        {
+          callbackIndex,
+          awaited: diagnosticsProviderRequest !== undefined,
+          awaitTargetClass: observerAwaitTargetClass,
+          enteredAt: observerEnteredAt,
+          completedAt: new Date().toISOString(),
+        },
         performance.now() - observerStartedAt,
       );
     } catch (error) {
@@ -7534,6 +7835,10 @@ async function runOne(input: {
         {
           callbackIndex,
           errorName: error instanceof Error ? error.name : "NonErrorThrown",
+          awaited: diagnosticsProviderRequest !== undefined,
+          awaitTargetClass: observerAwaitTargetClass,
+          enteredAt: observerEnteredAt,
+          completedAt: new Date().toISOString(),
         },
         performance.now() - observerStartedAt,
       );
@@ -9385,8 +9690,17 @@ function captureModelPayloads(
         url.includes("/chat/completions") ||
         url.includes("/responses");
       const serializationStartedAt = performance.now();
+      const serializationEnteredAt = new Date().toISOString();
       if (isPotentialProviderRequest) {
-        options?.onProviderCaptureStage?.({ event: "request-serialization-start" });
+        options?.onProviderCaptureStage?.({
+          event: "request-serialization-start",
+          details: {
+            stageName: "body-serialization",
+            awaited: true,
+            awaitTargetClass: "readCapturedFetchBody",
+            enteredAt: serializationEnteredAt,
+          },
+        });
       }
       let body: string | undefined;
       try {
@@ -9396,7 +9710,14 @@ function captureModelPayloads(
           options?.onProviderCaptureStage?.({
             event: "request-serialization-failed",
             elapsedMs: Math.max(0, Math.round(performance.now() - serializationStartedAt)),
-            details: { errorName: error instanceof Error ? error.name : "NonErrorThrown" },
+            details: {
+              stageName: "body-serialization",
+              awaited: true,
+              awaitTargetClass: "readCapturedFetchBody",
+              enteredAt: serializationEnteredAt,
+              completedAt: new Date().toISOString(),
+              errorName: error instanceof Error ? error.name : "NonErrorThrown",
+            },
           });
         }
         throw error;
@@ -9406,6 +9727,11 @@ function captureModelPayloads(
           event: "request-serialization-complete",
           elapsedMs: Math.max(0, Math.round(performance.now() - serializationStartedAt)),
           details: {
+            stageName: "body-serialization",
+            awaited: true,
+            awaitTargetClass: "readCapturedFetchBody",
+            enteredAt: serializationEnteredAt,
+            completedAt: new Date().toISOString(),
             requestJsonBytes: body === undefined ? null : Buffer.byteLength(body, "utf8"),
           },
         });
@@ -9450,7 +9776,59 @@ function captureModelPayloads(
             preflightEvent("request-observer-enter"),
             { callSite: "captureModelPayloads.wrapFetch", invocationIndex: requests.length },
           );
-          options?.onRequestCaptured?.(request);
+          const observerCallbackStartedAt = performance.now();
+          const observerCallbackEnteredAt = new Date().toISOString();
+          options?.onProviderCaptureStage?.({
+            event: "provider-bound-callback-enter",
+            details: {
+              stageName: "request-object-observation",
+              awaited: false,
+              awaitTargetClass: null,
+              enteredAt: observerCallbackEnteredAt,
+            },
+          });
+          try {
+            options?.onRequestCaptured?.(request);
+            options?.onProviderCaptureStage?.({
+              event: "callback-return-or-throw",
+              elapsedMs: Math.max(0, Math.round(performance.now() - observerCallbackStartedAt)),
+              details: {
+                stageName: "request-object-observation",
+                phase: "return",
+                awaited: false,
+                awaitTargetClass: null,
+                enteredAt: observerCallbackEnteredAt,
+                completedAt: new Date().toISOString(),
+              },
+            });
+          } catch (error) {
+            options?.onProviderCaptureStage?.({
+              event: "outer-catch-enter",
+              elapsedMs: Math.max(0, Math.round(performance.now() - observerCallbackStartedAt)),
+              details: {
+                stageName: "request-object-observation",
+                awaited: false,
+                awaitTargetClass: null,
+                enteredAt: observerCallbackEnteredAt,
+                completedAt: new Date().toISOString(),
+                errorName: error instanceof Error ? error.name : "NonErrorThrown",
+              },
+            });
+            options?.onProviderCaptureStage?.({
+              event: "callback-return-or-throw",
+              elapsedMs: Math.max(0, Math.round(performance.now() - observerCallbackStartedAt)),
+              details: {
+                stageName: "request-object-observation",
+                phase: "throw",
+                awaited: false,
+                awaitTargetClass: null,
+                enteredAt: observerCallbackEnteredAt,
+                completedAt: new Date().toISOString(),
+                errorName: error instanceof Error ? error.name : "NonErrorThrown",
+              },
+            });
+            throw error;
+          }
           options?.preflightDiagnostics?.record(preflightEvent("request-observer-exit"), {
             callSite: "captureModelPayloads.wrapFetch",
             invocationIndex: requests.length,
@@ -9496,6 +9874,17 @@ function captureModelPayloads(
             signal?.addEventListener("abort", () => reject(abortReason(signal)), { once: true });
           });
         }
+        const providerBoundCallbackEnteredAt = new Date().toISOString();
+        const providerBoundCallbackStartedAt = performance.now();
+        options?.onProviderCaptureStage?.({
+          event: "provider-bound-callback-enter",
+          details: {
+            stageName: "provider-bound-callback",
+            awaited: true,
+            awaitTargetClass: "onProviderRequestBeforeDispatch",
+            enteredAt: providerBoundCallbackEnteredAt,
+          },
+        });
         try {
           await options?.onProviderRequestBeforeDispatch?.({
             request,
@@ -9503,13 +9892,65 @@ function captureModelPayloads(
             requestIndex,
             dispatchOrdinal: providerDispatchAttempts + 1,
           });
-          options?.onProviderCaptureStage?.({ event: "provider-bound-request-captured" });
+          options?.onProviderCaptureStage?.({
+            event: "callback-return-or-throw",
+            elapsedMs: Math.max(0, Math.round(performance.now() - providerBoundCallbackStartedAt)),
+            details: {
+              stageName: "provider-bound-callback",
+              phase: "return",
+              awaited: true,
+              awaitTargetClass: "onProviderRequestBeforeDispatch",
+              enteredAt: providerBoundCallbackEnteredAt,
+              completedAt: new Date().toISOString(),
+            },
+          });
+          options?.onProviderCaptureStage?.({
+            event: "provider-bound-request-captured",
+            details: {
+              stageName: "provider-bound-callback",
+              awaited: false,
+              awaitTargetClass: null,
+            },
+          });
         } catch (error) {
           providerRequestGateFailed = true;
           providerRequestGateError = error;
+          options?.onProviderCaptureStage?.({
+            event: "outer-catch-enter",
+            elapsedMs: Math.max(0, Math.round(performance.now() - providerBoundCallbackStartedAt)),
+            details: {
+              stageName: "provider-bound-callback",
+              awaited: true,
+              awaitTargetClass: "onProviderRequestBeforeDispatch",
+              enteredAt: providerBoundCallbackEnteredAt,
+              completedAt: new Date().toISOString(),
+              errorName: error instanceof Error ? error.name : "NonErrorThrown",
+            },
+          });
+          options?.onProviderCaptureStage?.({
+            event: "callback-return-or-throw",
+            elapsedMs: Math.max(0, Math.round(performance.now() - providerBoundCallbackStartedAt)),
+            details: {
+              stageName: "provider-bound-callback",
+              phase: "throw",
+              awaited: true,
+              awaitTargetClass: "onProviderRequestBeforeDispatch",
+              enteredAt: providerBoundCallbackEnteredAt,
+              completedAt: new Date().toISOString(),
+              errorName: error instanceof Error ? error.name : "NonErrorThrown",
+            },
+          });
           throw error;
         }
         if (options?.stopAfterProviderBoundCapture) {
+          options?.onProviderCaptureStage?.({
+            event: "stop-signal-prepare",
+            details: {
+              stageName: "preflight-stop-signal",
+              awaited: false,
+              awaitTargetClass: null,
+            },
+          });
           const stopSignal = new V1IProviderRequestCapturedError();
           providerRequestGateFailed = true;
           providerRequestGateError = stopSignal;
@@ -9523,6 +9964,14 @@ function captureModelPayloads(
               signalName: V1IProviderRequestCapturedError.name,
             },
           );
+          options?.onProviderCaptureStage?.({
+            event: "stop-signal-raise",
+            details: {
+              stageName: "preflight-stop-signal",
+              awaited: false,
+              awaitTargetClass: null,
+            },
+          });
           throw stopSignal;
         }
       }

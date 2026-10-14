@@ -53,7 +53,9 @@ import {
   assertV1JAdapterDifferentialPreflight,
   assertV1JAdapterDifferentialRequestBudget,
   createV1JAdapterDifferentialJournal,
+  finalizeV1JAdapterDifferentialDiagnostic,
   installV1JAdapterDifferentialToolGuard,
+  recordV1JAdapterDifferentialOutcomes,
   reportV1JAdapterDifferentialProgress,
   runV1JAdapterDifferentialRawTransport,
   recordV1JAdapterDifferentialRequestFingerprint,
@@ -1921,7 +1923,9 @@ describeV1JAdapterDifferential("v1J raw-transport versus adapter differential", 
             startedAt: new Date().toISOString(),
           }),
       });
-      let rawResult: Awaited<ReturnType<typeof runV1JAdapterDifferentialRawTransport>> | undefined;
+      type RawOutcome = Awaited<ReturnType<typeof runV1JAdapterDifferentialRawTransport>>;
+      let rawOutcome: RawOutcome | undefined;
+      let rawTask: Promise<RawOutcome> | undefined;
       let observation: V1JObservation | undefined;
       let adapterDispatches = 0;
       let adapterToolGuard: ReturnType<typeof installV1JAdapterDifferentialToolGuard> | undefined;
@@ -2062,7 +2066,11 @@ describeV1JAdapterDifferential("v1J raw-transport versus adapter differential", 
                     `v1J captured provider-bound request changed before raw fork at: ${comparison.differingPaths.join(",")}`,
                   );
                 }
-                rawResult = await withV1JAdapterDifferentialProgress({
+                let resolveRawDispatchStarted!: () => void;
+                const rawDispatchStarted = new Promise<void>((resolve) => {
+                  resolveRawDispatchStarted = resolve;
+                });
+                rawTask = withV1JAdapterDifferentialProgress({
                   stage: "raw-control-c-fork-dispatch",
                   operation: () =>
                     runV1JAdapterDifferentialRawTransport({
@@ -2078,18 +2086,20 @@ describeV1JAdapterDifferential("v1J raw-transport versus adapter differential", 
                         modelDiscoveryStatus,
                         requestTimeoutMs: 120_000,
                       },
+                      onDispatchStarted: resolveRawDispatchStarted,
                     }),
                 });
-                journal.record("raw-transport-complete", {
-                  httpStatus: rawResult.httpStatus,
-                  responseFirstByteMs: rawResult.responseFirstByteMs,
-                  responseChunkCount: rawResult.responseChunkCount,
-                  responseByteCount: rawResult.responseByteCount,
-                  elapsedMs: rawResult.elapsedMs,
-                  outcome: rawResult.streamEnd ? "complete" : "incomplete",
-                });
+                // Release the adapter's pre-dispatch hook once the raw fork starts, not after its body completes.
+                const rawDispatched = await Promise.race([
+                  rawDispatchStarted.then(() => true),
+                  rawTask.then(() => false),
+                ]);
+                if (!rawDispatched) {
+                  rawOutcome = await rawTask;
+                  throw new Error("v1J raw diagnostic completed without reaching dispatch");
+                }
                 assertV1JAdapterDifferentialRequestBudget({
-                  rawRequests: rawResult.requestDispatchStarted ? 1 : 0,
+                  rawRequests: 1,
                   adapterRequests: 0,
                 });
               },
@@ -2098,15 +2108,27 @@ describeV1JAdapterDifferential("v1J raw-transport versus adapter differential", 
                   adapterPreparedRuntimeReadyAtMs = Date.now();
                 }
               },
-              onProviderDispatchAttempt: (count) => {
-                adapterDispatches = count;
+              onProviderDispatchAttempt: (count, requestIndex) => {
+                // The nested raw fork is provider request 2; keep it out of the adapter dispatch cap.
+                if (requestIndex === 2) {
+                  journal.record("raw-request-dispatch-observed", {
+                    requestIndex,
+                    dispatchOrdinal: count,
+                    outcome: "raw-control-c",
+                  });
+                  return;
+                }
+                if (requestIndex === 0) {
+                  return;
+                }
+                adapterDispatches += 1;
                 assertV1JAdapterDifferentialRequestBudget({
-                  rawRequests: rawResult?.requestDispatchStarted ? 1 : 0,
-                  adapterRequests: count,
+                  rawRequests: rawTask ? 1 : 0,
+                  adapterRequests: adapterDispatches,
                 });
                 const dispatchStartedAt = Date.now();
                 journal.record("adapter-request-dispatch-start", {
-                  dispatchOrdinal: count,
+                  dispatchOrdinal: adapterDispatches,
                   dispatchStartedAt: new Date(dispatchStartedAt).toISOString(),
                   timeSincePreparedRuntimeReadyMs:
                     adapterPreparedRuntimeReadyAtMs === undefined
@@ -2120,15 +2142,34 @@ describeV1JAdapterDifferential("v1J raw-transport versus adapter differential", 
                   requestTimeoutMs: 120_000,
                 });
                 journal.record("adapter-dispatch-attempt", {
-                  requestIndex: count,
+                  requestIndex,
                   outcome:
-                    count <= V1J_ADAPTER_DIFFERENTIAL_MAX_ADAPTER_REQUESTS
+                    adapterDispatches <= V1J_ADAPTER_DIFFERENTIAL_MAX_ADAPTER_REQUESTS
                       ? "within-bound"
                       : "hard-stop",
                 });
               },
             }),
         });
+        if (rawTask) {
+          rawOutcome ??= await rawTask;
+          journal.record("raw-transport-complete", {
+            httpStatus: rawOutcome.result?.httpStatus ?? null,
+            responseFirstByteMs: rawOutcome.result?.responseFirstByteMs ?? null,
+            responseChunkCount: rawOutcome.result?.responseChunkCount ?? 0,
+            responseByteCount: rawOutcome.result?.responseByteCount ?? 0,
+            elapsedMs: rawOutcome.result?.elapsedMs ?? 0,
+            requestDispatchStarted: rawOutcome.dispatchStarted,
+            requestDispatchCompleted: rawOutcome.result?.requestDispatchCompleted ?? false,
+            outcome: rawOutcome.result?.timedOut
+              ? "timed-out"
+              : rawOutcome.result?.streamEnd
+                ? "complete"
+                : "incomplete",
+            errorClass: rawOutcome.result?.errorName ?? rawOutcome.helperErrorName ?? undefined,
+            errorCode: rawOutcome.result?.streamError ?? rawOutcome.helperErrorCode ?? undefined,
+          });
+        }
         if (!adapterRequestMatch?.canonicalMatch) {
           throw new Error("v1J initial adapter request did not prove parity with raw Control C");
         }
@@ -2136,44 +2177,59 @@ describeV1JAdapterDifferential("v1J raw-transport versus adapter differential", 
           throw new Error("v1J adapter differential blocked an unapproved tool selection");
         }
         assertV1JAdapterDifferentialRequestBudget({
-          rawRequests: rawResult.requestDispatchStarted ? 1 : 0,
+          rawRequests: rawOutcome?.dispatchStarted ? 1 : 0,
           adapterRequests: adapterDispatches,
         });
-        journal.record("differential-complete", {
-          requestIndex: 1,
-          outcome: observation.valid ? "valid-terminal" : "invalid-terminal",
-          adapterRequestSha256: adapterRequestMatch?.adapterRequestSha256,
-          modelLoopStatus: observation.invalidReason ?? "completed",
-          toolCallCount: observation.toolCalls.length,
-          executionCount: observation.executions.length,
-          allowedReadDispatches: adapterToolGuard.readDispatches(),
-          blockedToolCalls: adapterToolGuard.blockedToolCalls(),
-          correlationStatus: observation.correlationStatus,
-          terminalEvidenceComplete: observation.terminalEvidenceComplete,
+        recordV1JAdapterDifferentialOutcomes({
+          journal,
+          raw: rawOutcome ?? null,
+          adapter: {
+            dispatchCount: adapterDispatches,
+            modelLoopStatus: observation.invalidReason ?? "completed",
+            providerResponseObserved: observation.providerResponseObserved,
+            terminalEvidenceComplete: observation.terminalEvidenceComplete,
+            correlationStatus: observation.correlationStatus,
+            toolCallCount: observation.toolCalls.length,
+            executionCount: observation.executions.length,
+            allowedReadDispatches: adapterToolGuard.readDispatches(),
+            blockedToolCalls: adapterToolGuard.blockedToolCalls(),
+          },
         });
       } catch (error) {
+        if (rawTask && !rawOutcome) {
+          try {
+            rawOutcome = await rawTask;
+          } catch {
+            // The raw branch records its own structured result before settling.
+          }
+        }
         journal.record("differential-failed", {
           outcome: "failed",
           errorClass: error instanceof Error ? error.name : "NonErrorThrown",
           errorCode:
             error && typeof error === "object" && "code" in error
-              ? String((error as { code?: unknown }).code ?? "")
+              ? typeof (error as { code?: unknown }).code === "string" ||
+                typeof (error as { code?: unknown }).code === "number"
+                ? String((error as { code: string | number }).code)
+                : undefined
               : undefined,
           timeoutState:
             error instanceof Error && error.name === "TimeoutError" ? "timed-out" : "no-timeout",
         });
         throw error;
       } finally {
-        adapterToolGuard?.restore();
-        try {
-          fs.rmSync(workspaceDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
-        } catch (error) {
-          journal.record("workspace-cleanup-failed", {
-            outcome: "failed",
-            errorClass: error instanceof Error ? error.name : "NonErrorThrown",
-          });
-        }
-        journal.close();
+        finalizeV1JAdapterDifferentialDiagnostic({
+          journal,
+          cleanup: () => {
+            adapterToolGuard?.restore();
+            fs.rmSync(workspaceDir, {
+              recursive: true,
+              force: true,
+              maxRetries: 3,
+              retryDelay: 50,
+            });
+          },
+        });
       }
       assertV1JFormalStateEmpty(repoRoot);
       if (fs.existsSync(resolveV1JSmokeRoot(repoRoot, head))) {
@@ -2181,7 +2237,7 @@ describeV1JAdapterDifferential("v1J raw-transport versus adapter differential", 
       }
       process.stdout.write(
         `${JSON.stringify({
-          rawTransport: rawResult,
+          rawTransport: rawOutcome ?? null,
           adapterDispatches,
           maxAdapterDispatches: V1J_ADAPTER_DIFFERENTIAL_MAX_ADAPTER_REQUESTS,
           maxTotalModelRequests: V1J_ADAPTER_DIFFERENTIAL_MAX_TOTAL_REQUESTS,
@@ -5679,7 +5735,7 @@ async function runOne(input: {
     onResponseSummary?: (summary: ProviderResponseSummary) => void;
     onAssistantMessage?: (message: AssistantMessage, modelTurnIndex: number) => void;
     liveness?: V1JCaptureLiveness;
-    onProviderDispatchAttempt?: (count: number) => void;
+    onProviderDispatchAttempt?: (count: number, requestIndex: number) => void;
     lifecycleJournal?: V1JLifecycleJournal;
     requestCorrelationId?: string;
   };
@@ -7782,7 +7838,7 @@ function captureModelPayloads(
     schemaCaptureName?: V1JSchemaCaptureName;
     preflightDiagnostics?: V1JPreflightDiagnosticJournal;
     liveness?: V1JCaptureLiveness;
-    onProviderDispatchAttempt?: (count: number) => void;
+    onProviderDispatchAttempt?: (count: number, requestIndex: number) => void;
     onRequestCaptured?: (request: CapturedModelRequest) => void;
     onProviderRequestBeforeDispatch?: (input: {
       request: CapturedModelRequest;
@@ -7867,7 +7923,7 @@ function captureModelPayloads(
         });
         if (options?.schemaCaptureName) {
           providerDispatchAttempts += 1;
-          options.onProviderDispatchAttempt?.(providerDispatchAttempts);
+          options.onProviderDispatchAttempt?.(providerDispatchAttempts, requestIndex);
           options?.preflightDiagnostics?.increment(
             "providerDispatchAttempts",
             preflightEvent("dispatch-counter-increment"),
@@ -7915,7 +7971,7 @@ function captureModelPayloads(
       options?.onDelegatedRequest?.();
       delegatedRequests += 1;
       providerDispatchAttempts += 1;
-      options?.onProviderDispatchAttempt?.(providerDispatchAttempts);
+      options?.onProviderDispatchAttempt?.(providerDispatchAttempts, requestIndex);
       if (isProviderRequest && !wrappedFetches.has(baseFetch)) {
         options?.preflightDiagnostics?.increment(
           "providerDispatchAttempts",

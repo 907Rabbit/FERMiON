@@ -32,6 +32,14 @@ export type V1JAdapterDifferentialJournal = {
   close: () => void;
 };
 
+export type V1JAdapterDifferentialRawTransportOutcome = {
+  result: V1JProviderControlResult | null;
+  dispatchStarted: boolean;
+  helperErrorName: string | null;
+  helperErrorCode: string | null;
+  helperErrorMessage: string | null;
+};
+
 export type V1JAdapterDifferentialRequestMetrics = {
   requestJsonBytes: number;
   messageCount: number;
@@ -507,6 +515,12 @@ const SAFE_DETAIL_KEYS = new Set([
   "optionValueNumber",
   "optionValueBoolean",
   "dispatchOrdinal",
+  "adapterDispatches",
+  "rawRequestDispatchStarted",
+  "rawRequestDispatchCompleted",
+  "rawHttpStatus",
+  "rawTimedOut",
+  "rawErrorName",
   "dispatchStartedAt",
   "timeSincePreparedRuntimeReadyMs",
   "timeSinceSchemaPreflightCompleteMs",
@@ -519,7 +533,14 @@ const SAFE_DETAIL_KEYS = new Set([
   "dispatched",
   "errorClass",
   "errorCode",
+  "errorMessage",
+  "errorName",
   "timeoutState",
+  "requestDispatchStarted",
+  "requestDispatchCompleted",
+  "streamEnd",
+  "streamCancel",
+  "timedOut",
 ]);
 
 export function assertV1JAdapterDifferentialPreflight(input: {
@@ -563,7 +584,7 @@ export function assertV1JAdapterDifferentialPreflight(input: {
   if (!/^[0-9a-f]{40}$/.test(input.head) || !input.trackedTreeClean) {
     throw new Error("v1J adapter differential requires the clean committed harness HEAD");
   }
-  if (input.activeFilteringEnabled !== false) {
+  if (input.activeFilteringEnabled) {
     throw new Error("v1J adapter differential requires active filtering to remain disabled");
   }
   if (
@@ -725,7 +746,8 @@ export async function runV1JAdapterDifferentialRawTransport(input: {
   dispatchContext?: V1JAdapterDifferentialDispatchContext;
   timeoutMs?: number;
   heartbeatMs?: number;
-}): Promise<V1JProviderControlResult> {
+  onDispatchStarted?: () => void;
+}): Promise<V1JAdapterDifferentialRawTransportOutcome> {
   let parsedRequestBody: unknown;
   try {
     parsedRequestBody = JSON.parse(input.serializedRequestBody);
@@ -753,79 +775,227 @@ export async function runV1JAdapterDifferentialRawTransport(input: {
     dispatched: false,
   });
   let dispatches = 0;
-  const results = await runV1JProviderTransportControls({
-    endpoint: input.endpoint,
-    model: typeof input.requestBody.model === "string" ? input.requestBody.model : "",
-    authorization: input.authorization,
-    requests: [
-      {
-        mode: "C",
-        requestObject: input.requestBody,
-        serializedRequestBody: input.serializedRequestBody,
-      },
-    ],
-    fetchImpl: (request, init) => {
-      dispatches += 1;
-      if (dispatches > V1J_ADAPTER_DIFFERENTIAL_MAX_RAW_REQUESTS) {
-        throw new Error("v1J adapter differential raw transport exceeded its one-request limit");
-      }
-      const dispatchStartedAt = Date.now();
-      input.journal.record("raw-request-dispatch-start", {
-        dispatchOrdinal: dispatches,
-        dispatchStartedAt: new Date(dispatchStartedAt).toISOString(),
-        timeSincePreparedRuntimeReadyMs:
-          input.dispatchContext?.preparedRuntimeReadyAtMs === undefined
-            ? undefined
-            : Math.max(0, dispatchStartedAt - input.dispatchContext.preparedRuntimeReadyAtMs),
-        timeSinceSchemaPreflightCompleteMs: Math.max(
-          0,
-          dispatchStartedAt -
-            (input.dispatchContext?.schemaPreflightCompletedAtMs ?? dispatchStartedAt),
-        ),
-        modelDiscoveryStatus: input.dispatchContext?.modelDiscoveryStatus ?? "unrecorded",
-        requestTimeoutMs: input.dispatchContext?.requestTimeoutMs ?? input.timeoutMs ?? 120_000,
-      });
-      const requestBody = init?.body;
-      const rawBody = typeof requestBody === "string" ? requestBody : undefined;
-      if (rawBody !== undefined) {
-        input.journal.record("raw-request-wire-fingerprint", {
+  let result: V1JProviderControlResult | null = null;
+  let helperError: unknown;
+  try {
+    const results = await runV1JProviderTransportControls({
+      endpoint: input.endpoint,
+      model: typeof input.requestBody.model === "string" ? input.requestBody.model : "",
+      authorization: input.authorization,
+      requests: [
+        {
+          mode: "C",
+          requestObject: input.requestBody,
+          serializedRequestBody: input.serializedRequestBody,
+        },
+      ],
+      fetchImpl: (request, init) => {
+        dispatches += 1;
+        if (dispatches > V1J_ADAPTER_DIFFERENTIAL_MAX_RAW_REQUESTS) {
+          throw new Error("v1J adapter differential raw transport exceeded its one-request limit");
+        }
+        const dispatchStartedAt = Date.now();
+        input.journal.record("raw-request-dispatch-start", {
           dispatchOrdinal: dispatches,
-          requestSha256: createHash("sha256").update(rawBody, "utf8").digest("hex"),
-          requestJsonBytes: Buffer.byteLength(rawBody, "utf8"),
+          dispatchStartedAt: new Date(dispatchStartedAt).toISOString(),
+          timeSincePreparedRuntimeReadyMs:
+            input.dispatchContext?.preparedRuntimeReadyAtMs === undefined
+              ? undefined
+              : Math.max(0, dispatchStartedAt - input.dispatchContext.preparedRuntimeReadyAtMs),
+          timeSinceSchemaPreflightCompleteMs: Math.max(
+            0,
+            dispatchStartedAt -
+              (input.dispatchContext?.schemaPreflightCompletedAtMs ?? dispatchStartedAt),
+          ),
+          modelDiscoveryStatus: input.dispatchContext?.modelDiscoveryStatus ?? "unrecorded",
+          requestTimeoutMs: input.dispatchContext?.requestTimeoutMs ?? input.timeoutMs ?? 120_000,
         });
-      }
-      return input.fetchImpl(request, init);
-    },
-    timeoutMs: input.timeoutMs,
-    heartbeatMs: input.heartbeatMs,
-    record: (event) => {
-      const result = event.result;
-      input.journal.record(`raw-${event.event}`, {
-        requestIndex: 1,
-        ...(result
-          ? {
-              httpStatus: result.httpStatus,
-              contentType: result.contentType,
-              responseFirstByteMs: result.responseFirstByteMs,
-              responseChunkCount: result.responseChunkCount,
-              responseByteCount: result.responseByteCount,
-              outcome: result.errorName ? "error" : result.streamEnd ? "complete" : "pending",
-              elapsedMs: result.elapsedMs,
-              errorClass: result.errorName ?? undefined,
-              errorCode: result.streamError ?? undefined,
-            }
-          : {
-              elapsedMs: event.elapsedMs,
-              responseChunkCount: event.chunkCount,
-              responseByteCount: event.byteCount,
-            }),
-      });
-    },
-  });
-  if (dispatches !== 1 || results.length !== 1) {
-    throw new Error("v1J adapter differential raw transport did not complete exactly one request");
+        const requestBody = init?.body;
+        const rawBody = typeof requestBody === "string" ? requestBody : undefined;
+        if (rawBody !== undefined) {
+          input.journal.record("raw-request-wire-fingerprint", {
+            dispatchOrdinal: dispatches,
+            requestSha256: createHash("sha256").update(rawBody, "utf8").digest("hex"),
+            requestJsonBytes: Buffer.byteLength(rawBody, "utf8"),
+          });
+        }
+        input.onDispatchStarted?.();
+        return input.fetchImpl(request, init);
+      },
+      timeoutMs: input.timeoutMs,
+      heartbeatMs: input.heartbeatMs,
+      record: (event) => {
+        if (event.result) {
+          // Keep the finalized control result even if abort cleanup makes the helper reject later.
+          result = event.result;
+        }
+        input.journal.record(`raw-${event.event}`, {
+          requestIndex: 1,
+          ...(event.result
+            ? {
+                httpStatus: event.result.httpStatus,
+                contentType: event.result.contentType ?? undefined,
+                responseFirstByteMs: event.result.responseFirstByteMs,
+                responseChunkCount: event.result.responseChunkCount,
+                responseByteCount: event.result.responseByteCount,
+                outcome: event.result.errorName
+                  ? "error"
+                  : event.result.streamEnd
+                    ? "complete"
+                    : "pending",
+                elapsedMs: event.result.elapsedMs,
+                errorClass: event.result.errorName ?? undefined,
+                errorCode: event.result.streamError ?? undefined,
+                requestDispatchStarted: event.result.requestDispatchStarted,
+                requestDispatchCompleted: event.result.requestDispatchCompleted,
+                streamEnd: event.result.streamEnd,
+                streamCancel: event.result.streamCancel,
+                timedOut: event.result.timedOut,
+                providerResponseObserved: event.result.providerResponseObserved,
+              }
+            : {
+                elapsedMs: event.elapsedMs,
+                responseChunkCount: event.chunkCount,
+                responseByteCount: event.byteCount,
+              }),
+        });
+      },
+    });
+    result = results[0] ?? result;
+  } catch (error) {
+    helperError = error;
   }
-  return results[0]!;
+  const normalizedError = helperError === undefined ? undefined : safeDiagnosticError(helperError);
+  const outcome: V1JAdapterDifferentialRawTransportOutcome = {
+    result,
+    dispatchStarted: dispatches === 1,
+    helperErrorName: normalizedError?.errorName ?? null,
+    helperErrorCode: normalizedError?.errorCode ?? null,
+    helperErrorMessage: normalizedError?.errorMessage ?? null,
+  };
+  input.journal.record("raw-transport-finalized", {
+    outcome: result
+      ? result.timedOut
+        ? "timed-out"
+        : result.streamEnd
+          ? "complete"
+          : "incomplete"
+      : "no-result",
+    requestDispatchStarted: result?.requestDispatchStarted ?? outcome.dispatchStarted,
+    requestDispatchCompleted: result?.requestDispatchCompleted ?? false,
+    httpStatus: result?.httpStatus ?? null,
+    contentType: result?.contentType ?? undefined,
+    responseFirstByteMs: result?.responseFirstByteMs ?? null,
+    responseChunkCount: result?.responseChunkCount ?? 0,
+    responseByteCount: result?.responseByteCount ?? 0,
+    streamEnd: result?.streamEnd ?? false,
+    streamCancel: result?.streamCancel ?? false,
+    timedOut: result?.timedOut ?? false,
+    providerResponseObserved: result?.providerResponseObserved ?? false,
+    errorName: result?.errorName ?? outcome.helperErrorName ?? undefined,
+    errorCode: result?.streamError ?? outcome.helperErrorCode ?? undefined,
+    elapsedMs: result?.elapsedMs ?? 0,
+  });
+  if (dispatches > 1) {
+    throw new Error("v1J adapter differential raw transport exceeded its one-request limit");
+  }
+  return outcome;
+}
+
+export function finalizeV1JAdapterDifferentialDiagnostic(input: {
+  journal: V1JAdapterDifferentialJournal;
+  cleanup: () => void;
+}): { cleanupError: ReturnType<typeof safeDiagnosticError> | null } {
+  input.journal.record("diagnostic-finalized", { outcome: "finalized" });
+  input.journal.record("workspace-cleanup-start", { outcome: "started" });
+  let cleanupError: ReturnType<typeof safeDiagnosticError> | null = null;
+  try {
+    input.cleanup();
+    input.journal.record("workspace-cleanup-complete", { outcome: "complete" });
+  } catch (error) {
+    cleanupError = safeDiagnosticError(error);
+    input.journal.record("workspace-cleanup-failed", {
+      outcome: "failed",
+      errorClass: cleanupError.errorName,
+      errorCode: cleanupError.errorCode,
+      errorMessage: cleanupError.errorMessage,
+    });
+  } finally {
+    input.journal.close();
+  }
+  return { cleanupError };
+}
+
+export function recordV1JAdapterDifferentialOutcomes(input: {
+  journal: V1JAdapterDifferentialJournal;
+  raw: V1JAdapterDifferentialRawTransportOutcome | null;
+  adapter: {
+    dispatchCount: number;
+    modelLoopStatus: string;
+    providerResponseObserved: boolean;
+    terminalEvidenceComplete: boolean;
+    correlationStatus: string;
+    toolCallCount: number;
+    executionCount: number;
+    allowedReadDispatches: number;
+    blockedToolCalls: number;
+  };
+}): void {
+  input.journal.record("adapter-model-loop-finalized", {
+    outcome: input.adapter.terminalEvidenceComplete ? "terminal-complete" : "terminal-incomplete",
+    dispatchOrdinal: input.adapter.dispatchCount,
+    modelLoopStatus: input.adapter.modelLoopStatus,
+    providerResponseObserved: input.adapter.providerResponseObserved,
+    terminalEvidenceComplete: input.adapter.terminalEvidenceComplete,
+    correlationStatus: input.adapter.correlationStatus,
+    toolCallCount: input.adapter.toolCallCount,
+    executionCount: input.adapter.executionCount,
+    allowedReadDispatches: input.adapter.allowedReadDispatches,
+    blockedToolCalls: input.adapter.blockedToolCalls,
+  });
+  input.journal.record("differential-complete", {
+    requestIndex: 1,
+    outcome: input.adapter.terminalEvidenceComplete ? "valid-terminal" : "invalid-terminal",
+    adapterDispatches: input.adapter.dispatchCount,
+    rawRequestDispatchStarted: input.raw?.dispatchStarted ?? false,
+    rawRequestDispatchCompleted: input.raw?.result?.requestDispatchCompleted ?? false,
+    rawHttpStatus: input.raw?.result?.httpStatus ?? null,
+    rawTimedOut: input.raw?.result?.timedOut ?? false,
+    rawErrorName: input.raw?.result?.errorName ?? input.raw?.helperErrorName ?? undefined,
+    modelLoopStatus: input.adapter.modelLoopStatus,
+    toolCallCount: input.adapter.toolCallCount,
+    executionCount: input.adapter.executionCount,
+    allowedReadDispatches: input.adapter.allowedReadDispatches,
+    blockedToolCalls: input.adapter.blockedToolCalls,
+    correlationStatus: input.adapter.correlationStatus,
+    terminalEvidenceComplete: input.adapter.terminalEvidenceComplete,
+  });
+}
+
+function safeDiagnosticError(error: unknown): {
+  errorName: string;
+  errorCode: string | null;
+  errorMessage: string;
+} {
+  const errorName = error instanceof Error ? error.name : "NonErrorThrown";
+  const errorCode =
+    error &&
+    typeof error === "object" &&
+    "code" in error &&
+    (typeof (error as { code?: unknown }).code === "string" ||
+      typeof (error as { code?: unknown }).code === "number")
+      ? String((error as { code: string | number }).code).slice(0, 64)
+      : null;
+  const message = error instanceof Error ? error.message : String(error);
+  return {
+    errorName: /^[A-Za-z0-9_.-]{1,64}$/.test(errorName) ? errorName : "Error",
+    errorCode,
+    errorMessage: message
+      .replace(/[\r\n\t]/g, " ")
+      .replace(/(bearer\s+)[^\s,;]+/gi, "$1[redacted]")
+      .replace(/((?:api[_-]?key|token|password|secret)\s*[:=]\s*)[^\s,;]+/gi, "$1[redacted]")
+      .slice(0, 400),
+  };
 }
 
 export function createV1JAdapterDifferentialJournal(input: {
@@ -888,7 +1058,9 @@ export function createV1JAdapterDifferentialJournal(input: {
     }
     const safe = Object.fromEntries(
       Object.entries(details).filter(
-        ([key, value]) => SAFE_DETAIL_KEYS.has(key) && isSafeValue(value),
+        ([key, value]) =>
+          SAFE_DETAIL_KEYS.has(key) &&
+          (key === "errorMessage" ? isSafeDiagnosticMessage(value) : isSafeValue(value)),
       ),
     );
     const row = {
@@ -943,6 +1115,16 @@ function isSafeValue(value: unknown): value is string | number | boolean | null 
     return /^[0-9a-f]{64}$/i.test(value);
   }
   return /^[a-z0-9_.:/ -]*$/i.test(value);
+}
+
+function isSafeDiagnosticMessage(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length <= 400 &&
+    !value.includes("\r") &&
+    !value.includes("\n") &&
+    !value.includes("\0")
+  );
 }
 
 function writeExclusive(filePath: string, contents: string): void {

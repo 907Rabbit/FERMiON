@@ -12,8 +12,10 @@ import {
   assertV1JAdapterDifferentialPreflight,
   compareV1JAdapterDifferentialRequests,
   createV1JAdapterDifferentialJournal,
+  finalizeV1JAdapterDifferentialDiagnostic,
   fingerprintV1JAdapterDifferentialField,
   installV1JAdapterDifferentialToolGuard,
+  recordV1JAdapterDifferentialOutcomes,
   reportV1JAdapterDifferentialProgress,
   runV1JAdapterDifferentialRawTransport,
   recordV1JAdapterDifferentialRequestFingerprint,
@@ -488,7 +490,8 @@ describe("v1J adapter differential diagnostics", () => {
       });
       expect(calls).toBe(1);
       expect(JSON.parse(serializedRequestBody)).toEqual(requestBody);
-      expect(result).toMatchObject({
+      expect(result.dispatchStarted).toBe(true);
+      expect(result.result).toMatchObject({
         mode: "C",
         stream: true,
         toolCount: 15,
@@ -535,6 +538,244 @@ describe("v1J adapter differential diagnostics", () => {
       expect(fingerprintEvents).not.toContain("followup-secret");
     } finally {
       journal.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("returns and journals a structured timeout after response headers", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "v1j-adapter-diff-timeout-headers-"));
+    const journal = createV1JAdapterDifferentialJournal({
+      repoRoot: root,
+      harnessCommit: head,
+      modelId: "qwen/qwen3.5-9b",
+      modelConfigHash: "2a219399da63b03057ceaf46a9dd1d74e76be20ead626f07af2b8ba45f37c529",
+      schemaFingerprint: schema,
+      startedAt: new Date().toISOString(),
+    });
+    try {
+      const outcome = await runV1JAdapterDifferentialRawTransport({
+        endpoint: "http://127.0.0.1:1234/v1/chat/completions",
+        authorization: "Bearer test-only",
+        requestBody,
+        serializedRequestBody: JSON.stringify(requestBody),
+        journal,
+        timeoutMs: 20,
+        heartbeatMs: 1_000,
+        fetchImpl: async (_request, init) =>
+          new Response(
+            new ReadableStream<Uint8Array>({
+              start(controller) {
+                init?.signal?.addEventListener(
+                  "abort",
+                  () => controller.error(new DOMException("aborted", "AbortError")),
+                  { once: true },
+                );
+              },
+            }),
+            { status: 200, headers: { "content-type": "text/event-stream" } },
+          ),
+      });
+
+      expect(outcome).toMatchObject({ dispatchStarted: true, helperErrorName: null });
+      expect(outcome.result).toMatchObject({
+        requestDispatchStarted: true,
+        requestDispatchCompleted: true,
+        httpStatus: 200,
+        responseFirstByteMs: null,
+        responseChunkCount: 0,
+        responseByteCount: 0,
+        timedOut: true,
+        streamEnd: false,
+      });
+      const journalEvents = fs.readFileSync(journal.filePath, "utf8");
+      expect(journalEvents).toContain('"event":"raw-http-response-headers"');
+      expect(journalEvents).toContain('"event":"raw-transport-finalized"');
+      expect(journalEvents).toContain('"httpStatus":200');
+      expect(journalEvents).toContain('"timedOut":true');
+      finalizeV1JAdapterDifferentialDiagnostic({ journal, cleanup: () => {} });
+      expect(fs.readFileSync(journal.filePath, "utf8")).toContain('"event":"diagnostic-finalized"');
+    } finally {
+      journal.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("returns a structured abort before headers without dereferencing a missing result", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "v1j-adapter-diff-abort-headers-"));
+    const journal = createV1JAdapterDifferentialJournal({
+      repoRoot: root,
+      harnessCommit: head,
+      modelId: "qwen/qwen3.5-9b",
+      modelConfigHash: "2a219399da63b03057ceaf46a9dd1d74e76be20ead626f07af2b8ba45f37c529",
+      schemaFingerprint: schema,
+      startedAt: new Date().toISOString(),
+    });
+    try {
+      const outcome = await runV1JAdapterDifferentialRawTransport({
+        endpoint: "http://127.0.0.1:1234/v1/chat/completions",
+        authorization: "Bearer test-only",
+        requestBody,
+        serializedRequestBody: JSON.stringify(requestBody),
+        journal,
+        timeoutMs: 20,
+        heartbeatMs: 1_000,
+        fetchImpl: (_request, init) =>
+          new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener(
+              "abort",
+              () => reject(new DOMException("aborted", "AbortError")),
+              { once: true },
+            );
+          }),
+      });
+
+      expect(outcome.dispatchStarted).toBe(true);
+      expect(outcome.result).toMatchObject({
+        requestDispatchStarted: true,
+        requestDispatchCompleted: false,
+        httpStatus: null,
+        providerResponseObserved: false,
+        timedOut: true,
+        errorName: "TimeoutError",
+      });
+      expect(fs.readFileSync(journal.filePath, "utf8")).toContain(
+        '"event":"raw-transport-finalized"',
+      );
+    } finally {
+      journal.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("journals an adapter timeout even when no raw result exists", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "v1j-adapter-diff-adapter-timeout-"));
+    const journal = createV1JAdapterDifferentialJournal({
+      repoRoot: root,
+      harnessCommit: head,
+      modelId: "qwen/qwen3.5-9b",
+      modelConfigHash: "2a219399da63b03057ceaf46a9dd1d74e76be20ead626f07af2b8ba45f37c529",
+      schemaFingerprint: schema,
+      startedAt: new Date().toISOString(),
+    });
+    try {
+      expect(() =>
+        recordV1JAdapterDifferentialOutcomes({
+          journal,
+          raw: null,
+          adapter: {
+            dispatchCount: 1,
+            modelLoopStatus: "timeout",
+            providerResponseObserved: true,
+            terminalEvidenceComplete: false,
+            correlationStatus: "UNPROVABLE",
+            toolCallCount: 0,
+            executionCount: 0,
+            allowedReadDispatches: 0,
+            blockedToolCalls: 0,
+          },
+        }),
+      ).not.toThrow();
+      const events = fs.readFileSync(journal.filePath, "utf8");
+      expect(events).toContain('"event":"adapter-model-loop-finalized"');
+      expect(events).toContain('"modelLoopStatus":"timeout"');
+      expect(events).toContain('"rawRequestDispatchStarted":false');
+      expect(events).toContain('"event":"differential-complete"');
+    } finally {
+      journal.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("journals independent raw and adapter timeouts without losing either outcome", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "v1j-adapter-diff-both-timeout-"));
+    const journal = createV1JAdapterDifferentialJournal({
+      repoRoot: root,
+      harnessCommit: head,
+      modelId: "qwen/qwen3.5-9b",
+      modelConfigHash: "2a219399da63b03057ceaf46a9dd1d74e76be20ead626f07af2b8ba45f37c529",
+      schemaFingerprint: schema,
+      startedAt: new Date().toISOString(),
+    });
+    try {
+      const raw = await runV1JAdapterDifferentialRawTransport({
+        endpoint: "http://127.0.0.1:1234/v1/chat/completions",
+        authorization: "Bearer test-only",
+        requestBody,
+        serializedRequestBody: JSON.stringify(requestBody),
+        journal,
+        timeoutMs: 20,
+        heartbeatMs: 1_000,
+        fetchImpl: async (_request, init) =>
+          new Response(
+            new ReadableStream<Uint8Array>({
+              start(controller) {
+                init?.signal?.addEventListener(
+                  "abort",
+                  () => controller.error(new DOMException("aborted", "AbortError")),
+                  { once: true },
+                );
+              },
+            }),
+            { status: 200, headers: { "content-type": "text/event-stream" } },
+          ),
+      });
+      recordV1JAdapterDifferentialOutcomes({
+        journal,
+        raw,
+        adapter: {
+          dispatchCount: 1,
+          modelLoopStatus: "timeout",
+          providerResponseObserved: true,
+          terminalEvidenceComplete: false,
+          correlationStatus: "UNPROVABLE",
+          toolCallCount: 0,
+          executionCount: 0,
+          allowedReadDispatches: 0,
+          blockedToolCalls: 0,
+        },
+      });
+      const events = fs.readFileSync(journal.filePath, "utf8");
+      expect(raw.result?.timedOut).toBe(true);
+      expect(events).toContain('"event":"raw-transport-finalized"');
+      expect(events).toContain('"rawTimedOut":true');
+      expect(events).toContain('"event":"adapter-model-loop-finalized"');
+      expect(events).toContain('"modelLoopStatus":"timeout"');
+    } finally {
+      journal.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("records finalization before cleanup failure with its actual error details", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "v1j-adapter-diff-cleanup-error-"));
+    const journal = createV1JAdapterDifferentialJournal({
+      repoRoot: root,
+      harnessCommit: head,
+      modelId: "qwen/qwen3.5-9b",
+      modelConfigHash: "2a219399da63b03057ceaf46a9dd1d74e76be20ead626f07af2b8ba45f37c529",
+      schemaFingerprint: schema,
+      startedAt: new Date().toISOString(),
+    });
+    try {
+      const finalized = finalizeV1JAdapterDifferentialDiagnostic({
+        journal,
+        cleanup: () => {
+          throw Object.assign(new Error("EPERM removing diagnostic workspace"), { code: "EPERM" });
+        },
+      });
+      expect(finalized.cleanupError).toMatchObject({
+        errorName: "Error",
+        errorCode: "EPERM",
+        errorMessage: "EPERM removing diagnostic workspace",
+      });
+      const events = fs.readFileSync(journal.filePath, "utf8");
+      expect(events.indexOf('"event":"diagnostic-finalized"')).toBeLessThan(
+        events.indexOf('"event":"workspace-cleanup-failed"'),
+      );
+      expect(events).toContain('"errorCode":"EPERM"');
+      expect(events).toContain('"errorMessage":"EPERM removing diagnostic workspace"');
+      expect(() => journal.record("closed-journal-write")).toThrow(/journal is closed/);
+    } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
   });

@@ -27,6 +27,7 @@ import {
   installModelPromptTransform,
   installRuntimeContextMessageForPrompt,
 } from "./attempt-llm-boundary.js";
+import { fingerprintPromptText } from "./attempt-prompt-materialization-trace.js";
 import {
   isSessionsYieldAbortError,
   persistSessionsYieldContextMessage,
@@ -101,6 +102,7 @@ export async function submitEmbeddedAttemptPrompt(input: {
     stage: "prompt-submit-enter",
     messages: activeSession.messages,
     source: "submitEmbeddedAttemptPrompt.activeSession.messages",
+    systemPromptFingerprint: fingerprintPromptText(input.systemPrompt),
     conversationHistorySource: "AgentSession transcript",
     promptAssemblySource: "submitEmbeddedAttemptPrompt",
   });
@@ -112,6 +114,7 @@ export async function submitEmbeddedAttemptPrompt(input: {
     stage: "prompt-history-normalized",
     messages: normalizedReplayMessages,
     source: "normalizeAssistantReplayContent",
+    systemPromptFingerprint: fingerprintPromptText(input.systemPrompt),
     conversationHistorySource: "AgentSession transcript",
     promptAssemblySource: "submitEmbeddedAttemptPrompt",
   });
@@ -179,6 +182,7 @@ export async function submitEmbeddedAttemptPrompt(input: {
         stage: "model-prompt-transform-enter",
         messages,
         source: "AgentSession.agent.transformContext input",
+        systemPromptFingerprint: fingerprintPromptText(input.systemPrompt),
         promptAssemblySource: "installModelPromptTransform",
       });
       const transformed = await installedTransformContext.call(
@@ -190,6 +194,7 @@ export async function submitEmbeddedAttemptPrompt(input: {
         stage: "model-prompt-transform-complete",
         messages: transformed,
         source: "AgentSession.agent.transformContext output",
+        systemPromptFingerprint: fingerprintPromptText(input.systemPrompt),
         promptAssemblySource: "installModelPromptTransform",
       });
       return transformed;

@@ -56,6 +56,10 @@ import {
   resolvePromptCacheTouchTimestamp,
 } from "./attempt-context-engine-helpers.js";
 import {
+  traceProviderAdapterInput,
+  traceProviderPayloadStages,
+} from "./attempt-prompt-materialization-trace.js";
+import {
   resolveAttemptStreamAuthProfileId,
   resolveAttemptToolPolicyMessageProvider,
 } from "./attempt-run-decisions.js";
@@ -82,14 +86,6 @@ type ToolSearchTargetTranscriptProjections = Parameters<
   typeof projectToolSearchTargetTranscriptMessages
 >[1];
 type WithOwnedTranscriptWrite = <T>(operation: () => Promise<T> | T) => Promise<T>;
-
-function providerPayloadMessages(payload: unknown): readonly unknown[] {
-  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
-    return [];
-  }
-  const messages = (payload as Record<string, unknown>).messages;
-  return Array.isArray(messages) ? messages : [];
-}
 
 type StreamSettleResult = {
   promptError: unknown;
@@ -546,25 +542,36 @@ export async function prepareEmbeddedAttemptTransport(input: {
       !streamFn ||
       (!experiment?.onProviderRequest &&
         !experiment?.onProviderRequestBeforeDispatch &&
-        !experiment?.onProviderResponse)
+        !experiment?.onProviderResponse &&
+        !experiment?.onPromptMessageTrace)
     ) {
       return streamFn;
     }
     let providerRequestCallbackIndex = 0;
     return (model, context, options) => {
+      traceProviderAdapterInput(
+        experiment.onPromptMessageTrace,
+        context.messages,
+        context.systemPrompt,
+      );
       const existingOnPayload = options?.onPayload;
       const existingOnResponse = options?.onResponse;
       return streamFn(model, context, {
         ...options,
         onPayload: async (payload, payloadModel) => {
           const callbackIndex = ++providerRequestCallbackIndex;
-          experiment.onPromptMessageTrace?.({
-            stage: "provider-onPayload-transform-enter",
-            messages: providerPayloadMessages(payload),
-            source: "observeProviderRequest.onPayload input",
-            promptAssemblySource: "provider stream onPayload chain",
-            callbackIndex,
-          });
+          traceProviderPayloadStages(experiment.onPromptMessageTrace, payload, callbackIndex, [
+            {
+              stage: "provider-message-conversion-output",
+              source: "provider message conversion output",
+            },
+            { stage: "provider-request-object-constructed", source: "provider request object" },
+            {
+              stage: "provider-onPayload-transform-enter",
+              source: "observeProviderRequest.onPayload input",
+              promptAssemblySource: "provider stream onPayload chain",
+            },
+          ]);
           try {
             await experiment.onProviderRequest?.({ payload, model: payloadModel });
           } catch (error) {
@@ -574,22 +581,22 @@ export async function prepareEmbeddedAttemptTransport(input: {
             });
             throw error;
           }
-          experiment.onPromptMessageTrace?.({
-            stage: "provider-onPayload-transform-start",
-            messages: providerPayloadMessages(payload),
-            source: "observeProviderRequest before existing onPayload",
-            promptAssemblySource: "provider stream onPayload chain",
-            callbackIndex,
-          });
+          traceProviderPayloadStages(experiment.onPromptMessageTrace, payload, callbackIndex, [
+            {
+              stage: "provider-onPayload-transform-start",
+              source: "observeProviderRequest before existing onPayload",
+              promptAssemblySource: "provider stream onPayload chain",
+            },
+          ]);
           const replacement = await existingOnPayload?.(payload, payloadModel);
           const finalPayload = replacement ?? payload;
-          experiment.onPromptMessageTrace?.({
-            stage: "provider-onPayload-transform-complete",
-            messages: providerPayloadMessages(finalPayload),
-            source: "observeProviderRequest final onPayload output",
-            promptAssemblySource: "provider stream onPayload chain",
-            callbackIndex,
-          });
+          traceProviderPayloadStages(experiment.onPromptMessageTrace, finalPayload, callbackIndex, [
+            {
+              stage: "provider-onPayload-transform-complete",
+              source: "observeProviderRequest final onPayload output",
+              promptAssemblySource: "provider stream onPayload chain",
+            },
+          ]);
           // Capture-only diagnostics stop here: provider adapters invoke their
           // request after onPayload resolves, so this is the last no-network seam.
           try {

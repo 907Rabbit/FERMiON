@@ -164,6 +164,8 @@ export type EmbeddedCapabilityIntelligenceExperimentHooks = {
     stage: string;
     messages: readonly unknown[];
     source: string;
+    systemPromptFingerprint?: { sha256: string; utf8Bytes: number };
+    materializationFactors?: Record<string, string | number | boolean | null>;
     conversationHistorySource?: string;
     promptAssemblySource?: string;
     armInstructionInsertionStage?: string;

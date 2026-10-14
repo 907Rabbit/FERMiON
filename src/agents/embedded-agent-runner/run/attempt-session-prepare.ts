@@ -46,6 +46,10 @@ import {
   resolveOrphanRepairPlan,
 } from "./attempt-orphan-repair.js";
 import { buildAfterTurnRuntimeContext } from "./attempt-prompt-helpers.js";
+import {
+  countRuntimeContextCarriers,
+  fingerprintPromptText,
+} from "./attempt-prompt-materialization-trace.js";
 import { resolveExistingAttemptTranscriptState } from "./attempt-transcript-helpers.js";
 import type { EmbeddedAttemptTranscriptLifecycle } from "./attempt-transcript-lifecycle.js";
 import { createUserTranscriptContextRegistry } from "./attempt-user-transcript-context-registry.js";
@@ -252,6 +256,7 @@ export async function prepareEmbeddedAttemptAgentSession(input: {
 type SessionBoundaryAttempt = Pick<
   EmbeddedRunAttemptParams,
   | "config"
+  | "capabilityIntelligenceExperiment"
   | "onUserMessagePersistenceInvalidated"
   | "operation"
   | "prompt"
@@ -345,14 +350,57 @@ export function prepareEmbeddedAttemptSessionBoundary(input: {
 
   if (typeof activeSession.agent.convertToLlm === "function") {
     const baseConvertToLlm = activeSession.agent.convertToLlm.bind(activeSession.agent);
-    activeSession.agent.convertToLlm = async (messages) =>
-      await baseConvertToLlm(
-        // Wire-only relocation keeps the request append-only through the active
-        // user turn without changing position-sensitive precheck normalization.
-        relocateCurrentRuntimeContextCarrierToTail(
-          normalizeMessagesForLlmBoundary(messages, buildBoundaryOptions()),
-        ),
-      );
+    activeSession.agent.convertToLlm = async (messages) => {
+      const trace = attempt.capabilityIntelligenceExperiment?.onPromptMessageTrace;
+      const systemPromptFingerprint = fingerprintPromptText(activeSession.agent.state.systemPrompt);
+      const traceStage = (
+        stage: string,
+        observed: readonly unknown[],
+        source: string,
+        materializationFactors?: Record<string, string | number | boolean | null>,
+      ) =>
+        trace?.({
+          stage,
+          messages: observed,
+          source,
+          systemPromptFingerprint,
+          ...(materializationFactors ? { materializationFactors } : {}),
+        });
+      const boundaryOptions = buildBoundaryOptions();
+      const boundaryFactors = {
+        boundaryTimestampEnabled: includeBoundaryTimestamp,
+        boundaryTimezoneConfigured: Boolean(boundaryTimezone),
+        timestampPrefixPolicyEnabled: includeBoundaryTimestamp && Boolean(boundaryTimezone),
+        currentUserTimestampOverridePresent: Boolean(currentUserTimestampOverride),
+        userTranscriptContextCount: boundaryOptions.userTranscriptContexts?.length ?? 0,
+        cwdOrPathTextInjected: "unknown",
+        environmentDerivedTextInjected: "unknown",
+        randomOrNonceTextInjected: "unknown",
+        dynamicCapabilityOrToolTextInjected: "unknown",
+      } as const;
+      traceStage("agent-llm-boundary-input", messages, "convertToLlm input", {
+        ...boundaryFactors,
+        runtimeContextCarrierCount: countRuntimeContextCarriers(messages),
+      });
+      const normalized = normalizeMessagesForLlmBoundary(messages, boundaryOptions);
+      traceStage("agent-llm-boundary-normalized", normalized, "normalizeMessagesForLlmBoundary", {
+        ...boundaryFactors,
+        runtimeContextCarrierCount: countRuntimeContextCarriers(normalized),
+      });
+      // Wire-only relocation keeps the request append-only through the active
+      // user turn without changing position-sensitive precheck normalization.
+      const relocated = relocateCurrentRuntimeContextCarrierToTail(normalized);
+      traceStage("agent-llm-boundary-relocated", relocated, "runtime context carrier relocation", {
+        ...boundaryFactors,
+        runtimeContextCarrierCount: countRuntimeContextCarriers(relocated),
+      });
+      const converted = await baseConvertToLlm(relocated);
+      traceStage("agent-llm-boundary-converted", converted, "AgentSession convertToLlm output", {
+        ...boundaryFactors,
+        runtimeContextCarrierCount: countRuntimeContextCarriers(converted),
+      });
+      return converted;
+    };
   }
 
   return {

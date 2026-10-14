@@ -3,6 +3,11 @@ import { buildTimestampPrefix } from "../../../gateway/server-methods/agent-time
 import type { AgentMessage } from "../../runtime/index.js";
 import type { guardSessionManager } from "../../session-tool-result-guard-wrapper.js";
 import type { AgentSession } from "../../sessions/index.js";
+import {
+  fingerprintPromptText,
+  traceProviderAdapterInput,
+  traceProviderPayloadStages,
+} from "./attempt-prompt-materialization-trace.js";
 import { prepareEmbeddedAttemptSessionBoundary } from "./attempt-session-prepare.js";
 
 function createActiveSession(messages: AgentMessage[] = []) {
@@ -28,6 +33,81 @@ function createSessionManager(
 }
 
 describe("prepareEmbeddedAttemptSessionBoundary", () => {
+  it("traces LLM-boundary materialization with fingerprints and no prompt text fields", async () => {
+    const privateSystem = "private system prompt";
+    const privateUser = "private user prompt";
+    const traceEvents: Array<Record<string, unknown>> = [];
+    const messages: AgentMessage[] = [
+      {
+        role: "user",
+        content: [{ type: "text", text: privateUser }],
+        timestamp: 1,
+      } as AgentMessage,
+    ];
+    const { activeSession } = createActiveSession(messages);
+    activeSession.agent.state.systemPrompt = privateSystem;
+    prepareEmbeddedAttemptSessionBoundary({
+      activeSession,
+      attempt: {
+        config: { agents: { defaults: { userTimezone: "UTC" } } },
+        prompt: privateUser,
+        trigger: "user",
+        capabilityIntelligenceExperiment: {
+          onPromptMessageTrace: (event) =>
+            traceEvents.push({
+              stage: event.stage,
+              source: event.source,
+              systemPromptFingerprint: event.systemPromptFingerprint,
+              materializationFactors: event.materializationFactors,
+              messages: event.messages.map((message) => {
+                const row = message as { role?: unknown; content?: unknown };
+                const content =
+                  typeof row.content === "string"
+                    ? row.content
+                    : JSON.stringify(row.content ?? null);
+                return {
+                  role: row.role,
+                  contentFingerprint: fingerprintPromptText(content),
+                };
+              }),
+            }),
+        },
+      },
+      getUserTranscriptContexts: () => undefined,
+      isRawModelRun: false,
+      preparedUserTurnMessage: undefined,
+      sessionManager: createSessionManager(),
+      setActiveSessionSystemPrompt: vi.fn(),
+    });
+
+    await activeSession.agent.convertToLlm(messages);
+    await activeSession.agent.convertToLlm(messages);
+
+    const expectedStages = [
+      "agent-llm-boundary-input",
+      "agent-llm-boundary-normalized",
+      "agent-llm-boundary-relocated",
+      "agent-llm-boundary-converted",
+    ];
+    expect(traceEvents.map((event) => event.stage)).toEqual([...expectedStages, ...expectedStages]);
+    expect(traceEvents[0]?.systemPromptFingerprint).toEqual(fingerprintPromptText(privateSystem));
+    expect(traceEvents[0]?.materializationFactors).toMatchObject({
+      boundaryTimestampEnabled: true,
+      boundaryTimezoneConfigured: true,
+      currentUserTimestampOverridePresent: false,
+      userTranscriptContextCount: 0,
+      cwdOrPathTextInjected: "unknown",
+      environmentDerivedTextInjected: "unknown",
+      randomOrNonceTextInjected: "unknown",
+      dynamicCapabilityOrToolTextInjected: "unknown",
+    });
+    expect(traceEvents.slice(0, expectedStages.length)).toEqual(
+      traceEvents.slice(expectedStages.length),
+    );
+    expect(JSON.stringify(traceEvents)).not.toContain(privateSystem);
+    expect(JSON.stringify(traceEvents)).not.toContain(privateUser);
+  });
+
   it("resets restored state and preserves exact prompt bytes for raw model probes", async () => {
     const { activeSession, reset } = createActiveSession();
     const setActiveSessionSystemPrompt = vi.fn();
@@ -587,5 +667,56 @@ describe("prepareEmbeddedAttemptSessionBoundary", () => {
     expect(clearNextUserMessagePersistenceSuppression).toHaveBeenCalledOnce();
     expect(onUserMessagePersistenceInvalidated).toHaveBeenCalledOnce();
     expect(activeSession.agent.state.messages).toBe(repairedMessages);
+  });
+});
+
+describe("provider prompt materialization trace", () => {
+  it("fingerprints adapter input and built request stages without retaining prompt text", () => {
+    const privateSystem = "private system payload";
+    const privateUser = "private user payload";
+    const safeRows: Array<Record<string, unknown>> = [];
+    type TraceHook = NonNullable<Parameters<typeof traceProviderAdapterInput>[0]>;
+    const trace: TraceHook = (event) => {
+      safeRows.push({
+        stage: event.stage,
+        systemPromptFingerprint: event.systemPromptFingerprint,
+        messages: event.messages.map((message) => {
+          const row = message as { role?: unknown; content?: unknown };
+          const content = typeof row.content === "string" ? row.content : "";
+          return {
+            role: row.role,
+            contentFingerprint: fingerprintPromptText(content),
+          };
+        }),
+      });
+    };
+
+    traceProviderAdapterInput(trace, [{ role: "user", content: privateUser }], privateSystem);
+    traceProviderPayloadStages(
+      trace,
+      {
+        messages: [
+          { role: "system", content: privateSystem },
+          { role: "user", content: privateUser },
+        ],
+      },
+      1,
+      [
+        { stage: "provider-message-conversion-output", source: "provider conversion" },
+        { stage: "provider-request-object-constructed", source: "request object" },
+        { stage: "provider-onPayload-transform-enter", source: "payload hook" },
+      ],
+    );
+
+    expect(safeRows.map((row) => row.stage)).toEqual([
+      "provider-adapter-input",
+      "provider-message-conversion-input",
+      "provider-message-conversion-output",
+      "provider-request-object-constructed",
+      "provider-onPayload-transform-enter",
+    ]);
+    expect(safeRows[0]?.systemPromptFingerprint).toEqual(fingerprintPromptText(privateSystem));
+    expect(JSON.stringify(safeRows)).not.toContain(privateSystem);
+    expect(JSON.stringify(safeRows)).not.toContain(privateUser);
   });
 });

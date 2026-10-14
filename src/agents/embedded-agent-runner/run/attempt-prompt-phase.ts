@@ -20,6 +20,7 @@ import {
   prepareEmbeddedAttemptPromptAssembly,
   prepareEmbeddedAttemptPromptContext,
 } from "./attempt-prompt-build.js";
+import { fingerprintPromptText } from "./attempt-prompt-materialization-trace.js";
 import {
   handleEmbeddedAttemptMidTurnPrecheck,
   prepareEmbeddedAttemptPromptPreflight,
@@ -277,6 +278,7 @@ export async function runEmbeddedAttemptPromptPhase(input: {
       stage: "prompt-context-built",
       messages: hookMessagesForCurrentPrompt,
       source: "prepareEmbeddedAttemptPromptContext",
+      systemPromptFingerprint: fingerprintPromptText(systemPromptForHook),
       conversationHistorySource: "promptContext.hookMessagesForCurrentPrompt",
       promptAssemblySource:
         "prepareEmbeddedAttemptPromptAssembly -> prepareEmbeddedAttemptPromptContext",

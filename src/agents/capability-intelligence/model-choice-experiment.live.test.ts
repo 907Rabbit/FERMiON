@@ -376,6 +376,12 @@ function summarizePromptMessageTrace(
   return {
     stage: event.stage,
     source: event.source,
+    ...(event.systemPromptFingerprint
+      ? { systemPromptFingerprint: event.systemPromptFingerprint }
+      : {}),
+    ...(event.materializationFactors
+      ? { materializationFactors: event.materializationFactors }
+      : {}),
     ...(event.conversationHistorySource
       ? { conversationHistorySource: event.conversationHistorySource }
       : {}),
@@ -414,6 +420,69 @@ function summarizePromptMessageTrace(
     }),
   };
 }
+
+function diffPromptMaterializationSnapshots(
+  previous: ReturnType<typeof summarizePromptMessageTrace>,
+  current: ReturnType<typeof summarizePromptMessageTrace>,
+): string[] {
+  const differences: string[] = [];
+  const previousSystem = previous.systemPromptFingerprint;
+  const currentSystem = current.systemPromptFingerprint;
+  if (
+    previousSystem?.sha256 !== currentSystem?.sha256 ||
+    previousSystem?.utf8Bytes !== currentSystem?.utf8Bytes
+  ) {
+    differences.push("$.systemPrompt");
+  }
+  for (const [key, previousValue] of Object.entries(previous.materializationFactors ?? {})) {
+    if (
+      current.materializationFactors &&
+      key in current.materializationFactors &&
+      previousValue !== current.materializationFactors[key]
+    ) {
+      differences.push(`$.materializationFactors.${key}`);
+    }
+  }
+  if (previous.messageCount !== current.messageCount) {
+    differences.push("$.messages.length");
+  }
+  const count = Math.max(previous.messages.length, current.messages.length);
+  for (let index = 0; index < count; index += 1) {
+    const before = previous.messages[index];
+    const after = current.messages[index];
+    if (!before || !after) {
+      differences.push(`$.messages[${index}]`);
+      continue;
+    }
+    if (before.role !== after.role) {
+      differences.push(`$.messages[${index}].role`);
+    }
+    if (
+      before.contentSha256 !== after.contentSha256 ||
+      before.contentBytes !== after.contentBytes
+    ) {
+      differences.push(`$.messages[${index}].content`);
+    }
+  }
+  return differences;
+}
+
+const V1J_PROMPT_MATERIALIZATION_STAGES = new Set([
+  "prompt-context-built",
+  "prompt-submit-enter",
+  "prompt-history-normalized",
+  "model-prompt-transform-enter",
+  "model-prompt-transform-complete",
+  "agent-llm-boundary-input",
+  "agent-llm-boundary-normalized",
+  "agent-llm-boundary-relocated",
+  "agent-llm-boundary-converted",
+  "provider-adapter-input",
+  "provider-message-conversion-input",
+  "provider-message-conversion-output",
+  "provider-request-object-constructed",
+  "provider-onPayload-transform-enter",
+]);
 
 function summarizeV1JTraceContent(content: unknown): {
   contentSha256: string | null;
@@ -2672,6 +2741,45 @@ describe("v1J pre-capture re-entry trace", () => {
       },
     ]);
     expect(JSON.stringify(summary)).not.toContain(privateText);
+  });
+
+  it("reports the first content-free prompt-materialization boundary that diverges", () => {
+    const privateSystem = "private system material";
+    const privateUser = "private user material";
+    const messages = [{ role: "user", content: privateUser }];
+    const identity = (value: object) => (value === messages ? 1 : 2);
+    const source = {
+      stage: "model-prompt-transform-complete",
+      source: "offline materialization fixture",
+      messages,
+      systemPromptFingerprint: {
+        sha256: sha256V1J(privateSystem),
+        utf8Bytes: Buffer.byteLength(privateSystem, "utf8"),
+      },
+      materializationFactors: { boundaryTimezoneConfigured: false },
+    } as PromptMessageTraceEvent;
+    const first = summarizePromptMessageTrace(source, identity);
+    const same = summarizePromptMessageTrace({ ...source }, identity);
+    const changed = summarizePromptMessageTrace(
+      {
+        ...source,
+        stage: "agent-llm-boundary-normalized",
+        messages: [{ role: "user", content: `${privateUser}!` }],
+      },
+      identity,
+    );
+
+    expect(diffPromptMaterializationSnapshots(first, same)).toEqual([]);
+    expect(diffPromptMaterializationSnapshots(first, changed)).toEqual(["$.messages[0].content"]);
+    expect(
+      diffPromptMaterializationSnapshots(first, {
+        ...same,
+        stage: "agent-llm-boundary-input",
+        materializationFactors: { boundaryTimezoneConfigured: true },
+      }),
+    ).toEqual(["$.materializationFactors.boundaryTimezoneConfigured"]);
+    expect(JSON.stringify([first, changed])).not.toContain(privateSystem);
+    expect(JSON.stringify([first, changed])).not.toContain(privateUser);
   });
 
   it("journals same-run transcript growth with appended roles and hashes only", () => {
@@ -5082,6 +5190,13 @@ describe("v1J schema-capture dispatch guard", () => {
       expect(traceStages).toContain("prompt-context-built");
       expect(traceStages).toContain("prompt-submit-enter");
       expect(traceStages).toContain("prompt-history-normalized");
+      expect(traceStages).toContain("agent-llm-boundary-input");
+      expect(traceStages).toContain("agent-llm-boundary-normalized");
+      expect(traceStages).toContain("agent-llm-boundary-converted");
+      expect(traceStages).toContain("provider-adapter-input");
+      expect(traceStages).toContain("provider-message-conversion-input");
+      expect(traceStages).toContain("provider-message-conversion-output");
+      expect(traceStages).toContain("provider-request-object-constructed");
       const promptContexts = messageTraceRows.filter((row) => row.stage === "prompt-context-built");
       expect(promptContexts.map((row) => row.callbackIndex)).toEqual([1]);
       expect(promptContexts.map((row) => row.messageCount)).toEqual([0]);
@@ -7951,6 +8066,8 @@ async function runOne(input: {
         messages: ReturnType<typeof summarizePromptMessageTrace>["messages"];
       }
     | undefined;
+  let previousMaterializationTrace: ReturnType<typeof summarizePromptMessageTrace> | undefined;
+  let materializationRequestIndex = 0;
   const preCaptureObserverTraces: V1JPreCaptureObserverTrace[] = [];
   const preCaptureTranscriptGrowth: V1JPreCaptureTranscriptGrowth[] = [];
   if (preflightDiagnostics) {
@@ -8008,6 +8125,15 @@ async function runOne(input: {
     }
     const journal = input.requestCapture?.preflightDiagnostics;
     if (journal) {
+      if (event.stage === "prompt-context-built") {
+        previousMaterializationTrace = undefined;
+        materializationRequestIndex = 0;
+      } else if (event.stage === "provider-adapter-input") {
+        materializationRequestIndex += 1;
+        if (materializationRequestIndex > 1) {
+          previousMaterializationTrace = undefined;
+        }
+      }
       if (event.stage === "prompt-context-built") {
         promptSubmissionTraceIndex += 1;
         if (promptSubmissionTraceIndex > 1) {
@@ -8067,6 +8193,29 @@ async function runOne(input: {
         callbackIndex === undefined ? event : { ...event, callbackIndex },
         identifyPromptObject,
       );
+      if (journal && V1J_PROMPT_MATERIALIZATION_STAGES.has(event.stage)) {
+        const differingPaths = previousMaterializationTrace
+          ? diffPromptMaterializationSnapshots(previousMaterializationTrace, summary)
+          : [];
+        journal.record("prompt-materialization-boundary", {
+          materializationRequestIndex,
+          previousStage: previousMaterializationTrace?.stage ?? null,
+          stage: event.stage,
+          firstDivergentStage:
+            previousMaterializationTrace && differingPaths.length > 0 ? event.stage : null,
+          differingPaths,
+          systemPromptFingerprint: summary.systemPromptFingerprint ?? null,
+          materializationFactors: summary.materializationFactors ?? null,
+          messageCount: summary.messageCount,
+          messages: summary.messages.map(({ index, role, contentSha256, contentBytes }) => ({
+            index,
+            role,
+            contentSha256,
+            contentBytes,
+          })),
+        });
+        previousMaterializationTrace = summary;
+      }
       const transcriptStages = new Set([
         "prompt-submit-enter",
         "prompt-history-normalized",

@@ -29,6 +29,7 @@ export type V1JProviderControlMode = "stream-false" | "stream-true" | "A" | "B" 
 export type V1JProviderControlRequest = {
   mode: V1JProviderControlMode;
   requestObject: Record<string, unknown>;
+  serializedRequestBody?: string;
 };
 
 export type V1JProviderControlMetrics = {
@@ -220,7 +221,7 @@ export async function runV1JProviderTransportControls(input: {
   record: (event: V1JProviderControlEvent) => void;
 }): Promise<V1JProviderControlResult[]> {
   const results: V1JProviderControlResult[] = [];
-  const requests =
+  const requests: readonly V1JProviderControlRequest[] =
     input.requests ??
     ([false, true] as const).map((stream) => ({
       mode: stream ? ("stream-true" as const) : ("stream-false" as const),
@@ -231,9 +232,9 @@ export async function runV1JProviderTransportControls(input: {
         stream,
       },
     }));
-  for (const { mode, requestObject } of requests) {
+  for (const { mode, requestObject, serializedRequestBody } of requests) {
     const stream = requestObject.stream === true;
-    const requestBody = JSON.stringify(requestObject);
+    const requestBody = serializedRequestBody ?? JSON.stringify(requestObject);
     const startedAtMs = (input.now ?? Date.now)();
     const startedAt = (input.wallNow ?? (() => new Date().toISOString()))();
     const controller = new AbortController();

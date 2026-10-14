@@ -63,12 +63,12 @@ import {
   V1J_ADAPTER_DIFFERENTIAL_COMMIT_FLAG,
   V1J_ADAPTER_DIFFERENTIAL_MAX_ADAPTER_REQUESTS,
   V1J_ADAPTER_DIFFERENTIAL_MAX_TOTAL_REQUESTS,
+  V1J_ADAPTER_DIFFERENTIAL_PARENT,
   V1J_ADAPTER_DIFFERENTIAL_PREFIX,
   V1J_ADAPTER_DIFFERENTIAL_RUN_FLAG,
 } from "../../../test/helpers/agents/model-choice-adapter-differential.js";
 import { runV1JPayloadDecompositionDiagnostic } from "../../../test/helpers/agents/model-choice-provider-payload-decomposition-live.js";
 import {
-  buildV1JPayloadDecompositionRequests,
   V1J_PAYLOAD_DECOMPOSITION_AUTHORIZED_FLAG,
   V1J_PAYLOAD_DECOMPOSITION_COMMIT_FLAG,
   V1J_PAYLOAD_DECOMPOSITION_RUN_FLAG,
@@ -1852,7 +1852,6 @@ describeV1JAdapterDifferential("v1J raw-transport versus adapter differential", 
       }
       const benchmark = v1jSmokeBenchmark(cell);
       const capturedBodies: Record<string, unknown>[] = [];
-      let schemaPreflightPreparedRuntimeReadyAtMs: number | undefined;
       const schemaSurface = await withV1JAdapterDifferentialProgress({
         stage: "schema-preflight",
         operation: (checkpoint) => {
@@ -1867,9 +1866,6 @@ describeV1JAdapterDifferential("v1J raw-transport versus adapter differential", 
               ),
             onCapturedRequest: (request) => capturedBodies.push(structuredClone(request.body)),
             onCheckpoint: (runtimeCheckpoint) => {
-              if (runtimeCheckpoint.stage === "client-preparation-completed") {
-                schemaPreflightPreparedRuntimeReadyAtMs = Date.now();
-              }
               if (
                 runtimeCheckpoint.stage.startsWith("prepared-runtime-") ||
                 runtimeCheckpoint.stage.startsWith("plugin-prep-")
@@ -1907,18 +1903,12 @@ describeV1JAdapterDifferential("v1J raw-transport versus adapter differential", 
         throw new Error("v1J adapter differential did not capture the frozen Arm-A request shape");
       }
       const schemaPreflightCompletedAtMs = Date.now();
-      const controlC = buildV1JPayloadDecompositionRequests({
-        capturedArmARequest,
-      }).find((request) => request.control === "C");
-      if (!controlC) {
-        throw new Error("v1J adapter differential raw Control C request is unavailable");
-      }
       const workspaceDir = fs.mkdtempSync(path.join(os.tmpdir(), "v1j-adapter-differential-"));
       fs.writeFileSync(path.join(workspaceDir, "smoke-reference.txt"), "smoke-token-47\n", {
         encoding: "utf8",
         flag: "wx",
       });
-      const requestMetrics = summarizeV1JAdapterDifferentialRequest(controlC.body);
+      const requestMetrics = summarizeV1JAdapterDifferentialRequest(capturedArmARequest);
       const journal = await withV1JAdapterDifferentialProgress({
         stage: "differential-journal-creation",
         operation: () =>
@@ -1940,35 +1930,6 @@ describeV1JAdapterDifferential("v1J raw-transport versus adapter differential", 
       let adapterPreparedRuntimeReadyAtMs: number | undefined;
       try {
         journal.record("captured-arm-a-request-ready", requestMetrics);
-        rawResult = await withV1JAdapterDifferentialProgress({
-          stage: "raw-control-c-dispatch",
-          operation: () =>
-            runV1JAdapterDifferentialRawTransport({
-              endpoint: `${LM_STUDIO_BASE_URL}/chat/completions`,
-              authorization: `Bearer ${process.env.LM_API_TOKEN ?? "lmstudio"}`,
-              requestBody: controlC.body,
-              fetchImpl: fetch,
-              journal,
-              dispatchContext: {
-                preparedRuntimeReadyAtMs: schemaPreflightPreparedRuntimeReadyAtMs,
-                schemaPreflightCompletedAtMs,
-                modelDiscoveryStatus,
-                requestTimeoutMs: 120_000,
-              },
-            }),
-        });
-        journal.record("raw-transport-complete", {
-          httpStatus: rawResult.httpStatus,
-          responseFirstByteMs: rawResult.responseFirstByteMs,
-          responseChunkCount: rawResult.responseChunkCount,
-          responseByteCount: rawResult.responseByteCount,
-          elapsedMs: rawResult.elapsedMs,
-          outcome: rawResult.streamEnd ? "complete" : "incomplete",
-        });
-        assertV1JAdapterDifferentialRequestBudget({
-          rawRequests: rawResult.requestDispatchStarted ? 1 : 0,
-          adapterRequests: 0,
-        });
         adapterToolGuard = installV1JAdapterDifferentialToolGuard({
           workspaceRoot: workspaceDir,
           journal,
@@ -2003,7 +1964,7 @@ describeV1JAdapterDifferential("v1J raw-transport versus adapter differential", 
                   dispatched: false,
                 });
               },
-              onProviderRequestBeforeDispatch: ({
+              onProviderRequestBeforeDispatch: async ({
                 request,
                 rawBody,
                 requestIndex,
@@ -2024,9 +1985,11 @@ describeV1JAdapterDifferential("v1J raw-transport versus adapter differential", 
                 if (requestIndex !== 1) {
                   return;
                 }
+                const providerBoundRequest = JSON.parse(rawBody) as Record<string, unknown>;
                 const comparison = compareV1JAdapterDifferentialRequests(
-                  controlC.body,
+                  providerBoundRequest,
                   request.body,
+                  rawBody,
                   rawBody,
                 );
                 adapterRequestMatch = comparison;
@@ -2040,6 +2003,20 @@ describeV1JAdapterDifferential("v1J raw-transport versus adapter differential", 
                   rawCanonicalRequestSha256: comparison.rawCanonicalRequestSha256,
                   adapterCanonicalRequestSha256: comparison.adapterCanonicalRequestSha256,
                   requestJsonBytes: adapterSummary.requestJsonBytes,
+                });
+                const toolChoiceFingerprint = fingerprintV1JAdapterDifferentialField(
+                  providerBoundRequest,
+                  "tool_choice",
+                );
+                journal.record("provider-request-fork", {
+                  requestIndex,
+                  dispatchOrdinal,
+                  outcome: "exact-provider-bound-body",
+                  rawValueSource: "exact-provider-bound-initial-request",
+                  toolChoicePresent: toolChoiceFingerprint.present,
+                  toolChoiceValueType: toolChoiceFingerprint.valueType,
+                  toolChoiceSha256: toolChoiceFingerprint.valueSha256 ?? undefined,
+                  toolChoiceBytes: toolChoiceFingerprint.valueBytes,
                 });
                 for (const differingPath of comparison.differingPaths) {
                   journal.record("adapter-request-difference", {
@@ -2063,7 +2040,7 @@ describeV1JAdapterDifferential("v1J raw-transport versus adapter differential", 
                     requestIndex,
                     dispatchOrdinal,
                     differingPath,
-                    rawValueSource: "control-c-clone-of-preflight-arm-a",
+                    rawValueSource: "exact-provider-bound-initial-request",
                     adapterCandidateSource: "fresh-execute-v1jcell-request-observer",
                     adapterWireSource: "provider-fetch-body-pre-dispatch",
                     rawValuePresent: rawField.present,
@@ -2082,9 +2059,39 @@ describeV1JAdapterDifferential("v1J raw-transport versus adapter differential", 
                 }
                 if (!comparison.canonicalMatch) {
                   throw new Error(
-                    `v1J actual adapter request differs from raw Control C at: ${comparison.differingPaths.join(",")}`,
+                    `v1J captured provider-bound request changed before raw fork at: ${comparison.differingPaths.join(",")}`,
                   );
                 }
+                rawResult = await withV1JAdapterDifferentialProgress({
+                  stage: "raw-control-c-fork-dispatch",
+                  operation: () =>
+                    runV1JAdapterDifferentialRawTransport({
+                      endpoint: request.url,
+                      authorization: `Bearer ${process.env.LM_API_TOKEN ?? "lmstudio"}`,
+                      requestBody: providerBoundRequest,
+                      serializedRequestBody: rawBody,
+                      fetchImpl: fetch,
+                      journal,
+                      dispatchContext: {
+                        preparedRuntimeReadyAtMs: adapterPreparedRuntimeReadyAtMs,
+                        schemaPreflightCompletedAtMs,
+                        modelDiscoveryStatus,
+                        requestTimeoutMs: 120_000,
+                      },
+                    }),
+                });
+                journal.record("raw-transport-complete", {
+                  httpStatus: rawResult.httpStatus,
+                  responseFirstByteMs: rawResult.responseFirstByteMs,
+                  responseChunkCount: rawResult.responseChunkCount,
+                  responseByteCount: rawResult.responseByteCount,
+                  elapsedMs: rawResult.elapsedMs,
+                  outcome: rawResult.streamEnd ? "complete" : "incomplete",
+                });
+                assertV1JAdapterDifferentialRequestBudget({
+                  rawRequests: rawResult.requestDispatchStarted ? 1 : 0,
+                  adapterRequests: 0,
+                });
               },
               onCheckpoint: (checkpoint) => {
                 if (checkpoint.stage === "client-preparation-completed") {
@@ -2731,7 +2738,7 @@ async function executeV1JCell(input: {
     rawBody: string;
     requestIndex: number;
     dispatchOrdinal: number;
-  }) => void;
+  }) => void | Promise<void>;
   onAssistantMessage?: (message: AssistantMessage, modelTurnIndex: number) => void;
   onProviderDispatchAttempt?: (count: number) => void;
   onCheckpoint?: (
@@ -3543,6 +3550,97 @@ describe("v1J schema-capture dispatch guard", () => {
       expect(capture.providerDispatchAttempts).toBe(1);
     } finally {
       capture.restore();
+    }
+  });
+
+  it("awaits the raw fork of the exact provider-bound body before adapter dispatch", async () => {
+    const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), "v1j-provider-body-fork-"));
+    const journal = createV1JAdapterDifferentialJournal({
+      repoRoot,
+      harnessCommit: "a".repeat(40),
+      modelId: MODEL_ID,
+      modelConfigHash: "2a219399da63b03057ceaf46a9dd1d74e76be20ead626f07af2b8ba45f37c529",
+      schemaFingerprint: {
+        authorizedToolCount: 15,
+        providerToolCount: 15,
+        authorizedToolNameSha256: "b".repeat(64),
+        providerToolNameSha256: "b".repeat(64),
+        authorizedToolSchemaSha256: "c".repeat(64),
+        providerToolSchemaSha256: "d".repeat(64),
+      },
+      startedAt: new Date().toISOString(),
+    });
+    const providerBody = {
+      model: MODEL_ID,
+      messages: [
+        { role: "system", content: "private provider-bound system prompt" },
+        { role: "user", content: "private provider-bound user prompt" },
+      ],
+      tools: Array.from({ length: 15 }, (_, index) => ({
+        function: { name: `tool_${index}`, parameters: { type: "object" } },
+      })),
+      max_tokens: 128,
+      stream: true,
+    };
+    const serializedProviderBody = ` {\n  ${JSON.stringify(providerBody).slice(1, -1)}\n}`;
+    const dispatchOrder: string[] = [];
+    let rawBodySent: string | undefined;
+    let parity: ReturnType<typeof compareV1JAdapterDifferentialRequests> | undefined;
+    const capture = captureModelPayloads(undefined, {
+      onProviderRequestBeforeDispatch: async ({ request, rawBody, requestIndex }) => {
+        if (requestIndex !== 1) {
+          return;
+        }
+        const providerRequest = JSON.parse(rawBody) as Record<string, unknown>;
+        expect(Object.hasOwn(providerRequest, "tool_choice")).toBe(false);
+        parity = compareV1JAdapterDifferentialRequests(
+          providerRequest,
+          request.body,
+          rawBody,
+          rawBody,
+        );
+        await runV1JAdapterDifferentialRawTransport({
+          endpoint: request.url,
+          authorization: "Bearer test-only",
+          requestBody: providerRequest,
+          serializedRequestBody: rawBody,
+          journal,
+          fetchImpl: async (_input, init) => {
+            dispatchOrder.push("raw");
+            rawBodySent = init?.body as string;
+            return new Response("data: [DONE]\n\n", {
+              headers: { "content-type": "text/event-stream" },
+            });
+          },
+          timeoutMs: 1_000,
+          heartbeatMs: 1_000,
+        });
+      },
+    });
+    try {
+      await capture.wrapFetch(async (_input, init) => {
+        dispatchOrder.push("adapter");
+        expect(init?.body).toBe(serializedProviderBody);
+        return new Response("{}", { headers: { "content-type": "application/json" } });
+      })(`${LM_STUDIO_BASE_URL}/chat/completions`, {
+        method: "POST",
+        body: serializedProviderBody,
+      });
+
+      expect(dispatchOrder).toEqual(["raw", "adapter"]);
+      expect(rawBodySent).toBe(serializedProviderBody);
+      expect(parity?.canonicalMatch).toBe(true);
+      expect(parity?.requestMatch).toBe(true);
+      expect(capture.providerDispatchAttempts).toBe(1);
+      const artifactParent = path.join(repoRoot, V1J_ADAPTER_DIFFERENTIAL_PARENT);
+      expect(fs.existsSync(path.join(artifactParent, "real-exact-run1"))).toBe(false);
+      expect(fs.existsSync(path.join(artifactParent, `smoke-${"a".repeat(40)}`))).toBe(false);
+      const persisted = fs.readFileSync(journal.filePath, "utf8");
+      expect(persisted).not.toContain("private provider-bound");
+    } finally {
+      capture.restore();
+      journal.close();
+      fs.rmSync(repoRoot, { recursive: true, force: true });
     }
   });
 
@@ -5576,7 +5674,7 @@ async function runOne(input: {
       rawBody: string;
       requestIndex: number;
       dispatchOrdinal: number;
-    }) => void;
+    }) => void | Promise<void>;
     onDelegatedRequest?: () => void;
     onResponseSummary?: (summary: ProviderResponseSummary) => void;
     onAssistantMessage?: (message: AssistantMessage, modelTurnIndex: number) => void;
@@ -7691,7 +7789,7 @@ function captureModelPayloads(
       rawBody: string;
       requestIndex: number;
       dispatchOrdinal: number;
-    }) => void;
+    }) => void | Promise<void>;
     onDelegatedRequest?: () => void;
     onResponseSummary?: (summary: ProviderResponseSummary) => void;
     lifecycleJournal?: V1JLifecycleJournal;
@@ -7802,7 +7900,7 @@ function captureModelPayloads(
           });
         }
         try {
-          options?.onProviderRequestBeforeDispatch?.({
+          await options?.onProviderRequestBeforeDispatch?.({
             request,
             rawBody: body,
             requestIndex,

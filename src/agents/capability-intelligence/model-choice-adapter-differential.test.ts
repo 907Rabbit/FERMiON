@@ -465,11 +465,13 @@ describe("v1J adapter differential diagnostics", () => {
       startedAt: new Date().toISOString(),
     });
     let calls = 0;
+    const serializedRequestBody = ` ${JSON.stringify(requestBody)}\n`;
     try {
       const result = await runV1JAdapterDifferentialRawTransport({
         endpoint: "http://127.0.0.1:1234/v1/chat/completions",
         authorization: "Bearer test-only",
         requestBody,
+        serializedRequestBody,
         journal,
         fetchImpl: async (_request, init) => {
           calls += 1;
@@ -485,6 +487,7 @@ describe("v1J adapter differential diagnostics", () => {
         heartbeatMs: 1_000,
       });
       expect(calls).toBe(1);
+      expect(JSON.parse(serializedRequestBody)).toEqual(requestBody);
       expect(result).toMatchObject({
         mode: "C",
         stream: true,
@@ -530,6 +533,95 @@ describe("v1J adapter differential diagnostics", () => {
       expect(fingerprintEvents).not.toContain("safe fixture prompt");
       expect(fingerprintEvents).not.toContain("response-secret");
       expect(fingerprintEvents).not.toContain("followup-secret");
+    } finally {
+      journal.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    { label: "absent", body: requestBody },
+    { label: "present", body: { ...requestBody, tool_choice: "auto" } },
+  ])("forks the exact serialized provider body with tool_choice $label", async ({ body }) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "v1j-adapter-diff-exact-body-"));
+    const journal = createV1JAdapterDifferentialJournal({
+      repoRoot: root,
+      harnessCommit: head,
+      modelId: "qwen/qwen3.5-9b",
+      modelConfigHash: "2a219399da63b03057ceaf46a9dd1d74e76be20ead626f07af2b8ba45f37c529",
+      schemaFingerprint: schema,
+      startedAt: new Date().toISOString(),
+    });
+    const serializedRequestBody = ` {\n  ${JSON.stringify(body).slice(1, -1)}\n}\n`;
+    let sentBody: string | undefined;
+    try {
+      await runV1JAdapterDifferentialRawTransport({
+        endpoint: "http://127.0.0.1:1234/v1/chat/completions",
+        authorization: "Bearer test-only",
+        requestBody: body,
+        serializedRequestBody,
+        journal,
+        fetchImpl: async (_request, init) => {
+          sentBody = init?.body as string;
+          return new Response("data: [DONE]\n\n", {
+            headers: { "content-type": "text/event-stream" },
+          });
+        },
+        timeoutMs: 1_000,
+        heartbeatMs: 1_000,
+      });
+
+      expect(sentBody).toBe(serializedRequestBody);
+      const parsedSentBody = JSON.parse(sentBody!) as Record<string, unknown>;
+      const hasToolChoice = Object.hasOwn(body, "tool_choice");
+      const expectedToolChoice = hasToolChoice
+        ? (body as Record<string, unknown>).tool_choice
+        : undefined;
+      expect(Object.hasOwn(parsedSentBody, "tool_choice")).toBe(hasToolChoice);
+      expect(parsedSentBody.tool_choice).toBe(expectedToolChoice);
+      expect(
+        compareV1JAdapterDifferentialRequests(body, parsedSentBody, sentBody, serializedRequestBody)
+          .canonicalMatch,
+      ).toBe(true);
+      expect(fingerprintV1JAdapterDifferentialField(parsedSentBody, "tools").valueSha256).toBe(
+        fingerprintV1JAdapterDifferentialField(body, "tools").valueSha256,
+      );
+    } finally {
+      journal.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a captured-body mismatch before raw transport dispatch", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "v1j-adapter-diff-body-mismatch-"));
+    const journal = createV1JAdapterDifferentialJournal({
+      repoRoot: root,
+      harnessCommit: head,
+      modelId: "qwen/qwen3.5-9b",
+      modelConfigHash: "2a219399da63b03057ceaf46a9dd1d74e76be20ead626f07af2b8ba45f37c529",
+      schemaFingerprint: schema,
+      startedAt: new Date().toISOString(),
+    });
+    let dispatches = 0;
+    try {
+      await expect(
+        runV1JAdapterDifferentialRawTransport({
+          endpoint: "http://127.0.0.1:1234/v1/chat/completions",
+          authorization: "Bearer test-only",
+          requestBody,
+          serializedRequestBody: JSON.stringify({ ...requestBody, tool_choice: "none" }),
+          journal,
+          fetchImpl: async () => {
+            dispatches += 1;
+            return new Response("data: [DONE]\n\n", {
+              headers: { "content-type": "text/event-stream" },
+            });
+          },
+          timeoutMs: 1_000,
+          heartbeatMs: 1_000,
+        }),
+      ).rejects.toThrow(/does not match its captured request/);
+      expect(dispatches).toBe(0);
     } finally {
       journal.close();
       fs.rmSync(root, { recursive: true, force: true });

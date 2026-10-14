@@ -331,8 +331,9 @@ export function compareV1JAdapterDifferentialRequests(
   rawRequest: Record<string, unknown>,
   adapterRequest: Record<string, unknown>,
   adapterRawBody?: string,
+  rawRawBody?: string,
 ): V1JAdapterDifferentialRequestComparison {
-  const raw = summarizeV1JAdapterDifferentialRequest(rawRequest);
+  const raw = summarizeV1JAdapterDifferentialRequest(rawRequest, rawRawBody);
   const adapter = summarizeV1JAdapterDifferentialRequest(adapterRequest, adapterRawBody);
   const differingPaths: string[] = [];
   collectDifferingJsonPaths(rawRequest, adapterRequest, "", differingPaths);
@@ -511,6 +512,10 @@ const SAFE_DETAIL_KEYS = new Set([
   "timeSinceSchemaPreflightCompleteMs",
   "modelDiscoveryStatus",
   "requestTimeoutMs",
+  "toolChoicePresent",
+  "toolChoiceValueType",
+  "toolChoiceSha256",
+  "toolChoiceBytes",
   "dispatched",
   "errorClass",
   "errorCode",
@@ -714,12 +719,25 @@ export async function runV1JAdapterDifferentialRawTransport(input: {
   endpoint: string;
   authorization: string;
   requestBody: Record<string, unknown>;
+  serializedRequestBody: string;
   fetchImpl: V1JProviderControlFetch;
   journal: V1JAdapterDifferentialJournal;
   dispatchContext?: V1JAdapterDifferentialDispatchContext;
   timeoutMs?: number;
   heartbeatMs?: number;
 }): Promise<V1JProviderControlResult> {
+  let parsedRequestBody: unknown;
+  try {
+    parsedRequestBody = JSON.parse(input.serializedRequestBody);
+  } catch {
+    throw new Error("v1J adapter differential captured provider body is not valid JSON");
+  }
+  if (
+    !isRecord(parsedRequestBody) ||
+    canonicalJson(parsedRequestBody) !== canonicalJson(input.requestBody)
+  ) {
+    throw new Error("v1J adapter differential provider body does not match its captured request");
+  }
   if (
     input.requestBody.stream !== true ||
     !Array.isArray(input.requestBody.tools) ||
@@ -731,6 +749,7 @@ export async function runV1JAdapterDifferentialRawTransport(input: {
     journal: input.journal,
     event: "raw-transport-request-ready",
     body: input.requestBody,
+    rawBody: input.serializedRequestBody,
     dispatched: false,
   });
   let dispatches = 0;
@@ -738,7 +757,13 @@ export async function runV1JAdapterDifferentialRawTransport(input: {
     endpoint: input.endpoint,
     model: typeof input.requestBody.model === "string" ? input.requestBody.model : "",
     authorization: input.authorization,
-    requests: [{ mode: "C", requestObject: input.requestBody }],
+    requests: [
+      {
+        mode: "C",
+        requestObject: input.requestBody,
+        serializedRequestBody: input.serializedRequestBody,
+      },
+    ],
     fetchImpl: (request, init) => {
       dispatches += 1;
       if (dispatches > V1J_ADAPTER_DIFFERENTIAL_MAX_RAW_REQUESTS) {

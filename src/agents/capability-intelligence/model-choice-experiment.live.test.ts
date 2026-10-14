@@ -71,10 +71,11 @@ import {
 } from "../../../test/helpers/agents/model-choice-adapter-differential.js";
 import { recordV1JPromptAwaitDiagnostic } from "../../../test/helpers/agents/model-choice-prompt-await-diagnostic.js";
 import {
+  diffV1JPromptMaterializationBoundaries,
   fingerprintV1JSystemPromptParagraphs,
   fingerprintV1JSystemPromptSections,
-  summarizeV1JPromptMessageContentDeltas,
-  type V1JPromptMessageContent,
+  V1J_PROMPT_MATERIALIZATION_BOUNDARY_ORDER,
+  type V1JPromptMaterializationBoundary,
 } from "../../../test/helpers/agents/model-choice-prompt-content-delta.js";
 import {
   V1J_PROVIDER_CONTROL_MODEL_CONFIG_SHA256,
@@ -503,22 +504,9 @@ function diffPromptMaterializationSnapshots(
   return differences;
 }
 
-const V1J_PROMPT_MATERIALIZATION_STAGES = new Set([
-  "prompt-context-built",
-  "prompt-submit-enter",
-  "prompt-history-normalized",
-  "model-prompt-transform-enter",
-  "model-prompt-transform-complete",
-  "agent-llm-boundary-input",
-  "agent-llm-boundary-normalized",
-  "agent-llm-boundary-relocated",
-  "agent-llm-boundary-converted",
-  "provider-adapter-input",
-  "provider-message-conversion-input",
-  "provider-message-conversion-output",
-  "provider-request-object-constructed",
-  "provider-onPayload-transform-enter",
-]);
+const V1J_PROMPT_MATERIALIZATION_STAGES = new Set<string>(
+  V1J_PROMPT_MATERIALIZATION_BOUNDARY_ORDER,
+);
 
 function summarizeV1JTraceContent(content: unknown): {
   contentSha256: string | null;
@@ -5399,34 +5387,49 @@ describe("v1J schema-capture dispatch guard", () => {
       const normalizedBoundary = materializationRows.find(
         (row) => row.stage === "agent-llm-boundary-normalized",
       );
-      expect(normalizedBoundary?.contentDeltas).toEqual(
-        expect.arrayContaining([
-          expect.objectContaining({
-            index: expect.any(Number),
-            beforeRole: expect.any(String),
-            afterRole: expect.any(String),
-            delta: expect.objectContaining({
-              beforeBytes: expect.any(Number),
-              afterBytes: expect.any(Number),
-              prefixCommonBytes: expect.any(Number),
-              suffixCommonBytes: expect.any(Number),
-              insertedByteCount: expect.any(Number),
-              deletedByteCount: expect.any(Number),
-              substitutedByteCount: expect.any(Number),
-              beforeTailSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
-              afterTailSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
-              newlineCountBefore: expect.any(Number),
-              newlineCountAfter: expect.any(Number),
-              crCountBefore: expect.any(Number),
-              crCountAfter: expect.any(Number),
-              lfCountBefore: expect.any(Number),
-              lfCountAfter: expect.any(Number),
-              utf8CodepointCountBefore: expect.any(Number),
-              utf8CodepointCountAfter: expect.any(Number),
-            }),
-          }),
-        ]),
+      const inputBoundary = materializationRows.find(
+        (row) => row.stage === "agent-llm-boundary-input",
       );
+      expect(normalizedBoundary?.contentDeltaPairing).toMatchObject({
+        sourceBoundary: "agent-llm-boundary-input",
+        destinationBoundary: "agent-llm-boundary-normalized",
+        identity: {
+          runOneAttemptId: expect.any(String),
+          embeddedRunId: expect.any(String),
+          sessionIdSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+          promptSubmissionIndex: 1,
+          modelLoopIterationIndex: 1,
+        },
+      });
+      const inputUserMessage = Array.isArray(inputBoundary?.messages)
+        ? (inputBoundary.messages as Array<Record<string, unknown>>).find(
+            (message) => message.role === "user",
+          )
+        : undefined;
+      const normalizedUserMessage = Array.isArray(normalizedBoundary?.messages)
+        ? (normalizedBoundary.messages as Array<Record<string, unknown>>).find(
+            (message) => message.role === "user",
+          )
+        : undefined;
+      const normalizedUserDelta = Array.isArray(normalizedBoundary?.contentDeltas)
+        ? (normalizedBoundary.contentDeltas as Array<Record<string, unknown>>).find(
+            (delta) => delta.role === "user",
+          )
+        : undefined;
+      expect(normalizedUserDelta).toBeDefined();
+      if (normalizedUserDelta?.pairingStatus === "PAIRED") {
+        expect(normalizedUserDelta).toMatchObject({
+          beforeContentSha256: inputUserMessage?.contentSha256,
+          afterContentSha256: normalizedUserMessage?.contentSha256,
+        });
+        expect(normalizedUserDelta.delta).toMatchObject({
+          beforeBytes: inputUserMessage?.contentBytes,
+          afterBytes: normalizedUserMessage?.contentBytes,
+        });
+      } else {
+        expect(normalizedUserDelta?.pairingReason).toEqual(expect.any(String));
+        expect(normalizedUserDelta?.delta).toBeUndefined();
+      }
       expect(normalizedBoundary?.systemPromptSections).toEqual(
         expect.arrayContaining([
           expect.objectContaining({
@@ -8327,8 +8330,12 @@ async function runOne(input: {
         messages: ReturnType<typeof summarizePromptMessageTrace>["messages"];
       }
     | undefined;
-  let previousMaterializationTrace: ReturnType<typeof summarizePromptMessageTrace> | undefined;
-  let previousMaterializationContent: V1JPromptMessageContent[] | undefined;
+  let previousMaterializationBoundary:
+    | {
+        trace: ReturnType<typeof summarizePromptMessageTrace>;
+        content: V1JPromptMaterializationBoundary;
+      }
+    | undefined;
   let materializationRequestIndex = 0;
   const preCaptureObserverTraces: V1JPreCaptureObserverTrace[] = [];
   const preCaptureTranscriptGrowth: V1JPreCaptureTranscriptGrowth[] = [];
@@ -8388,14 +8395,12 @@ async function runOne(input: {
     const journal = input.requestCapture?.preflightDiagnostics;
     if (journal) {
       if (event.stage === "prompt-context-built") {
-        previousMaterializationTrace = undefined;
-        previousMaterializationContent = undefined;
+        previousMaterializationBoundary = undefined;
         materializationRequestIndex = 0;
       } else if (event.stage === "provider-adapter-input") {
         materializationRequestIndex += 1;
         if (materializationRequestIndex > 1) {
-          previousMaterializationTrace = undefined;
-          previousMaterializationContent = undefined;
+          previousMaterializationBoundary = undefined;
         }
       }
       if (event.stage === "prompt-context-built") {
@@ -8458,8 +8463,9 @@ async function runOne(input: {
         identifyPromptObject,
       );
       if (journal && V1J_PROMPT_MATERIALIZATION_STAGES.has(event.stage)) {
-        const differingPaths = previousMaterializationTrace
-          ? diffPromptMaterializationSnapshots(previousMaterializationTrace, summary)
+        const previousTrace = previousMaterializationBoundary?.trace;
+        const differingPaths = previousTrace
+          ? diffPromptMaterializationSnapshots(previousTrace, summary)
           : [];
         const materializationContent = event.messages.map((message) => {
           const row =
@@ -8468,29 +8474,41 @@ async function runOne(input: {
               : {};
           return {
             role: typeof row.role === "string" ? row.role : null,
-            content: typeof row.content === "string" ? row.content : "",
+            content: typeof row.content === "string" ? row.content : null,
           };
         });
-        const contentDeltas = previousMaterializationContent
-          ? summarizeV1JPromptMessageContentDeltas(
-              previousMaterializationContent,
-              materializationContent,
-            )
-          : [];
+        const contentBoundary: V1JPromptMaterializationBoundary = {
+          stage: event.stage as V1JPromptMaterializationBoundary["stage"],
+          identity: {
+            runOneAttemptId: runId,
+            embeddedRunId,
+            sessionIdSha256,
+            promptSubmissionIndex: promptSubmissionTraceIndex,
+            modelLoopIterationIndex: currentProviderPayloadTraceIndex || promptSubmissionTraceIndex,
+          },
+          messages: materializationContent.map((message, index) => ({ ...message, index })),
+        };
+        const deltaPairing = diffV1JPromptMaterializationBoundaries(
+          previousMaterializationBoundary?.content,
+          contentBoundary,
+        );
         const systemMessage = materializationContent.find((message) => message.role === "system");
         journal.record("prompt-materialization-boundary", {
           materializationRequestIndex,
-          previousStage: previousMaterializationTrace?.stage ?? null,
+          previousStage: previousTrace?.stage ?? null,
           stage: event.stage,
-          firstDivergentStage:
-            previousMaterializationTrace && differingPaths.length > 0 ? event.stage : null,
+          firstDivergentStage: previousTrace && differingPaths.length > 0 ? event.stage : null,
           differingPaths,
           source: summary.source,
           messageArrayIdentity: summary.messageArrayIdentity,
           systemPromptFingerprint: summary.systemPromptFingerprint ?? null,
           materializationFactors: summary.materializationFactors ?? null,
           messageCount: summary.messageCount,
-          contentDeltas,
+          contentDeltaPairing: {
+            ...deltaPairing,
+            identity: contentBoundary.identity,
+          },
+          contentDeltas: deltaPairing.deltas,
           systemPromptSections: fingerprintV1JSystemPromptSections({
             providerSystemMessage: systemMessage?.content,
           }),
@@ -8513,8 +8531,7 @@ async function runOne(input: {
             }),
           ),
         });
-        previousMaterializationTrace = summary;
-        previousMaterializationContent = materializationContent;
+        previousMaterializationBoundary = { trace: summary, content: contentBoundary };
       }
       const transcriptStages = new Set([
         "prompt-submit-enter",

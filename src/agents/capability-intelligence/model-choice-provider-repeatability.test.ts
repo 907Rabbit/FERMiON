@@ -12,7 +12,6 @@ import {
   fingerprintV1JSystemPromptParagraphs,
   fingerprintV1JSystemPromptSections,
   summarizeV1JPromptContentDelta,
-  summarizeV1JPromptMessageContentDeltas,
 } from "../../../test/helpers/agents/model-choice-prompt-content-delta.js";
 import {
   V1J_PROVIDER_CONTROL_MODEL_CONFIG_SHA256,
@@ -163,17 +162,29 @@ describe("v1J raw-only provider repeatability", () => {
     expect(summarizeV1JPromptContentDelta(" tail", "tail").classification).toBe(
       "leading-whitespace-normalization",
     );
-    expect(summarizeV1JPromptContentDelta("e\u0301", "é").classification).toBe(
+    expect(summarizeV1JPromptContentDelta("e\u0301", "\u00e9").classification).toBe(
       "unicode-normalization",
     );
 
-    const messages = summarizeV1JPromptMessageContentDeltas(
-      [{ role: "user", content: "PRIVATE_BEFORE" }],
-      [{ role: "user", content: "PRIVATE_AFTER" }],
-    );
-    expect(messages).toHaveLength(1);
-    expect(JSON.stringify({ append, lineEndings, messages })).not.toContain("PRIVATE_");
-    expect(JSON.stringify({ append, lineEndings, messages })).not.toContain("prompt!");
+    expect(summarizeV1JPromptContentDelta("abc", "axc")).toMatchObject({
+      classification: "byte-content-change",
+      beforeBytes: 3,
+      afterBytes: 3,
+      substitutedByteCount: 1,
+      insertedByteCount: 0,
+      deletedByteCount: 0,
+    });
+    expect(summarizeV1JPromptContentDelta("tail", "!tail")).toMatchObject({
+      prefixCommonBytes: 0,
+      suffixCommonBytes: 4,
+      insertedByteCount: 1,
+      deletedByteCount: 0,
+    });
+    expect(summarizeV1JPromptContentDelta("prompt!", "prompt")).toMatchObject({
+      deletedByteCount: 1,
+      insertedByteCount: 0,
+    });
+    expect(JSON.stringify({ append, lineEndings })).not.toContain("prompt!");
   });
 
   it("localizes system prompt section drift by named section fingerprint", () => {

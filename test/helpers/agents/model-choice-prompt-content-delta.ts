@@ -32,14 +32,58 @@ export type V1JPromptContentDelta = {
 
 export type V1JPromptMessageContent = {
   role: string | null;
-  content: string;
+  content: string | null;
 };
 
-export type V1JPromptMessageContentDelta = {
-  index: number;
-  beforeRole: string | null;
-  afterRole: string | null;
-  delta: V1JPromptContentDelta;
+export const V1J_PROMPT_MATERIALIZATION_BOUNDARY_ORDER = [
+  "prompt-context-built",
+  "prompt-submit-enter",
+  "prompt-history-normalized",
+  "model-prompt-transform-enter",
+  "model-prompt-transform-complete",
+  "agent-llm-boundary-input",
+  "agent-llm-boundary-normalized",
+  "agent-llm-boundary-relocated",
+  "agent-llm-boundary-converted",
+  "provider-adapter-input",
+  "provider-message-conversion-input",
+  "provider-message-conversion-output",
+  "provider-request-object-constructed",
+  "provider-onPayload-transform-enter",
+] as const;
+
+export type V1JPromptMaterializationBoundary = {
+  stage: (typeof V1J_PROMPT_MATERIALIZATION_BOUNDARY_ORDER)[number];
+  identity: {
+    runOneAttemptId: string;
+    embeddedRunId: string | null;
+    sessionIdSha256: string | null;
+    promptSubmissionIndex: number;
+    modelLoopIterationIndex: number;
+  };
+  messages: readonly (V1JPromptMessageContent & { index: number })[];
+};
+
+export type V1JPromptMaterializationContentDelta = {
+  sourceBoundary: string | null;
+  destinationBoundary: string;
+  role: string | null;
+  ordinalWithinRole: number;
+  beforeIndex: number | null;
+  afterIndex: number | null;
+  pairingStatus: "PAIRED" | "DELTA_PAIRING_UNAVAILABLE";
+  pairingReason?: string;
+  beforeContentSha256?: string;
+  afterContentSha256?: string;
+  delta?: V1JPromptContentDelta;
+};
+
+export type V1JPromptMaterializationDeltaSummary = {
+  pairingStatus: "PAIRED" | "DELTA_PAIRING_UNAVAILABLE";
+  sourceBoundary: string | null;
+  destinationBoundary: string;
+  pairingReason?: string;
+  deltas: V1JPromptMaterializationContentDelta[];
 };
 
 export type V1JPromptSectionFingerprint = {
@@ -158,31 +202,194 @@ export function summarizeV1JPromptContentDelta(
   };
 }
 
-export function summarizeV1JPromptMessageContentDeltas(
-  before: readonly V1JPromptMessageContent[],
-  after: readonly V1JPromptMessageContent[],
-): V1JPromptMessageContentDelta[] {
-  const changes: V1JPromptMessageContentDelta[] = [];
-  const count = Math.max(before.length, after.length);
-  for (let index = 0; index < count; index += 1) {
-    const previous = before[index];
-    const current = after[index];
-    if (
-      previous &&
-      current &&
-      previous.content === current.content &&
-      previous.role === current.role
-    ) {
+function roleOrdinals(messages: V1JPromptMaterializationBoundary["messages"]) {
+  const counts = new Map<string, number>();
+  return messages.map((message) => {
+    if (message.role === null) {
+      return { message, ordinalWithinRole: message.index };
+    }
+    const ordinalWithinRole = counts.get(message.role) ?? 0;
+    counts.set(message.role, ordinalWithinRole + 1);
+    return { message, ordinalWithinRole };
+  });
+}
+
+function sameMaterializationIdentity(
+  left: V1JPromptMaterializationBoundary["identity"],
+  right: V1JPromptMaterializationBoundary["identity"],
+): boolean {
+  return (
+    left.runOneAttemptId === right.runOneAttemptId &&
+    left.embeddedRunId === right.embeddedRunId &&
+    left.sessionIdSha256 === right.sessionIdSha256 &&
+    left.promptSubmissionIndex === right.promptSubmissionIndex &&
+    left.modelLoopIterationIndex === right.modelLoopIterationIndex
+  );
+}
+
+function roleCounts(messages: V1JPromptMaterializationBoundary["messages"]): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const message of messages) {
+    if (message.role !== null) {
+      counts.set(message.role, (counts.get(message.role) ?? 0) + 1);
+    }
+  }
+  return counts;
+}
+
+/** Pairs only adjacent snapshots from the same run and role-relative message identity. */
+export function diffV1JPromptMaterializationBoundaries(
+  previous: V1JPromptMaterializationBoundary | undefined,
+  current: V1JPromptMaterializationBoundary,
+): V1JPromptMaterializationDeltaSummary {
+  const sourceBoundary = previous?.stage ?? null;
+  const destinationBoundary = current.stage;
+  const sourceIndex = previous
+    ? V1J_PROMPT_MATERIALIZATION_BOUNDARY_ORDER.indexOf(previous.stage)
+    : -1;
+  const destinationIndex = V1J_PROMPT_MATERIALIZATION_BOUNDARY_ORDER.indexOf(current.stage);
+  const unavailableReason = !previous
+    ? "no-adjacent-boundary-predecessor"
+    : !sameMaterializationIdentity(previous.identity, current.identity)
+      ? "materialization-identity-mismatch"
+      : destinationIndex !== sourceIndex + 1
+        ? "predecessor-is-not-adjacent-boundary"
+        : undefined;
+
+  if (!previous || unavailableReason) {
+    return {
+      pairingStatus: "DELTA_PAIRING_UNAVAILABLE",
+      sourceBoundary,
+      destinationBoundary,
+      pairingReason: unavailableReason,
+      deltas: roleOrdinals(current.messages).map(({ message, ordinalWithinRole }) => ({
+        sourceBoundary,
+        destinationBoundary,
+        role: message.role,
+        ordinalWithinRole,
+        beforeIndex: null,
+        afterIndex: message.index,
+        pairingStatus: "DELTA_PAIRING_UNAVAILABLE",
+        pairingReason: unavailableReason,
+      })),
+    };
+  }
+
+  const beforeByIdentity = new Map(
+    roleOrdinals(previous.messages).map(({ message, ordinalWithinRole }) => [
+      `${message.role ?? "<unknown>"}\u0000${ordinalWithinRole}`,
+      { message, ordinalWithinRole },
+    ]),
+  );
+  const afterByIdentity = new Map(
+    roleOrdinals(current.messages).map(({ message, ordinalWithinRole }) => [
+      `${message.role ?? "<unknown>"}\u0000${ordinalWithinRole}`,
+      { message, ordinalWithinRole },
+    ]),
+  );
+  const beforeRoleCounts = roleCounts(previous.messages);
+  const afterRoleCounts = roleCounts(current.messages);
+  const deltas: V1JPromptMaterializationContentDelta[] = [];
+  for (const [key, before] of beforeByIdentity) {
+    const after = afterByIdentity.get(key);
+    if (!after) {
+      deltas.push({
+        sourceBoundary,
+        destinationBoundary,
+        role: before.message.role,
+        ordinalWithinRole: before.ordinalWithinRole,
+        beforeIndex: before.message.index,
+        afterIndex: null,
+        pairingStatus: "DELTA_PAIRING_UNAVAILABLE",
+        pairingReason: "message-identity-missing-at-destination",
+      });
       continue;
     }
-    changes.push({
-      index,
-      beforeRole: previous?.role ?? null,
-      afterRole: current?.role ?? null,
-      delta: summarizeV1JPromptContentDelta(previous?.content ?? "", current?.content ?? ""),
+    if (
+      before.message.role !== null &&
+      beforeRoleCounts.get(before.message.role) !== afterRoleCounts.get(before.message.role)
+    ) {
+      deltas.push({
+        sourceBoundary,
+        destinationBoundary,
+        role: before.message.role,
+        ordinalWithinRole: before.ordinalWithinRole,
+        beforeIndex: before.message.index,
+        afterIndex: after.message.index,
+        pairingStatus: "DELTA_PAIRING_UNAVAILABLE",
+        pairingReason: "message-role-counts-changed",
+      });
+      continue;
+    }
+    if (before.message.role === null || after.message.role === null) {
+      deltas.push({
+        sourceBoundary,
+        destinationBoundary,
+        role: null,
+        ordinalWithinRole: before.ordinalWithinRole,
+        beforeIndex: before.message.index,
+        afterIndex: after.message.index,
+        pairingStatus: "DELTA_PAIRING_UNAVAILABLE",
+        pairingReason: "message-role-unavailable",
+      });
+      continue;
+    }
+    if (before.message.content === null || after.message.content === null) {
+      deltas.push({
+        sourceBoundary,
+        destinationBoundary,
+        role: after.message.role,
+        ordinalWithinRole: after.ordinalWithinRole,
+        beforeIndex: before.message.index,
+        afterIndex: after.message.index,
+        pairingStatus: "DELTA_PAIRING_UNAVAILABLE",
+        pairingReason: "message-content-is-not-a-string",
+      });
+      continue;
+    }
+    if (before.message.content === after.message.content) {
+      continue;
+    }
+    deltas.push({
+      sourceBoundary,
+      destinationBoundary,
+      role: after.message.role,
+      ordinalWithinRole: after.ordinalWithinRole,
+      beforeIndex: before.message.index,
+      afterIndex: after.message.index,
+      pairingStatus: "PAIRED",
+      beforeContentSha256: sha256(Buffer.from(before.message.content, "utf8")),
+      afterContentSha256: sha256(Buffer.from(after.message.content, "utf8")),
+      delta: summarizeV1JPromptContentDelta(before.message.content, after.message.content),
     });
   }
-  return changes;
+  for (const [key, after] of afterByIdentity) {
+    if (beforeByIdentity.has(key)) {
+      continue;
+    }
+    deltas.push({
+      sourceBoundary,
+      destinationBoundary,
+      role: after.message.role,
+      ordinalWithinRole: after.ordinalWithinRole,
+      beforeIndex: null,
+      afterIndex: after.message.index,
+      pairingStatus: "DELTA_PAIRING_UNAVAILABLE",
+      pairingReason: "message-identity-missing-at-source",
+    });
+  }
+  const pairingStatus = deltas.some((entry) => entry.pairingStatus !== "PAIRED")
+    ? "DELTA_PAIRING_UNAVAILABLE"
+    : "PAIRED";
+  return {
+    pairingStatus,
+    sourceBoundary,
+    destinationBoundary,
+    ...(pairingStatus === "DELTA_PAIRING_UNAVAILABLE"
+      ? { pairingReason: "one-or-more-message-identities-could-not-be-paired" }
+      : {}),
+    deltas,
+  };
 }
 
 /** Fingerprints named system-prompt inputs without retaining their text. */

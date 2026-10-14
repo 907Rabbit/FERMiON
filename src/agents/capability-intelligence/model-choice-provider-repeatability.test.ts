@@ -13,11 +13,11 @@ import {
   assertV1JRawRepeatabilityPreflight,
   createV1JRawRepeatabilityJournal,
   readV1JProviderBoundBodyArtifact,
+  publishAndVerifyV1JProviderBoundBodyArtifact,
   runV1JRawRepeatabilityFromArtifact,
   runV1JPreflightWithHeartbeat,
   runV1JRawRepeatabilityTransport,
   summarizeV1JRawRepeatabilityRequest,
-  writeV1JProviderBoundBodyArtifact,
   V1J_RAW_REPEATABILITY_AUTHORIZED_FLAG,
   V1J_RAW_REPEATABILITY_CAPTURE_COMMIT_FLAG,
   V1J_RAW_REPEATABILITY_COMMIT_FLAG,
@@ -65,9 +65,10 @@ function makeCapture(): V1JRawRepeatabilityCapture {
 function exportProviderBoundBody(repoRoot: string, sourceCommit = captureCommit) {
   const capture = makeCapture();
   const summary = summarizeV1JRawRepeatabilityRequest(capture);
-  const exported = writeV1JProviderBoundBodyArtifact({
+  const exported = publishAndVerifyV1JProviderBoundBodyArtifact({
     repoRoot,
     captureCommit: sourceCommit,
+    endpoint: capture.endpoint,
     provider: "lmstudio",
     model: "qwen/qwen3.5-9b",
     rawBody: capture.rawBody,
@@ -211,6 +212,24 @@ describe("v1J raw-only provider repeatability", () => {
           expectedCanonicalRequestSha256: summary.requestCanonicalSha256,
         }),
       ).toThrow(/raw-byte integrity/);
+    } finally {
+      fs.rmSync(repoRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("does not return publication metadata until the exact published bytes are verified", () => {
+    const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), "v1j-provider-body-publish-verify-"));
+    try {
+      const { capture, summary, exported } = exportProviderBoundBody(repoRoot);
+      const verified = readV1JProviderBoundBodyArtifact({
+        repoRoot,
+        captureCommit,
+        endpoint: capture.endpoint,
+        expectedCanonicalRequestSha256: summary.requestCanonicalSha256,
+      });
+      expect(verified.capture.rawBody).toBe(capture.rawBody);
+      expect(verified.metadata).toEqual(exported.metadata);
+      expect(verified.artifactRoot).toBe(exported.artifactRoot);
     } finally {
       fs.rmSync(repoRoot, { recursive: true, force: true });
     }

@@ -169,6 +169,39 @@ export function readV1JProviderBoundBodyArtifact(input: {
   };
 }
 
+export function publishAndVerifyV1JProviderBoundBodyArtifact(input: {
+  repoRoot: string;
+  captureCommit: string;
+  endpoint: string;
+  provider: string;
+  model: string;
+  rawBody: string;
+  expectedCanonicalRequestSha256: string;
+}): { artifactRoot: string; metadata: V1JProviderBoundBodyMetadata } {
+  const published = writeV1JProviderBoundBodyArtifact(input);
+  const verified = readV1JProviderBoundBodyArtifact({
+    repoRoot: input.repoRoot,
+    captureCommit: input.captureCommit,
+    endpoint: input.endpoint,
+    expectedCanonicalRequestSha256: input.expectedCanonicalRequestSha256,
+  });
+  if (
+    verified.artifactRoot !== published.artifactRoot ||
+    verified.capture.rawBody !== input.rawBody ||
+    verified.metadata.bodyBytes !== published.metadata.bodyBytes ||
+    verified.metadata.rawBodySha256 !== published.metadata.rawBodySha256 ||
+    verified.metadata.canonicalRequestSha256 !== published.metadata.canonicalRequestSha256 ||
+    verified.metadata.messageCount !== published.metadata.messageCount ||
+    verified.metadata.toolCount !== published.metadata.toolCount ||
+    verified.metadata.captureCommit !== published.metadata.captureCommit ||
+    verified.metadata.provider !== published.metadata.provider ||
+    verified.metadata.model !== published.metadata.model
+  ) {
+    throw new Error("v1J provider-bound body publication verification failed");
+  }
+  return published;
+}
+
 export async function runV1JPreflightWithHeartbeat<T>(input: {
   operation: () => Promise<T>;
   stage: () => string;

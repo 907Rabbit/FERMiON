@@ -83,11 +83,11 @@ import {
 import {
   assertV1JRawRepeatabilityPreflight,
   createV1JRawRepeatabilityJournal,
+  publishAndVerifyV1JProviderBoundBodyArtifact,
   runV1JPreflightWithHeartbeat,
   runV1JRawRepeatabilityTransport,
   readV1JProviderBoundBodyArtifact,
   summarizeV1JRawRepeatabilityRequest,
-  writeV1JProviderBoundBodyArtifact,
   V1J_PROVIDER_BOUND_REQUEST_CANONICAL_SHA256,
   V1J_PROVIDER_BOUND_BODY_PARENT,
   V1J_RAW_REPEATABILITY_AUTHORIZED_FLAG,
@@ -2879,8 +2879,7 @@ describeV1JProviderCapturePreflight("v1J provider-bound capture preflight only",
       let preflightStage = "lmstudio-discovery";
       let providerBoundCaptureCount = 0;
       let requestSummary: ReturnType<typeof summarizeV1JRawRepeatabilityRequest> | undefined;
-      let capturedRawBody: string | undefined;
-      let bodyArtifact: ReturnType<typeof writeV1JProviderBoundBodyArtifact> | undefined;
+      let bodyArtifact: ReturnType<typeof publishAndVerifyV1JProviderBoundBodyArtifact> | undefined;
       const providerCaptureStages: string[] = [];
       const callbackStageStartedAt = new Map<string, string>();
       const recordCaptureStage = (event: V1JProviderControlEvent) => {
@@ -3013,7 +3012,34 @@ describeV1JProviderCapturePreflight("v1J provider-bound capture preflight only",
                   { endpoint: request.url, rawBody, requestObject: request.body },
                   recordCaptureStage,
                 );
-                capturedRawBody = rawBody;
+                bodyArtifact = publishAndVerifyV1JProviderBoundBodyArtifact({
+                  repoRoot,
+                  captureCommit: head,
+                  endpoint: request.url,
+                  provider: protocol.model.provider,
+                  model: protocol.model.id,
+                  rawBody,
+                  expectedCanonicalRequestSha256: V1J_PROVIDER_BOUND_REQUEST_CANONICAL_SHA256,
+                });
+                if (
+                  bodyArtifact.metadata.bodyBytes !== requestSummary.requestJsonBytes ||
+                  bodyArtifact.metadata.canonicalRequestSha256 !==
+                    requestSummary.requestCanonicalSha256
+                ) {
+                  throw new Error(
+                    "v1J provider-bound body export metadata differs from captured request",
+                  );
+                }
+                journal.record("provider-bound-body-export-complete", {
+                  captureCommit: bodyArtifact.metadata.captureCommit,
+                  bodyBytes: bodyArtifact.metadata.bodyBytes,
+                  rawBodySha256: bodyArtifact.metadata.rawBodySha256,
+                  canonicalRequestSha256: bodyArtifact.metadata.canonicalRequestSha256,
+                  messageCount: bodyArtifact.metadata.messageCount,
+                  toolCount: bodyArtifact.metadata.toolCount,
+                  provider: bodyArtifact.metadata.provider,
+                  model: bodyArtifact.metadata.model,
+                });
                 recordCallbackJournalEvent("capture-record-build-complete", {
                   awaited: false,
                   stageName: "capture-record-build",
@@ -3064,33 +3090,15 @@ describeV1JProviderCapturePreflight("v1J provider-bound capture preflight only",
         if (fs.existsSync(formalRoot) || fs.existsSync(normalSmokeRoot)) {
           throw new Error("v1J provider capture preflight observed formal or smoke state");
         }
-        if (!capturedRawBody || !requestSummary) {
-          throw new Error("v1J provider-bound body was not available after preflight completion");
+        if (!bodyArtifact || !requestSummary) {
+          throw new Error("v1J provider-bound body was not verified before preflight stop");
         }
-        bodyArtifact = writeV1JProviderBoundBodyArtifact({
-          repoRoot,
-          captureCommit: head,
-          provider: protocol.model.provider,
-          model: protocol.model.id,
-          rawBody: capturedRawBody,
-          expectedCanonicalRequestSha256: V1J_PROVIDER_BOUND_REQUEST_CANONICAL_SHA256,
-        });
         if (
           bodyArtifact.metadata.bodyBytes !== requestSummary.requestJsonBytes ||
           bodyArtifact.metadata.canonicalRequestSha256 !== requestSummary.requestCanonicalSha256
         ) {
-          throw new Error("v1J provider-bound body export metadata differs from captured request");
+          throw new Error("v1J provider-bound body metadata changed after callback verification");
         }
-        journal.record("provider-bound-body-export-complete", {
-          captureCommit: bodyArtifact.metadata.captureCommit,
-          bodyBytes: bodyArtifact.metadata.bodyBytes,
-          rawBodySha256: bodyArtifact.metadata.rawBodySha256,
-          canonicalRequestSha256: bodyArtifact.metadata.canonicalRequestSha256,
-          messageCount: bodyArtifact.metadata.messageCount,
-          toolCount: bodyArtifact.metadata.toolCount,
-          provider: bodyArtifact.metadata.provider,
-          model: bodyArtifact.metadata.model,
-        });
         journal.record("provider-capture-preflight-complete", {
           ...counters,
           authorizedToolCount: surface.authorizedToolCount,
@@ -5123,9 +5131,10 @@ describe("v1J schema-capture dispatch guard", () => {
           toolCount: 15,
           requestJsonBytes: Buffer.byteLength(requestBody),
         });
-        const exported = writeV1JProviderBoundBodyArtifact({
+        const exported = publishAndVerifyV1JProviderBoundBodyArtifact({
           repoRoot,
           captureCommit: commit,
+          endpoint: request.url,
           provider: "lmstudio",
           model: MODEL_ID,
           rawBody,
@@ -5134,6 +5143,7 @@ describe("v1J schema-capture dispatch guard", () => {
         exportedBodyPath = path.join(exported.artifactRoot, "request-body.bin");
         expect(exported.metadata.rawBodySha256).toBe(summary.requestSha256);
         expect(exported.metadata.canonicalRequestSha256).toBe(summary.requestCanonicalSha256);
+        events.push({ event: "provider-bound-body-published-and-verified" });
         events.push({ event: "capture-record-build-complete" });
         journal.record("capture-record-build-complete", summary);
       },
@@ -5172,6 +5182,7 @@ describe("v1J schema-capture dispatch guard", () => {
         "capture-record-build-start",
         "request-canonicalization-start",
         "request-canonicalization-complete",
+        "provider-bound-body-published-and-verified",
         "capture-record-build-complete",
         "callback-return-or-throw",
         "provider-bound-request-captured",
@@ -5190,7 +5201,21 @@ describe("v1J schema-capture dispatch guard", () => {
         awaited: true,
         awaitTargetClass: "onProviderRequestBeforeDispatch",
       });
-      expect(events[10]?.details).toMatchObject({ phase: "return", awaited: true });
+      const publishIndex = events.findIndex(
+        (event) => event.event === "provider-bound-body-published-and-verified",
+      );
+      const callbackReturnIndex = events.findIndex(
+        (event) =>
+          event.event === "callback-return-or-throw" &&
+          event.details?.phase === "return" &&
+          event.details.awaited === true,
+      );
+      const stopSignalIndex = events.findIndex(
+        (event) => event.event === "preflight-stop-signal-raised",
+      );
+      expect(publishIndex).toBeGreaterThan(-1);
+      expect(publishIndex).toBeLessThan(callbackReturnIndex);
+      expect(callbackReturnIndex).toBeLessThan(stopSignalIndex);
       expect(JSON.stringify(events)).not.toContain(privateText);
       expect(events.map((event) => event.event)).not.toContain("tool-execution-started");
       expect(journal.counters()).toMatchObject({
@@ -5210,6 +5235,89 @@ describe("v1J schema-capture dispatch guard", () => {
     } finally {
       capture.restore();
       journal.close();
+      fs.rmSync(repoRoot, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    "canonical mismatch",
+    "artifact publication failure",
+    "published-byte verification failure",
+  ])("%s fails inside the provider-bound callback before any stop or dispatch", async (failure) => {
+    const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), "v1j-provider-body-callback-failure-"));
+    const commit = "6".repeat(40);
+    const artifactRoot = path.join(repoRoot, V1J_PROVIDER_BOUND_BODY_PARENT, commit);
+    const requestBody = JSON.stringify({
+      model: MODEL_ID,
+      messages: [{ role: "user", content: "private callback failure prompt" }],
+      tools: Array.from({ length: 15 }, (_, index) => ({
+        type: "function",
+        function: { name: `tool-${index}`, parameters: { type: "object" } },
+      })),
+      stream: true,
+    });
+    const requestObject = JSON.parse(requestBody) as Record<string, unknown>;
+    const requestSummary = summarizeV1JRawRepeatabilityRequest({
+      endpoint: `${LM_STUDIO_BASE_URL}/chat/completions`,
+      rawBody: requestBody,
+      requestObject,
+    });
+    if (failure === "artifact publication failure") {
+      fs.mkdirSync(artifactRoot, { recursive: true });
+    }
+
+    const originalReadFileSync = fs.readFileSync.bind(fs);
+    const readSpy =
+      failure === "published-byte verification failure"
+        ? vi.spyOn(fs, "readFileSync").mockImplementation((filePath, options) => {
+            if (typeof filePath === "string" && path.basename(filePath) === "request-body.bin") {
+              return Buffer.from("tampered body") as never;
+            }
+            return originalReadFileSync(filePath as never, options as never);
+          })
+        : undefined;
+    const events: V1JProviderControlEvent[] = [];
+    let callbackReturned = false;
+    let rawRequests = 0;
+    const capture = captureModelPayloads(undefined, {
+      stopAfterProviderBoundCapture: true,
+      onProviderCaptureStage: (event) => events.push(event),
+      onProviderRequestBeforeDispatch: ({ request, rawBody }) => {
+        publishAndVerifyV1JProviderBoundBodyArtifact({
+          repoRoot,
+          captureCommit: commit,
+          endpoint: request.url,
+          provider: "lmstudio",
+          model: MODEL_ID,
+          rawBody,
+          expectedCanonicalRequestSha256:
+            failure === "canonical mismatch"
+              ? "0".repeat(64)
+              : requestSummary.requestCanonicalSha256,
+        });
+        callbackReturned = true;
+      },
+    });
+    try {
+      await expect(
+        capture.wrapFetch(async () => {
+          rawRequests += 1;
+          return new Response("{}");
+        })(`${LM_STUDIO_BASE_URL}/chat/completions`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: requestBody,
+        }),
+      ).rejects.toThrow();
+
+      expect(callbackReturned).toBe(false);
+      expect(capture.providerDispatchAttempts).toBe(0);
+      expect(capture.delegatedRequests).toBe(0);
+      expect(rawRequests).toBe(0);
+      expect(events.map((event) => event.event)).not.toContain("preflight-stop-signal-raised");
+    } finally {
+      readSpy?.mockRestore();
+      capture.restore();
       fs.rmSync(repoRoot, { recursive: true, force: true });
     }
   });

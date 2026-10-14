@@ -49,6 +49,7 @@ import {
 } from "../../../test/helpers/agents/model-choice-action-initiation.js";
 import {
   compareV1JAdapterDifferentialRequests,
+  fingerprintV1JAdapterDifferentialField,
   assertV1JAdapterDifferentialPreflight,
   assertV1JAdapterDifferentialRequestBudget,
   createV1JAdapterDifferentialJournal,
@@ -1935,6 +1936,7 @@ describeV1JAdapterDifferential("v1J raw-transport versus adapter differential", 
       let adapterDispatches = 0;
       let adapterToolGuard: ReturnType<typeof installV1JAdapterDifferentialToolGuard> | undefined;
       let adapterRequestMatch: ReturnType<typeof compareV1JAdapterDifferentialRequests> | undefined;
+      let adapterRequestCandidateBody: Record<string, unknown> | undefined;
       let adapterPreparedRuntimeReadyAtMs: number | undefined;
       try {
         journal.record("captured-arm-a-request-ready", requestMetrics);
@@ -1987,6 +1989,9 @@ describeV1JAdapterDifferential("v1J raw-transport versus adapter differential", 
               lifecycleJournal: journal,
               onAssistantMessage: () => adapterToolGuard?.ensureInstalled(),
               onRequestCaptured: (request, requestIndex) => {
+                if (requestIndex === 1) {
+                  adapterRequestCandidateBody = structuredClone(request.body);
+                }
                 recordV1JAdapterDifferentialRequestFingerprint({
                   journal,
                   event:
@@ -2041,6 +2046,38 @@ describeV1JAdapterDifferential("v1J raw-transport versus adapter differential", 
                     requestIndex,
                     dispatchOrdinal,
                     differingPath,
+                  });
+                  const rawField = fingerprintV1JAdapterDifferentialField(
+                    controlC.body,
+                    differingPath,
+                  );
+                  const adapterCandidateField = fingerprintV1JAdapterDifferentialField(
+                    adapterRequestCandidateBody ?? {},
+                    differingPath,
+                  );
+                  const adapterWireField = fingerprintV1JAdapterDifferentialField(
+                    request.body,
+                    differingPath,
+                  );
+                  journal.record("adapter-request-difference-provenance", {
+                    requestIndex,
+                    dispatchOrdinal,
+                    differingPath,
+                    rawValueSource: "control-c-clone-of-preflight-arm-a",
+                    adapterCandidateSource: "fresh-execute-v1jcell-request-observer",
+                    adapterWireSource: "provider-fetch-body-pre-dispatch",
+                    rawValuePresent: rawField.present,
+                    rawValueType: rawField.valueType,
+                    rawValueSha256: rawField.valueSha256,
+                    rawValueBytes: rawField.valueBytes,
+                    adapterCandidateValuePresent: adapterCandidateField.present,
+                    adapterCandidateValueType: adapterCandidateField.valueType,
+                    adapterCandidateValueSha256: adapterCandidateField.valueSha256,
+                    adapterCandidateValueBytes: adapterCandidateField.valueBytes,
+                    adapterWireValuePresent: adapterWireField.present,
+                    adapterWireValueType: adapterWireField.valueType,
+                    adapterWireValueSha256: adapterWireField.valueSha256,
+                    adapterWireValueBytes: adapterWireField.valueBytes,
                   });
                 }
                 if (!comparison.canonicalMatch) {
@@ -3476,53 +3513,231 @@ describe("v1J schema-capture dispatch guard", () => {
     }
   });
 
-  it("fails final-request parity before the wrapped provider fetch is invoked", async () => {
-    const mismatch = new Error("final request differs from raw control");
+  it("allows the wrapped provider fetch only after exact canonical parity", async () => {
     const rawControlBody = {
       model: MODEL_ID,
       messages: [{ role: "user", content: "raw control message" }],
       tools: [],
       stream: true,
     };
-    let observedRawBody: string | undefined;
+    let delegatedFetchCalls = 0;
+    let comparison: ReturnType<typeof compareV1JAdapterDifferentialRequests> | undefined;
+    const capture = captureModelPayloads(undefined, {
+      onProviderRequestBeforeDispatch: ({ request, rawBody, requestIndex, dispatchOrdinal }) => {
+        expect(requestIndex).toBe(1);
+        expect(dispatchOrdinal).toBe(1);
+        comparison = compareV1JAdapterDifferentialRequests(rawControlBody, request.body, rawBody);
+        expect(comparison.canonicalMatch).toBe(true);
+      },
+    });
+    try {
+      await capture.wrapFetch(async () => {
+        delegatedFetchCalls += 1;
+        return new Response("{}", { headers: { "content-type": "application/json" } });
+      })(`${LM_STUDIO_BASE_URL}/chat/completions`, {
+        method: "POST",
+        body: JSON.stringify(rawControlBody),
+      });
+      expect(comparison?.canonicalMatch).toBe(true);
+      expect(delegatedFetchCalls).toBe(1);
+      expect(capture.providerDispatchAttempts).toBe(1);
+    } finally {
+      capture.restore();
+    }
+  });
+
+  it.each([
+    {
+      name: "message content",
+      rawBody: {
+        model: MODEL_ID,
+        messages: [{ role: "user", content: "raw private prompt" }],
+        tools: [],
+        stream: true,
+      },
+      adapterBody: {
+        model: MODEL_ID,
+        messages: [{ role: "user", content: "adapter private prompt" }],
+        tools: [],
+        stream: true,
+      },
+      differingPath: "messages.0.content",
+    },
+    {
+      name: "tool choice",
+      rawBody: {
+        model: MODEL_ID,
+        messages: [{ role: "user", content: "same prompt" }],
+        tools: [],
+        stream: true,
+        tool_choice: "auto",
+      },
+      adapterBody: {
+        model: MODEL_ID,
+        messages: [{ role: "user", content: "same prompt" }],
+        tools: [],
+        stream: true,
+        tool_choice: "none",
+      },
+      differingPath: "tool_choice",
+    },
+    {
+      name: "tool schema",
+      rawBody: {
+        model: MODEL_ID,
+        messages: [{ role: "user", content: "same prompt" }],
+        tools: [{ function: { name: "read", parameters: { type: "object" } } }],
+        stream: true,
+      },
+      adapterBody: {
+        model: MODEL_ID,
+        messages: [{ role: "user", content: "same prompt" }],
+        tools: [{ function: { name: "read", parameters: { type: "string" } } }],
+        stream: true,
+      },
+      differingPath: "tools.0.function.parameters.type",
+    },
+  ])("latches a $name parity mismatch before all provider dispatches", async (scenario) => {
+    const mismatch = new Error("final request differs from raw control");
+    const journalRoot = fs.mkdtempSync(path.join(os.tmpdir(), "v1j-adapter-parity-gate-"));
+    const journalHead = "a".repeat(40);
+    const journal = createV1JAdapterDifferentialJournal({
+      repoRoot: journalRoot,
+      harnessCommit: journalHead,
+      modelId: MODEL_ID,
+      modelConfigHash: "2a219399da63b03057ceaf46a9dd1d74e76be20ead626f07af2b8ba45f37c529",
+      schemaFingerprint: {
+        authorizedToolCount: 15,
+        providerToolCount: 15,
+        authorizedToolNameSha256: "b".repeat(64),
+        providerToolNameSha256: "b".repeat(64),
+        authorizedToolSchemaSha256: "c".repeat(64),
+        providerToolSchemaSha256: "d".repeat(64),
+      },
+      startedAt: new Date().toISOString(),
+    });
+    let beforeDispatchCallbacks = 0;
     let delegatedFetchCalls = 0;
     const capture = captureModelPayloads(undefined, {
       onProviderRequestBeforeDispatch: ({ request, rawBody, requestIndex, dispatchOrdinal }) => {
-        observedRawBody = rawBody;
-        expect(requestIndex).toBe(1);
-        expect(dispatchOrdinal).toBe(1);
+        beforeDispatchCallbacks += 1;
+        if (requestIndex !== 1) {
+          return;
+        }
         const comparison = compareV1JAdapterDifferentialRequests(
-          rawControlBody,
+          scenario.rawBody,
           request.body,
           rawBody,
         );
-        expect(comparison.canonicalMatch).toBe(false);
-        expect(comparison.differingPaths).toEqual(["messages.0.content"]);
+        journal.record("adapter-request-parity", {
+          requestIndex,
+          dispatchOrdinal,
+          requestMatch: comparison.requestMatch,
+          canonicalMatch: comparison.canonicalMatch,
+          rawCanonicalRequestSha256: comparison.rawCanonicalRequestSha256,
+          adapterCanonicalRequestSha256: comparison.adapterCanonicalRequestSha256,
+        });
+        for (const differingPath of comparison.differingPaths) {
+          journal.record("adapter-request-difference", {
+            requestIndex,
+            dispatchOrdinal,
+            differingPath,
+          });
+          const rawField = fingerprintV1JAdapterDifferentialField(scenario.rawBody, differingPath);
+          const adapterField = fingerprintV1JAdapterDifferentialField(
+            scenario.adapterBody,
+            differingPath,
+          );
+          journal.record("adapter-request-difference-provenance", {
+            requestIndex,
+            dispatchOrdinal,
+            differingPath,
+            rawValueSource: "control-c-clone-of-preflight-arm-a",
+            adapterCandidateSource: "fresh-execute-v1jcell-request-observer",
+            adapterWireSource: "provider-fetch-body-pre-dispatch",
+            rawValuePresent: rawField.present,
+            rawValueType: rawField.valueType,
+            rawValueSha256: rawField.valueSha256,
+            rawValueBytes: rawField.valueBytes,
+            adapterCandidateValuePresent: adapterField.present,
+            adapterCandidateValueType: adapterField.valueType,
+            adapterCandidateValueSha256: adapterField.valueSha256,
+            adapterCandidateValueBytes: adapterField.valueBytes,
+            adapterWireValuePresent: adapterField.present,
+            adapterWireValueType: adapterField.valueType,
+            adapterWireValueSha256: adapterField.valueSha256,
+            adapterWireValueBytes: adapterField.valueBytes,
+          });
+        }
         if (!comparison.canonicalMatch) {
           throw mismatch;
         }
       },
     });
-    const finalProviderBody = JSON.stringify({
-      ...rawControlBody,
-      messages: [{ role: "user", content: "final transformed message" }],
+    const fetch = capture.wrapFetch(async () => {
+      delegatedFetchCalls += 1;
+      return new Response("{}", { headers: { "content-type": "application/json" } });
+    });
+    const url = `${LM_STUDIO_BASE_URL}/chat/completions`;
+    const initFor = (body: Record<string, unknown>) => ({
+      method: "POST",
+      body: JSON.stringify(body),
     });
     try {
-      await expect(
-        capture.wrapFetch(async () => {
-          delegatedFetchCalls += 1;
-          return new Response("{}", { headers: { "content-type": "application/json" } });
-        })(`${LM_STUDIO_BASE_URL}/chat/completions`, {
-          method: "POST",
-          body: finalProviderBody,
-        }),
-      ).rejects.toBe(mismatch);
-      expect(observedRawBody).toBe(finalProviderBody);
+      await expect(fetch(url, initFor(scenario.adapterBody))).rejects.toBe(mismatch);
+      await expect(fetch(url, initFor(scenario.adapterBody))).rejects.toBe(mismatch);
+
+      expect(beforeDispatchCallbacks).toBe(1);
       expect(delegatedFetchCalls).toBe(0);
       expect(capture.providerDispatchAttempts).toBe(0);
-      expect(capture.delegatedRequests).toBe(0);
+      const persisted = fs.readFileSync(journal.filePath, "utf8");
+      const events = persisted
+        .trim()
+        .split("\n")
+        .map(
+          (line) =>
+            JSON.parse(line) as {
+              event: string;
+              differingPath?: string;
+              rawValueSource?: string;
+              rawValueSha256?: string;
+            },
+        );
+      expect(events.map((event) => event.event)).toEqual([
+        "diagnostic-start",
+        "adapter-request-parity",
+        "adapter-request-difference",
+        "adapter-request-difference-provenance",
+      ]);
+      expect(events[2]?.differingPath).toBe(scenario.differingPath);
+      expect(events[3]).toMatchObject({
+        differingPath: scenario.differingPath,
+        rawValueSource: "control-c-clone-of-preflight-arm-a",
+        rawValueSha256: expect.stringMatching(/^[0-9a-f]{64}$/),
+      });
+      expect(persisted).not.toContain("raw private prompt");
+      expect(persisted).not.toContain("adapter private prompt");
+      expect(
+        fs.existsSync(
+          path.join(
+            journalRoot,
+            "artifacts/capability-intelligence/v1j-action-initiation/real-exact-run1",
+          ),
+        ),
+      ).toBe(false);
+      expect(
+        fs.existsSync(
+          path.join(
+            journalRoot,
+            "artifacts/capability-intelligence/v1j-action-initiation",
+            `smoke-${journalHead}`,
+          ),
+        ),
+      ).toBe(false);
     } finally {
       capture.restore();
+      journal.close();
+      fs.rmSync(journalRoot, { recursive: true, force: true });
     }
   });
 });
@@ -7489,6 +7704,8 @@ function captureModelPayloads(
   let delegatedRequests = 0;
   let providerDispatchAttempts = 0;
   let providerRequestIndex = 0;
+  let providerRequestGateFailed = false;
+  let providerRequestGateError: unknown;
   const originalFetch = globalThis.fetch;
   const wrappedFetches = new WeakSet<typeof globalThis.fetch>();
   const wrapFetch = (baseFetch: typeof globalThis.fetch): typeof globalThis.fetch => {
@@ -7522,6 +7739,9 @@ function captureModelPayloads(
         typeof body === "string" &&
         body.trim().startsWith("{");
       const requestIndex = isProviderRequest ? ++providerRequestIndex : 0;
+      if (isProviderRequest && providerRequestGateFailed) {
+        throw providerRequestGateError;
+      }
       const correlationId = isProviderRequest
         ? `${options?.requestCorrelationId ?? "v1j-request"}:${requestIndex}`
         : undefined;
@@ -7581,12 +7801,18 @@ function captureModelPayloads(
             signal?.addEventListener("abort", () => reject(abortReason(signal)), { once: true });
           });
         }
-        options?.onProviderRequestBeforeDispatch?.({
-          request,
-          rawBody: body,
-          requestIndex,
-          dispatchOrdinal: providerDispatchAttempts + 1,
-        });
+        try {
+          options?.onProviderRequestBeforeDispatch?.({
+            request,
+            rawBody: body,
+            requestIndex,
+            dispatchOrdinal: providerDispatchAttempts + 1,
+          });
+        } catch (error) {
+          providerRequestGateFailed = true;
+          providerRequestGateError = error;
+          throw error;
+        }
       }
       options?.onDelegatedRequest?.();
       delegatedRequests += 1;

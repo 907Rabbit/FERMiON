@@ -70,6 +70,13 @@ export type V1JAdapterDifferentialRequestComparison = {
   differingPaths: string[];
 };
 
+export type V1JAdapterDifferentialFieldFingerprint = {
+  present: boolean;
+  valueType: "missing" | "null" | "array" | "object" | "string" | "number" | "boolean";
+  valueSha256: string | null;
+  valueBytes: number;
+};
+
 export type V1JAdapterDifferentialDispatchContext = {
   preparedRuntimeReadyAtMs?: number;
   schemaPreflightCompletedAtMs: number;
@@ -340,6 +347,56 @@ export function compareV1JAdapterDifferentialRequests(
   };
 }
 
+export function fingerprintV1JAdapterDifferentialField(
+  body: Record<string, unknown>,
+  jsonPath: string,
+): V1JAdapterDifferentialFieldFingerprint {
+  let value: unknown = body;
+  for (const segment of jsonPath.split(".")) {
+    if (Array.isArray(value)) {
+      if (!/^(0|[1-9][0-9]*)$/.test(segment) || !Object.hasOwn(value, segment)) {
+        return { present: false, valueType: "missing", valueSha256: null, valueBytes: 0 };
+      }
+      value = value[Number(segment)];
+      continue;
+    }
+    if (value === null || typeof value !== "object" || !Object.hasOwn(value, segment)) {
+      return { present: false, valueType: "missing", valueSha256: null, valueBytes: 0 };
+    }
+    value = (value as Record<string, unknown>)[segment];
+  }
+  const canonicalValue = canonicalJson(value);
+  let valueType: V1JAdapterDifferentialFieldFingerprint["valueType"];
+  if (value === null) {
+    valueType = "null";
+  } else if (Array.isArray(value)) {
+    valueType = "array";
+  } else {
+    switch (typeof value) {
+      case "string":
+        valueType = "string";
+        break;
+      case "number":
+        valueType = "number";
+        break;
+      case "boolean":
+        valueType = "boolean";
+        break;
+      case "object":
+        valueType = "object";
+        break;
+      default:
+        throw new Error("request field is not JSON serializable");
+    }
+  }
+  return {
+    present: true,
+    valueType,
+    valueSha256: createHash("sha256").update(canonicalValue, "utf8").digest("hex"),
+    valueBytes: Buffer.byteLength(canonicalValue, "utf8"),
+  };
+}
+
 export function recordV1JAdapterDifferentialRequestFingerprint(input: {
   journal: V1JAdapterDifferentialJournal;
   event: string;
@@ -423,6 +480,21 @@ const SAFE_DETAIL_KEYS = new Set([
   "requestMatch",
   "canonicalMatch",
   "differingPath",
+  "rawValueSource",
+  "adapterCandidateSource",
+  "adapterWireSource",
+  "rawValuePresent",
+  "rawValueType",
+  "rawValueSha256",
+  "rawValueBytes",
+  "adapterCandidateValuePresent",
+  "adapterCandidateValueType",
+  "adapterCandidateValueSha256",
+  "adapterCandidateValueBytes",
+  "adapterWireValuePresent",
+  "adapterWireValueType",
+  "adapterWireValueSha256",
+  "adapterWireValueBytes",
   "messageIndex",
   "messageRole",
   "messageContentSha256",

@@ -12,6 +12,7 @@ import {
   assertV1JAdapterDifferentialPreflight,
   compareV1JAdapterDifferentialRequests,
   createV1JAdapterDifferentialJournal,
+  fingerprintV1JAdapterDifferentialField,
   installV1JAdapterDifferentialToolGuard,
   reportV1JAdapterDifferentialProgress,
   runV1JAdapterDifferentialRawTransport,
@@ -158,6 +159,36 @@ describe("v1J adapter differential diagnostics", () => {
     expect(summary.requestSha256).toMatch(/^[0-9a-f]{64}$/);
     expect(summary.messagesCanonicalSha256).toMatch(/^[0-9a-f]{64}$/);
     expect(summary.toolsCanonicalSha256).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it("fingerprints changed fields without retaining their values", () => {
+    const body = {
+      messages: [{ role: "user", content: "private field text" }],
+      tool_choice: "auto",
+      nullable: null,
+    };
+    const messageFingerprint = fingerprintV1JAdapterDifferentialField(body, "messages.0.content");
+    const toolChoiceFingerprint = fingerprintV1JAdapterDifferentialField(body, "tool_choice");
+    const missingFingerprint = fingerprintV1JAdapterDifferentialField(body, "tool_choice.name");
+    const nullFingerprint = fingerprintV1JAdapterDifferentialField(body, "nullable");
+
+    expect(messageFingerprint).toMatchObject({
+      present: true,
+      valueType: "string",
+      valueSha256: expect.stringMatching(/^[0-9a-f]{64}$/),
+      valueBytes: Buffer.byteLength(JSON.stringify("private field text")),
+    });
+    expect(toolChoiceFingerprint.valueType).toBe("string");
+    expect(missingFingerprint).toEqual({
+      present: false,
+      valueType: "missing",
+      valueSha256: null,
+      valueBytes: 0,
+    });
+    expect(nullFingerprint).toMatchObject({ present: true, valueType: "null" });
+    expect(JSON.stringify([messageFingerprint, toolChoiceFingerprint])).not.toContain(
+      "private field text",
+    );
   });
 
   it("accepts canonical key-order parity while reporting wire-byte hashes separately", () => {

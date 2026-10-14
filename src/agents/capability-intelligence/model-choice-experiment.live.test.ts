@@ -395,9 +395,115 @@ function summarizePromptMessageTrace(
         contentObjectIdentity: content && typeof content === "object" ? identity(content) : null,
         contentSha256: sha256V1J(canonicalContent),
         contentLength: typeof content === "string" ? content.length : canonicalContent.length,
+        contentBytes: Buffer.byteLength(
+          typeof content === "string" ? content : canonicalContent,
+          "utf8",
+        ),
+        observedAtStage: event.stage,
+        observedSource: event.source,
+        origin: "unknown",
       };
     }),
   };
+}
+
+function samePromptMessageState(
+  left: ReturnType<typeof summarizePromptMessageTrace>,
+  right: ReturnType<typeof summarizePromptMessageTrace>,
+): boolean {
+  return (
+    left.messageArrayIdentity === right.messageArrayIdentity &&
+    left.messageCount === right.messageCount &&
+    left.messages.every((message, index) => {
+      const current = right.messages[index];
+      return (
+        current?.messageObjectIdentity === message.messageObjectIdentity &&
+        current.contentObjectIdentity === message.contentObjectIdentity &&
+        current.role === message.role &&
+        current.contentSha256 === message.contentSha256 &&
+        current.contentBytes === message.contentBytes
+      );
+    })
+  );
+}
+
+type V1JPreCaptureObserverTrace = {
+  invocationIndex: number;
+  runOneAttemptId: string;
+  embeddedRunId: string | null;
+  sessionIdSha256: string | null;
+  promptSubmissionIndex: number;
+  modelLoopIterationIndex: number;
+  precedingModelTurnIndex: number | null;
+  messageArrayIdentity: number;
+  messageCount: number;
+  messageFingerprint: string;
+  nestedObserverReentry: boolean;
+};
+
+type V1JPreCaptureTranscriptGrowth = {
+  promptSubmissionIndex: number;
+  modelLoopIterationIndex: number;
+  precedingModelTurnIndex: number | null;
+  transcriptArrayReused: boolean;
+  transcriptLengthBefore: number;
+  transcriptLengthAfter: number;
+  appendedMessages: Array<{ index: number; role: string | null; contentSha256: string }>;
+};
+
+type V1JPreCaptureReentryClass =
+  | "single-observation"
+  | "nested-observer-reentry"
+  | "same-iteration-shared-array-mutation"
+  | "independent-prompt-build-pass"
+  | "new-model-loop-iteration-with-transcript-growth"
+  | "new-model-loop-iteration"
+  | "repeated-request-build-pass"
+  | "separate-run-or-session";
+
+function classifyV1JPreCaptureReentry(input: {
+  observers: readonly V1JPreCaptureObserverTrace[];
+  transcriptGrowth: readonly V1JPreCaptureTranscriptGrowth[];
+}): V1JPreCaptureReentryClass {
+  if (input.observers.some((observer) => observer.nestedObserverReentry)) {
+    return "nested-observer-reentry";
+  }
+  if (input.observers.length < 2) {
+    return "single-observation";
+  }
+  const first = input.observers[0]!;
+  const second = input.observers[1]!;
+  if (
+    first.runOneAttemptId !== second.runOneAttemptId ||
+    first.embeddedRunId !== second.embeddedRunId ||
+    first.sessionIdSha256 !== second.sessionIdSha256
+  ) {
+    return "separate-run-or-session";
+  }
+  if (
+    first.modelLoopIterationIndex === second.modelLoopIterationIndex &&
+    first.messageArrayIdentity === second.messageArrayIdentity &&
+    (first.messageCount !== second.messageCount ||
+      first.messageFingerprint !== second.messageFingerprint)
+  ) {
+    return "same-iteration-shared-array-mutation";
+  }
+  if (first.promptSubmissionIndex !== second.promptSubmissionIndex) {
+    return "independent-prompt-build-pass";
+  }
+  if (first.modelLoopIterationIndex !== second.modelLoopIterationIndex) {
+    const hasTranscriptGrowth = input.transcriptGrowth.some(
+      (growth) =>
+        growth.promptSubmissionIndex === second.promptSubmissionIndex &&
+        growth.modelLoopIterationIndex >= first.modelLoopIterationIndex &&
+        growth.modelLoopIterationIndex < second.modelLoopIterationIndex &&
+        growth.appendedMessages.length > 0,
+    );
+    return hasTranscriptGrowth
+      ? "new-model-loop-iteration-with-transcript-growth"
+      : "new-model-loop-iteration";
+  }
+  return "repeated-request-build-pass";
 }
 
 type V1JCanonicalSchemaCaptureName = "capture-1" | "capture-2" | "arm-a" | "arm-c";
@@ -2327,6 +2433,124 @@ describeV1JAdapterDifferential("v1J raw-transport versus adapter differential", 
   );
 });
 
+describe("v1J pre-capture re-entry trace", () => {
+  const observer = (
+    overrides: Partial<V1JPreCaptureObserverTrace> = {},
+  ): V1JPreCaptureObserverTrace => ({
+    invocationIndex: 1,
+    runOneAttemptId: "attempt-a",
+    embeddedRunId: "embedded-a",
+    sessionIdSha256: "a".repeat(64),
+    promptSubmissionIndex: 1,
+    modelLoopIterationIndex: 1,
+    precedingModelTurnIndex: null,
+    messageArrayIdentity: 10,
+    messageCount: 2,
+    messageFingerprint: "a".repeat(64),
+    nestedObserverReentry: false,
+    ...overrides,
+  });
+
+  it.each([
+    {
+      name: "same iteration mutates the observed request array",
+      observers: [
+        observer(),
+        observer({ invocationIndex: 2, messageCount: 4, messageFingerprint: "b".repeat(64) }),
+      ],
+      transcriptGrowth: [],
+      expected: "same-iteration-shared-array-mutation",
+    },
+    {
+      name: "a new model-loop iteration follows transcript growth",
+      observers: [
+        observer(),
+        observer({
+          invocationIndex: 2,
+          modelLoopIterationIndex: 2,
+          messageArrayIdentity: 20,
+          messageCount: 4,
+        }),
+      ],
+      transcriptGrowth: [
+        {
+          promptSubmissionIndex: 1,
+          modelLoopIterationIndex: 1,
+          precedingModelTurnIndex: 0,
+          transcriptArrayReused: true,
+          transcriptLengthBefore: 1,
+          transcriptLengthAfter: 3,
+          appendedMessages: [
+            { index: 1, role: "assistant", contentSha256: "b".repeat(64) },
+            { index: 2, role: "toolResult", contentSha256: "c".repeat(64) },
+          ],
+        },
+      ],
+      expected: "new-model-loop-iteration-with-transcript-growth",
+    },
+    {
+      name: "a second prompt build is distinguished from another loop iteration",
+      observers: [observer(), observer({ invocationIndex: 2, promptSubmissionIndex: 2 })],
+      transcriptGrowth: [],
+      expected: "independent-prompt-build-pass",
+    },
+    {
+      name: "a distinct attempt or session is not merged with the first observation",
+      observers: [observer(), observer({ invocationIndex: 2, runOneAttemptId: "attempt-b" })],
+      transcriptGrowth: [],
+      expected: "separate-run-or-session",
+    },
+    {
+      name: "a second request build in the same iteration stays distinct",
+      observers: [observer(), observer({ invocationIndex: 2, messageArrayIdentity: 20 })],
+      transcriptGrowth: [],
+      expected: "repeated-request-build-pass",
+    },
+    {
+      name: "nested observer entry is marked as instrumentation re-entry",
+      observers: [observer(), observer({ invocationIndex: 2, nestedObserverReentry: true })],
+      transcriptGrowth: [],
+      expected: "nested-observer-reentry",
+    },
+  ] satisfies Array<{
+    name: string;
+    observers: V1JPreCaptureObserverTrace[];
+    transcriptGrowth: V1JPreCaptureTranscriptGrowth[];
+    expected: V1JPreCaptureReentryClass;
+  }>)("classifies $name", ({ observers, transcriptGrowth, expected }) => {
+    const before = structuredClone({ observers, transcriptGrowth });
+    expect(classifyV1JPreCaptureReentry({ observers, transcriptGrowth })).toBe(expected);
+    expect({ observers, transcriptGrowth }).toEqual(before);
+  });
+
+  it("summarizes transcript messages without retaining their content", () => {
+    const privateText = "private transcript content must not be persisted";
+    const event = {
+      stage: "model-prompt-transform-enter",
+      messages: [{ role: "user", content: privateText }],
+      source: "offline trace fixture",
+    } as PromptMessageTraceEvent;
+    const identities = new WeakMap<object, number>();
+    let nextIdentity = 1;
+    const summary = summarizePromptMessageTrace(event, (value) => {
+      const identity = identities.get(value) ?? nextIdentity++;
+      identities.set(value, identity);
+      return identity;
+    });
+
+    expect(summary.messages).toMatchObject([
+      {
+        index: 0,
+        role: "user",
+        contentSha256: sha256V1J(canonicalizeV1IValue(privateText)),
+        contentBytes: Buffer.byteLength(privateText, "utf8"),
+        origin: "unknown",
+      },
+    ]);
+    expect(JSON.stringify(summary)).not.toContain(privateText);
+  });
+});
+
 describeV1JProviderCapturePreflight("v1J provider-bound capture preflight only", () => {
   it(
     "captures one serialized request and terminates before every dispatch path",
@@ -2421,16 +2645,16 @@ describeV1JProviderCapturePreflight("v1J provider-bound capture preflight only",
       const recordCaptureStage = (event: V1JProviderControlEvent) => {
         preflightStage = event.event;
         providerCaptureStages.push(event.event);
-        const allowedDetails = [
+        const allowedDetails = new Set([
           "canonicalRequestSha256",
           "contentBytes",
           "errorName",
           "messageCount",
           "requestJsonBytes",
           "toolCount",
-        ];
+        ]);
         const details = Object.fromEntries(
-          Object.entries(event.details ?? {}).filter(([key]) => allowedDetails.includes(key)),
+          Object.entries(event.details ?? {}).filter(([key]) => allowedDetails.has(key)),
         );
         journal.record(`provider-capture-${event.event}`, {
           ...(event.elapsedMs === undefined ? {} : { elapsedMs: event.elapsedMs }),
@@ -4184,6 +4408,7 @@ describe("v1J schema-capture dispatch guard", () => {
       expect(journal.counters()).toMatchObject({
         requestObserverInvocations: 1,
         providerRequestHookInvocations: 1,
+        fetchWrapperInvocations: 0,
         providerCallbackInvocations: 0,
         providerDispatchAttempts: 0,
         modelRequestCounter: 0,
@@ -4210,6 +4435,8 @@ describe("v1J schema-capture dispatch guard", () => {
       expect(events).toContain("arm-c-preflight-stop-signal-caught");
       expect(events.some((event) => event.startsWith("arm-a-"))).toBe(false);
       expect(events.some((event) => event.includes("smoke-schedule"))).toBe(false);
+      expect(events.some((event) => event.includes("tool-execution-started"))).toBe(false);
+      expect(events.some((event) => event.includes("raw-transport"))).toBe(false);
       const observationRows = rows.filter(
         (row) => row.event === "arm-c-request-observation-captured",
       );
@@ -4270,6 +4497,17 @@ describe("v1J schema-capture dispatch guard", () => {
       expect(observerEntries).toHaveLength(1);
       expect(observerExits).toHaveLength(1);
       expect(observerEntries.map((row) => row.callbackIndex)).toEqual([1]);
+      expect(observerEntries[0]).toMatchObject({
+        runOneAttemptId: expect.any(String),
+        embeddedRunId: expect.any(String),
+        sessionIdSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+        promptSubmissionIndex: 1,
+        modelLoopIterationIndex: 1,
+        precedingModelTurnIndex: null,
+        payloadTransformInvocation: 1,
+        payloadTransformInputMessageCount: 2,
+        nestedObserverReentry: false,
+      });
       expect(new Set(observerEntries.map((row) => row.messageArrayIdentity)).size).toBe(1);
       expect(
         observerExits.every((row) => row.arrayOrMessageStateChangedDuringObserver === false),
@@ -4306,11 +4544,15 @@ describe("v1J schema-capture dispatch guard", () => {
       expect(firstObserverMessages.map((message) => Object.keys(message).toSorted())).toEqual(
         firstObserverMessages.map(() =>
           [
+            "contentBytes",
             "contentLength",
             "contentObjectIdentity",
             "contentSha256",
             "index",
             "messageObjectIdentity",
+            "observedAtStage",
+            "observedSource",
+            "origin",
             "role",
           ].toSorted(),
         ),
@@ -6801,6 +7043,9 @@ async function runOne(input: {
       : undefined;
   const runProvider = input.provider ?? PROVIDER;
   const runModel = input.model ?? MODEL_ID;
+  const runId =
+    input.runIdOverride ??
+    `v1i-${input.surfaceMode.toLowerCase()}-${input.benchmarkCase.id}-${input.arm}-${input.replicate}`;
   const diagnostics = createExperimentDiagnostics();
   const recordProviderCaptureStage = (
     event: string,
@@ -6826,6 +7071,18 @@ async function runOne(input: {
   let promptSubmissionTraceIndex = 0;
   let providerPayloadTraceIndex = 0;
   let currentProviderPayloadTraceIndex = 0;
+  let embeddedRunId: string | null = null;
+  let sessionIdSha256: string | null = null;
+  let precedingModelTurnIndex: number | null = null;
+  let activeRequestObserverCount = 0;
+  let previousTranscriptTrace:
+    | {
+        messageArrayIdentity: number;
+        messages: ReturnType<typeof summarizePromptMessageTrace>["messages"];
+      }
+    | undefined;
+  const preCaptureObserverTraces: V1JPreCaptureObserverTrace[] = [];
+  const preCaptureTranscriptGrowth: V1JPreCaptureTranscriptGrowth[] = [];
   const originalPromptMessageTrace = diagnostics.hooks.onPromptMessageTrace;
   diagnostics.hooks.onPromptMessageTrace = (event) => {
     originalPromptMessageTrace?.(event);
@@ -6842,9 +7099,27 @@ async function runOne(input: {
     if (journal) {
       if (event.stage === "prompt-context-built") {
         promptSubmissionTraceIndex += 1;
+        if (promptSubmissionTraceIndex > 1) {
+          journal.record("prompt-reentry-start", {
+            runOneAttemptId: runId,
+            embeddedRunId,
+            sessionIdSha256,
+            promptSubmissionIndex: promptSubmissionTraceIndex,
+            source: event.source,
+          });
+        }
       }
       if (event.stage === "provider-onPayload-transform-enter") {
         currentProviderPayloadTraceIndex = ++providerPayloadTraceIndex;
+        journal.record("model-loop-iteration-start", {
+          runOneAttemptId: runId,
+          embeddedRunId,
+          sessionIdSha256,
+          promptSubmissionIndex: promptSubmissionTraceIndex,
+          modelLoopIterationIndex: currentProviderPayloadTraceIndex,
+          messageCount: event.messages.length,
+          source: event.source,
+        });
       }
       const callbackIndex =
         event.stage === "provider-onPayload-transform-enter" ||
@@ -6852,13 +7127,103 @@ async function runOne(input: {
         event.stage === "provider-onPayload-transform-complete"
           ? currentProviderPayloadTraceIndex
           : (event.callbackIndex ?? promptSubmissionTraceIndex);
-      journal.record(
-        `arm-${journal.arm.toLowerCase()}-prompt-message-trace`,
-        summarizePromptMessageTrace(
-          callbackIndex === undefined ? event : { ...event, callbackIndex },
-          identifyPromptObject,
-        ),
+      const summary = summarizePromptMessageTrace(
+        callbackIndex === undefined ? event : { ...event, callbackIndex },
+        identifyPromptObject,
       );
+      const transcriptStages = new Set([
+        "prompt-submit-enter",
+        "prompt-history-normalized",
+        "model-prompt-transform-enter",
+        "prompt-active-session-settled",
+        "prompt-agent-state-settled",
+      ]);
+      const isTranscriptSnapshot = transcriptStages.has(event.stage);
+      const transcriptLengthBefore = previousTranscriptTrace?.messages.length ?? null;
+      const traceDetails = {
+        ...summary,
+        runOneAttemptId: runId,
+        embeddedRunId,
+        sessionIdSha256,
+        promptSubmissionIndex: promptSubmissionTraceIndex,
+        modelLoopIterationIndex: currentProviderPayloadTraceIndex,
+        precedingModelTurnIndex,
+        payloadTransformInvocation: currentProviderPayloadTraceIndex || null,
+        payloadTransformInputMessageCount:
+          event.stage === "provider-onPayload-transform-enter" ||
+          event.stage === "provider-onPayload-transform-start"
+            ? summary.messageCount
+            : null,
+        payloadTransformOutputMessageCount:
+          event.stage === "provider-onPayload-transform-complete" ? summary.messageCount : null,
+        transcriptLengthBefore: isTranscriptSnapshot ? transcriptLengthBefore : null,
+        transcriptLengthAfter: isTranscriptSnapshot ? summary.messageCount : null,
+        transcriptLengthDelta:
+          isTranscriptSnapshot && transcriptLengthBefore !== null
+            ? summary.messageCount - transcriptLengthBefore
+            : null,
+      };
+      journal.record(`arm-${journal.arm.toLowerCase()}-prompt-message-trace`, traceDetails);
+
+      if (isTranscriptSnapshot) {
+        if (previousTranscriptTrace) {
+          const prefixMatches = previousTranscriptTrace.messages.every((previous, index) => {
+            const current = summary.messages[index];
+            return (
+              current?.role === previous.role &&
+              current.contentSha256 === previous.contentSha256 &&
+              current.contentBytes === previous.contentBytes
+            );
+          });
+          const appendedMessages = prefixMatches
+            ? summary.messages.slice(previousTranscriptTrace.messages.length)
+            : [];
+          if (!prefixMatches || appendedMessages.length > 0) {
+            const growth: V1JPreCaptureTranscriptGrowth = {
+              promptSubmissionIndex: promptSubmissionTraceIndex,
+              modelLoopIterationIndex: currentProviderPayloadTraceIndex,
+              precedingModelTurnIndex,
+              transcriptArrayReused:
+                previousTranscriptTrace.messageArrayIdentity === summary.messageArrayIdentity,
+              transcriptLengthBefore: previousTranscriptTrace.messages.length,
+              transcriptLengthAfter: summary.messageCount,
+              appendedMessages: appendedMessages.map((message, index) => ({
+                index: previousTranscriptTrace!.messages.length + index,
+                role: message.role,
+                contentSha256: message.contentSha256,
+              })),
+            };
+            preCaptureTranscriptGrowth.push(growth);
+            journal.record(`arm-${journal.arm.toLowerCase()}-transcript-growth-observed`, {
+              ...growth,
+              sourceStage: event.stage,
+              source: event.source,
+            });
+            for (const message of growth.appendedMessages) {
+              const appendCheckpoint =
+                message.role === "user"
+                  ? "user-message-append-observed"
+                  : message.role === "assistant"
+                    ? "assistant-message-append-observed"
+                    : message.role === "toolResult"
+                      ? "tool-result-append-observed"
+                      : undefined;
+              if (appendCheckpoint) {
+                journal.record(`arm-${journal.arm.toLowerCase()}-${appendCheckpoint}`, {
+                  ...growth,
+                  message,
+                  sourceStage: event.stage,
+                  source: event.source,
+                });
+              }
+            }
+          }
+        }
+        previousTranscriptTrace = {
+          messageArrayIdentity: summary.messageArrayIdentity,
+          messages: summary.messages,
+        };
+      }
     }
   };
   const postResponseLiveness: PostResponseLiveness | undefined = input.postResponseDiagnostics
@@ -7016,6 +7381,8 @@ async function runOne(input: {
   diagnostics.hooks.onProviderRequest = async ({ payload, model }) => {
     const callbackIndex = ++requestObserverInvocationIndex;
     const preflightDiagnostics = input.requestCapture?.preflightDiagnostics;
+    const nestedObserverReentry = activeRequestObserverCount > 0;
+    activeRequestObserverCount += 1;
     preflightDiagnostics?.increment(
       "providerRequestHookInvocations",
       `arm-${preflightDiagnostics.arm.toLowerCase()}-provider-request-hook-enter`,
@@ -7045,9 +7412,37 @@ async function runOne(input: {
       },
       identifyPromptObject,
     );
+    const observerTrace: V1JPreCaptureObserverTrace = {
+      invocationIndex: callbackIndex,
+      runOneAttemptId: runId,
+      embeddedRunId,
+      sessionIdSha256,
+      promptSubmissionIndex: promptSubmissionTraceIndex,
+      modelLoopIterationIndex: currentProviderPayloadTraceIndex,
+      precedingModelTurnIndex,
+      messageArrayIdentity: callbackEntry.messageArrayIdentity,
+      messageCount: callbackEntry.messageCount,
+      messageFingerprint: hashV1ICanonical(
+        callbackEntry.messages.map(({ role, contentSha256, contentBytes }) => ({
+          role,
+          contentSha256,
+          contentBytes,
+        })),
+      ),
+      nestedObserverReentry,
+    };
+    preCaptureObserverTraces.push(observerTrace);
     preflightDiagnostics?.record(
       `arm-${preflightDiagnostics.arm.toLowerCase()}-prompt-message-trace`,
-      callbackEntry,
+      {
+        ...callbackEntry,
+        ...observerTrace,
+        tracePhase: "request-observer-entry-snapshot",
+        payloadTransformInvocation: currentProviderPayloadTraceIndex,
+        payloadTransformInputMessageCount: callbackEntry.messageCount,
+        transcriptLengthBefore: previousTranscriptTrace?.messages.length ?? null,
+        transcriptLengthAfter: previousTranscriptTrace?.messages.length ?? null,
+      },
     );
     input.requestCapture?.liveness?.record("provider-tool-projection-complete");
     if (input.requestCapture?.schemaCaptureName) {
@@ -7159,10 +7554,31 @@ async function runOne(input: {
         {
           ...callbackExit,
           callbackEntry,
-          arrayOrMessageStateChangedDuringObserver:
-            callbackEntry.messageArrayIdentity !== callbackExit.messageArrayIdentity ||
-            callbackEntry.messageCount !== callbackExit.messageCount ||
-            JSON.stringify(callbackEntry.messages) !== JSON.stringify(callbackExit.messages),
+          ...observerTrace,
+          tracePhase: "request-observer-exit-snapshot",
+          payloadTransformInvocation: currentProviderPayloadTraceIndex,
+          payloadTransformOutputMessageCount: callbackExit.messageCount,
+          transcriptLengthBefore: previousTranscriptTrace?.messages.length ?? null,
+          transcriptLengthAfter: previousTranscriptTrace?.messages.length ?? null,
+          arrayOrMessageStateChangedDuringObserver: !samePromptMessageState(
+            callbackEntry,
+            callbackExit,
+          ),
+        },
+      );
+      activeRequestObserverCount = Math.max(0, activeRequestObserverCount - 1);
+      preflightDiagnostics?.record(
+        `arm-${preflightDiagnostics.arm.toLowerCase()}-pre-capture-reentry-classification`,
+        {
+          classification: classifyV1JPreCaptureReentry({
+            observers: preCaptureObserverTraces,
+            transcriptGrowth: preCaptureTranscriptGrowth,
+          }),
+          observerCount: preCaptureObserverTraces.length,
+          nestedObserverReentry,
+          runOneAttemptId: runId,
+          embeddedRunId,
+          sessionIdSha256,
         },
       );
       preflightDiagnostics?.record(
@@ -7272,6 +7688,7 @@ async function runOne(input: {
           modelTurnIndex,
         });
       }
+      precedingModelTurnIndex = modelTurnIndex;
       input.requestCapture?.onAssistantMessage?.(message, modelTurnIndex);
     },
   );
@@ -7298,6 +7715,17 @@ async function runOne(input: {
         .map((tool) => (typeof tool === "string" ? tool : tool.function.name)),
     });
     const runner = async (params: RunEmbeddedAgentParams): Promise<EmbeddedAgentRunResult> => {
+      embeddedRunId = typeof params.runId === "string" ? params.runId : null;
+      sessionIdSha256 = typeof params.sessionId === "string" ? sha256V1J(params.sessionId) : null;
+      input.requestCapture?.preflightDiagnostics?.record("embedded-run-enter", {
+        runOneAttemptId: runId,
+        embeddedRunId,
+        sessionIdSha256,
+        caseId: input.benchmarkCase.id,
+        arm: input.arm,
+        replicate: input.replicate,
+        attempt: input.attempt,
+      });
       const originalFactListener = params.onEmbeddedReplayFact;
       const originalResultListener = params.onAgentToolResult;
       diagnostics.hooks.onCheckpoint?.({
@@ -7408,9 +7836,6 @@ async function runOne(input: {
       }
       return result;
     };
-    const runId =
-      input.runIdOverride ??
-      `v1i-${input.surfaceMode.toLowerCase()}-${input.benchmarkCase.id}-${input.arm}-${input.replicate}`;
     if (input.directRunner) {
       const { embeddedReplaySessionId, embeddedReplaySessionKey } =
         await import("./embedded-replay-runtime.js");

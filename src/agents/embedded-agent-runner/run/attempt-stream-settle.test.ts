@@ -189,6 +189,92 @@ describe("prepareEmbeddedAttemptTransport", () => {
     expect(session.agent.transport).toBe("sse");
   });
 
+  it("captures the final provider payload before a provider can dispatch it", async () => {
+    const model = { api: "test-api", provider: "test-provider", id: "test-model-preflight" };
+    let providerOptions: ProviderStreamOptions | undefined;
+    const providerStream = vi.fn((_model, _context, options) => {
+      providerOptions = options as ProviderStreamOptions;
+      return {} as never;
+    });
+    bindStreamLlmRuntime(providerStream, {
+      streamSimple: providerStream,
+      registry: { getApiProvider: () => undefined },
+    } as never);
+    registerProviderStreamForModel.mockReturnValue(providerStream);
+    const session = {
+      agent: { streamFn: providerStream, transport: "auto" },
+    };
+    const stages: string[] = [];
+    const finalPayload = {
+      model: model.id,
+      messages: [{ role: "user", content: "transformed" }],
+      tools: [],
+    };
+    const stop = new Error("stop before provider dispatch");
+
+    await prepareEmbeddedAttemptTransport({
+      attempt: {
+        config: {},
+        model,
+        modelId: model.id,
+        provider: model.provider,
+        runId: "run-provider-preflight",
+        sessionId: "session-provider-preflight",
+        runtimePlan: {
+          auth: { forwardedAuthProfileId: undefined },
+          transport: { resolveExtraParams: () => ({}) },
+        },
+        capabilityIntelligenceExperiment: {
+          onProviderRequest: ({ payload }) => {
+            stages.push("request-observed");
+            expect(payload).not.toMatchObject(finalPayload);
+          },
+          onProviderRequestBeforeDispatch: ({ payload }) => {
+            stages.push("before-dispatch");
+            expect(payload).toEqual(finalPayload);
+            throw stop;
+          },
+        },
+      },
+      session,
+      settingsManager: {
+        getGlobalSettings: () => ({}),
+        getProjectSettings: () => ({}),
+      },
+      sessionAgentId: "main",
+      workspaceDir: "/workspace",
+      workspaceOnly: false,
+      agentDir: "/agent",
+      abortSignal: new AbortController().signal,
+      getProviderRuntimeHandle: () => ({ provider: model.provider, modelId: model.id }),
+      sandboxSessionKey: "agent:main:test",
+      codeModeControlsEnabled: false,
+      providerPromptState: { state: {}, effectiveContextTokenBudget: 128_000 },
+    } as unknown as PrepareTransportInput);
+
+    const originalOnPayload = vi.fn(async () => finalPayload);
+    session.agent.streamFn(
+      model as never,
+      { systemPrompt: "system", messages: [], tools: [] } as never,
+      {
+        onPayload: originalOnPayload,
+      } as never,
+    );
+    let providerDispatches = 0;
+    const invokeProvider = async () => {
+      await providerOptions?.onPayload?.(
+        { model: model.id, messages: [{ role: "user", content: "before" }], tools: [] } as never,
+        model as never,
+      );
+      providerDispatches += 1;
+    };
+
+    await expect(invokeProvider()).rejects.toBe(stop);
+    expect(stages).toEqual(["request-observed", "before-dispatch"]);
+    expect(originalOnPayload).toHaveBeenCalledOnce();
+    expect(providerDispatches).toBe(0);
+  });
+
   it("materializes native video from the prepared session agent workspace", async () => {
     const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-transport-video-"));
     const videoPath = path.join(workspaceDir, "history.mp4");

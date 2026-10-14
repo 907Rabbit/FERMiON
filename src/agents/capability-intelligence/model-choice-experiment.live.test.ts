@@ -1602,6 +1602,7 @@ type ModelPayloadCapture = {
   requests: CapturedModelRequest[];
   delegatedRequests: number;
   providerDispatchAttempts: number;
+  providerInvocationCount: number;
   responseSummaries: ProviderResponseSummary[];
   originalFetch: typeof globalThis.fetch;
   wrapFetch: (baseFetch: typeof globalThis.fetch) => typeof globalThis.fetch;
@@ -1638,6 +1639,13 @@ class V1IProviderDispatchAttemptError extends Error {
   constructor() {
     super("v1J capture blocked a provider dispatch attempt");
     this.name = "V1IProviderDispatchAttemptError";
+  }
+}
+
+class V1JUnexpectedPreflightModelResultError extends Error {
+  constructor(readonly classification: string) {
+    super(`v1J preflight rejected unexpected model result: ${classification}`);
+    this.name = "V1JUnexpectedPreflightModelResultError";
   }
 }
 
@@ -3672,8 +3680,7 @@ async function captureV1JPreflightSurface(
       model: protocol.model.id,
       runIdOverride: `v1j-preflight-${arm}-${head.slice(0, 8)}-${process.pid}`,
       requestCapture: {
-        stopAfterCapture: options?.onProviderBoundRequest === undefined,
-        ...(options?.onProviderBoundRequest ? { stopAfterProviderBoundCapture: true } : {}),
+        stopAfterProviderBoundCapture: true,
         ...(preflightDiagnostics ? { preflightDiagnostics } : {}),
         onProviderCaptureStage: options?.onProviderCaptureStage,
         capturePromptInstruction: v1jInstructionForArm(protocol, arm),
@@ -4495,8 +4502,10 @@ describe("v1J schema-capture dispatch guard", () => {
     let underlyingFetches = 0;
     const captured: string[] = [];
     let stopSignals = 0;
+    const invocations: unknown[] = [];
     const payloadCapture = captureModelPayloads(undefined, {
       stopAfterProviderBoundCapture: true,
+      onProviderInvocation: (invocation) => invocations.push(invocation),
       onProviderRequestBeforeDispatch: ({ rawBody, requestIndex, dispatchOrdinal }) => {
         captured.push(rawBody);
         expect(requestIndex).toBe(1);
@@ -4523,7 +4532,9 @@ describe("v1J schema-capture dispatch guard", () => {
       expect(captured).toEqual([requestBody]);
       expect(payloadCapture.requests).toHaveLength(1);
       expect(payloadCapture.providerDispatchAttempts).toBe(0);
+      expect(payloadCapture.providerInvocationCount).toBe(0);
       expect(payloadCapture.delegatedRequests).toBe(0);
+      expect(invocations).toEqual([]);
       expect(underlyingFetches).toBe(0);
       expect(stopSignals).toBe(0);
     } finally {
@@ -5367,6 +5378,14 @@ describe("v1J schema-capture dispatch guard", () => {
 
     let normalFetchCalls = 0;
     const normal = captureModelPayloads();
+    const invocationEvents: unknown[] = [];
+    const invocationOrder: string[] = [];
+    const normalWithInvocationObserver = captureModelPayloads(undefined, {
+      onProviderInvocation: (event) => {
+        invocationEvents.push(event);
+        invocationOrder.push("provider-invoke-enter");
+      },
+    });
     try {
       await normal.wrapFetch(async () => {
         normalFetchCalls += 1;
@@ -5377,9 +5396,90 @@ describe("v1J schema-capture dispatch guard", () => {
       });
       expect(normal.providerDispatchAttempts).toBe(1);
       expect(normalFetchCalls).toBe(1);
+      expect(normal.providerInvocationCount).toBe(1);
+      expect(invocationEvents).toEqual([]);
+      await normalWithInvocationObserver.wrapFetch(async () => {
+        invocationOrder.push("network-request-start");
+        return new Response("{}", { headers: { "content-type": "application/json" } });
+      })(`${LM_STUDIO_BASE_URL}/chat/completions`, {
+        method: "POST",
+        body: JSON.stringify({ model: MODEL_ID, tools: [] }),
+      });
+      expect(normalWithInvocationObserver.providerInvocationCount).toBe(1);
+      expect(invocationEvents).toEqual([
+        expect.objectContaining({ count: 1, requestIndex: 1, dispatchOrdinal: 1 }),
+      ]);
+      expect(invocationOrder).toEqual(["provider-invoke-enter", "network-request-start"]);
     } finally {
+      normalWithInvocationObserver.restore();
       normal.restore();
     }
+  });
+
+  it("rejects an unaccounted preflight model result and records tool identity only", () => {
+    const records: Array<{ event: string; details: Record<string, unknown> }> = [];
+    const journal = {
+      record: (event: string, details: Record<string, unknown> = {}) =>
+        records.push({ event, details }),
+    } as unknown as V1JPreflightDiagnosticJournal;
+    const toolCall = {
+      type: "toolCall" as const,
+      id: "private-call-id",
+      name: "read",
+      arguments: { path: "private prompt content" },
+    };
+    const assistant = makeAssistantMessage([toolCall]);
+
+    expect(() =>
+      guardV1JPreflightAssistantResult({
+        message: assistant,
+        modelTurnIndex: 0,
+        providerInvocationCount: 0,
+        stopSignalRaised: false,
+        journal,
+        captureOnly: true,
+      }),
+    ).toThrowError(
+      expect.objectContaining({
+        name: "V1JUnexpectedPreflightModelResultError",
+        classification: "UNACCOUNTED_MODEL_RESULT_SOURCE",
+      }),
+    );
+
+    expect(records).toEqual([
+      {
+        event: "preflight-unexpected-model-result",
+        details: expect.objectContaining({
+          classification: "UNACCOUNTED_MODEL_RESULT_SOURCE",
+          providerInvocationCount: 0,
+          toolCallCount: 1,
+          toolCalls: [{ toolName: "read", callIdSha256: sha256V1J("private-call-id") }],
+          toolHandlerEntryCount: 0,
+          toolResultCallbackCount: 0,
+          secondModelLoopIterationAllowed: false,
+        }),
+      },
+    ]);
+    expect(JSON.stringify(records)).not.toContain("private-call-id");
+    expect(JSON.stringify(records)).not.toContain("private prompt content");
+  });
+
+  it("recognizes only the local capture-stop error without treating it as a model result", () => {
+    const record = vi.fn();
+    const result = guardV1JPreflightAssistantResult({
+      message: { ...makeAssistantMessage([]), stopReason: "error" },
+      modelTurnIndex: 0,
+      providerInvocationCount: 0,
+      stopSignalRaised: true,
+      journal: { record } as unknown as V1JPreflightDiagnosticJournal,
+      captureOnly: true,
+    });
+
+    expect(result).toBe(true);
+    expect(record).toHaveBeenCalledWith(
+      "preflight-stop-assistant-error-observed",
+      expect.objectContaining({ providerInvocationCount: 0, stopReason: "error" }),
+    );
   });
 
   it("allows the wrapped provider fetch only after exact canonical parity", async () => {
@@ -6195,7 +6295,9 @@ describe("v1I harness evidence repair", () => {
           "request-dispatch-start",
           "request-dispatch-complete",
           "http-response-headers",
+          "network-response-headers",
           "provider-response-observed",
+          "network-response-body-start",
           "http-response-body-start",
           "adapter-stream-enter",
           "response-first-byte",
@@ -6220,6 +6322,7 @@ describe("v1I harness evidence repair", () => {
       });
       expect(JSON.stringify(lifecycle)).not.toContain("git_status");
       expect(capture.providerDispatchAttempts).toBe(1);
+      expect(capture.providerInvocationCount).toBe(1);
     } finally {
       configureAiTransportHost(previousHost);
       capture.restore();
@@ -7604,9 +7707,11 @@ async function runOne(input: {
   let assistantContentSha256: string | null = null;
   let assistantContentBytes: number | null = null;
   let assistantToolCallCount = 0;
+  let providerInvocationCount = 0;
+  let providerBoundCaptureInvocationIndex = 0;
+  let preflightStopSignalRaised = false;
   const preDispatchCallbackExpected = input.requestCapture?.stopAfterProviderBoundCapture === true;
-  const preDispatchCallbackRegistered =
-    typeof input.requestCapture?.onProviderRequestBeforeDispatch === "function";
+  const preDispatchCallbackRegistered = preDispatchCallbackExpected;
   const recordPromptAwait = (event: string, details: Record<string, unknown> = {}) =>
     recordV1JPromptAwaitDiagnostic(preflightDiagnostics, event, {
       runOneAttemptId: runId,
@@ -8108,6 +8213,22 @@ async function runOne(input: {
     input.requestCapture
       ? {
           ...input.requestCapture,
+          onProviderInvocation: ({ count, requestIndex, dispatchOrdinal, requestUrlSha256 }) => {
+            providerInvocationCount = count;
+            input.requestCapture?.preflightDiagnostics?.record("provider-invoke-enter", {
+              providerInvocationCount: count,
+              requestIndex,
+              dispatchOrdinal,
+              requestUrlSha256,
+              callSite: "runOne.captureModelPayloads.baseFetch",
+            });
+            input.requestCapture?.lifecycleJournal?.record("network-request-start", {
+              requestId: `${input.requestCapture?.requestCorrelationId ?? runId}:${requestIndex}`,
+              requestIndex,
+              providerInvocationCount: count,
+              dispatchOrdinal,
+            });
+          },
           onProviderCaptureStage: (event) =>
             recordProviderCaptureStage(event.event, event.details, event.elapsedMs),
         }
@@ -8251,20 +8372,25 @@ async function runOne(input: {
         },
       );
     }
-    capture.recordProviderRequest(request);
+    const stopAtProviderBoundPayload = input.requestCapture?.stopAfterProviderBoundCapture === true;
+    if (!stopAtProviderBoundPayload) {
+      capture.recordProviderRequest(request);
+    }
     callbackJournal?.increment(
       "requestObserverInvocations",
       `arm-${callbackJournal.arm.toLowerCase()}-request-observer-enter`,
       {
-        invocationIndex: capture.requests.length,
+        invocationIndex: callbackIndex,
         providerRequestPhase: "request-observer-enter",
         callSite: "runOne.diagnostics.hooks.onProviderRequest",
       },
     );
-    input.requestCapture?.onRequestCaptured?.(request);
+    if (!stopAtProviderBoundPayload) {
+      input.requestCapture?.onRequestCaptured?.(request);
+    }
     callbackJournal?.record(`arm-${callbackJournal.arm.toLowerCase()}-request-observer-exit`, {
       callSite: "runOne.diagnostics.hooks.onProviderRequest",
-      invocationIndex: capture.requests.length,
+      invocationIndex: callbackIndex,
     });
     const toolNames = toolNamesFromBody(body);
     diagnostics.hooks.onCheckpoint?.({
@@ -8411,10 +8537,67 @@ async function runOne(input: {
       });
     }
   };
+  const diagnosticsProviderRequestBeforeDispatch =
+    diagnostics.hooks.onProviderRequestBeforeDispatch;
+  diagnostics.hooks.onProviderRequestBeforeDispatch = async ({ payload, model }) => {
+    await diagnosticsProviderRequestBeforeDispatch?.({ payload, model });
+    if (input.requestCapture?.stopAfterProviderBoundCapture !== true) {
+      return;
+    }
+
+    const callbackIndex = ++providerBoundCaptureInvocationIndex;
+    const journal = input.requestCapture.preflightDiagnostics;
+    const rawBody = JSON.stringify(payload);
+    if (typeof rawBody !== "string" || !payload || typeof payload !== "object") {
+      throw new TypeError("v1J provider-bound payload is not serializable");
+    }
+    const finalRequest: CapturedModelRequest = {
+      body: payload as Record<string, unknown>,
+      url: "provider-adapter",
+    };
+    capture.recordProviderRequest(finalRequest);
+    journal?.record("provider-bound-request-captured", {
+      invocationIndex: callbackIndex,
+      requestJsonBytes: Buffer.byteLength(rawBody, "utf8"),
+      requestBodySha256: hashV1ICanonical(finalRequest.body),
+      providerInvocationCount,
+    });
+    input.requestCapture.onRequestCaptured?.(finalRequest);
+    preDispatchCallbackInvoked = true;
+    await input.requestCapture.onProviderRequestBeforeDispatch?.({
+      request: finalRequest,
+      rawBody,
+      requestIndex: callbackIndex,
+      dispatchOrdinal: providerInvocationCount + 1,
+    });
+    preflightStopSignalRaised = true;
+    input.requestCapture.onPreflightStopRaised?.();
+    journal?.increment("preflightStopSignalRaised", "preflight-stop-signal-raised", {
+      callSite: "runOne.diagnostics.hooks.onProviderRequestBeforeDispatch",
+      signalName: V1IProviderRequestCapturedError.name,
+      providerInvocationCount,
+    });
+    throw new V1IProviderRequestCapturedError();
+  };
   const diagnosticsProviderResponse = diagnostics.hooks.onProviderResponse;
   let adapterResponseIndex = 0;
   diagnostics.hooks.onProviderResponse = async ({ response, model }) => {
     const requestIndex = ++adapterResponseIndex;
+    const captureOnly =
+      input.requestCapture?.stopAfterCapture === true ||
+      input.requestCapture?.stopAfterProviderBoundCapture === true;
+    if (captureOnly) {
+      const classification =
+        providerInvocationCount === 0
+          ? "UNACCOUNTED_MODEL_RESULT_SOURCE"
+          : "PROVIDER_RESPONSE_AFTER_CAPTURE_STOP";
+      input.requestCapture?.preflightDiagnostics?.record("unexpected-provider-response", {
+        resultStage: "provider-response-observed",
+        providerInvocationCount,
+        classification,
+      });
+      throw new V1JUnexpectedPreflightModelResultError(classification);
+    }
     input.requestCapture?.lifecycleJournal?.record("adapter-parse-start", {
       requestIndex,
       outcome: "entered",
@@ -8532,6 +8715,19 @@ async function runOne(input: {
       }
       precedingModelTurnIndex = modelTurnIndex;
       try {
+        const preflightResult = guardV1JPreflightAssistantResult({
+          message,
+          modelTurnIndex,
+          providerInvocationCount,
+          stopSignalRaised: preflightStopSignalRaised,
+          journal: assistantJournal,
+          captureOnly:
+            input.requestCapture?.stopAfterCapture === true ||
+            input.requestCapture?.stopAfterProviderBoundCapture === true,
+        });
+        if (preflightResult) {
+          return;
+        }
         input.requestCapture?.onAssistantMessage?.(message, modelTurnIndex);
       } finally {
         assistantJournal?.record("assistant-turn-finalized", {
@@ -8930,6 +9126,7 @@ async function runOne(input: {
       requestObserverInvocations: counters.requestObserverInvocations,
       fetchWrapperInvocations: counters.fetchWrapperInvocations,
       providerDispatchAttempts: counters.providerDispatchAttempts,
+      providerInvocationCount,
       timeoutSource: timeoutFired
         ? "embedded-attempt-run-budget"
         : input.abortSignal?.aborted
@@ -10288,6 +10485,12 @@ function captureModelPayloads(
     liveness?: V1JCaptureLiveness;
     onProviderDispatchAttempt?: (count: number, requestIndex: number) => void;
     onRequestCaptured?: (request: CapturedModelRequest) => void;
+    onProviderInvocation?: (input: {
+      count: number;
+      requestIndex: number;
+      dispatchOrdinal: number;
+      requestUrlSha256: string;
+    }) => void;
     onProviderCaptureStage?: (event: V1JProviderControlEvent) => void;
     onProviderRequestBeforeDispatch?: (input: {
       request: CapturedModelRequest;
@@ -10307,6 +10510,7 @@ function captureModelPayloads(
   let providerRequestRecorded = false;
   let delegatedRequests = 0;
   let providerDispatchAttempts = 0;
+  let providerInvocationCount = 0;
   let providerRequestIndex = 0;
   let providerRequestGateFailed = false;
   let providerRequestGateError: unknown;
@@ -10664,6 +10868,15 @@ function captureModelPayloads(
       }
       let response: Response;
       try {
+        if (isProviderRequest) {
+          providerInvocationCount += 1;
+          options?.onProviderInvocation?.({
+            count: providerInvocationCount,
+            requestIndex,
+            dispatchOrdinal: providerDispatchAttempts,
+            requestUrlSha256: sha256V1J(url),
+          });
+        }
         response = await baseFetch(input, init);
       } catch (error) {
         if (isProviderRequest) {
@@ -10708,6 +10921,13 @@ function captureModelPayloads(
         httpStatus: response.status,
         contentType,
       });
+      options?.lifecycleJournal?.record("network-response-headers", {
+        requestId: correlationId,
+        correlationId,
+        requestIndex,
+        httpStatus: response.status,
+        contentType,
+      });
       options?.lifecycleJournal?.record("provider-response-observed", {
         requestId: correlationId,
         correlationId,
@@ -10719,6 +10939,12 @@ function captureModelPayloads(
       responseSummaries.push(initialSummary);
       emitResponseSummary(initialSummary);
       if (!response.body) {
+        options?.lifecycleJournal?.record("network-response-body-start", {
+          requestId: correlationId,
+          correlationId,
+          requestIndex,
+          responseBytes: 0,
+        });
         options?.lifecycleJournal?.record("http-response-body-start", {
           requestId: correlationId,
           correlationId,
@@ -10752,6 +10978,11 @@ function captureModelPayloads(
       const reader = providerBody.getReader();
       let responseBytes = 0;
       let adapterStreamEntered = false;
+      options?.lifecycleJournal?.record("network-response-body-start", {
+        requestId: correlationId,
+        correlationId,
+        requestIndex,
+      });
       options?.lifecycleJournal?.record("http-response-body-start", {
         requestId: correlationId,
         correlationId,
@@ -10849,6 +11080,9 @@ function captureModelPayloads(
     get providerDispatchAttempts() {
       return providerDispatchAttempts;
     },
+    get providerInvocationCount() {
+      return providerInvocationCount;
+    },
     responseSummaries,
     originalFetch,
     wrapFetch,
@@ -10879,6 +11113,52 @@ function installAssistantMessageObserver(
       hooks.onAssistantMessage = previous;
     }
   };
+}
+
+function guardV1JPreflightAssistantResult(input: {
+  message: AssistantMessage;
+  modelTurnIndex: number;
+  providerInvocationCount: number;
+  stopSignalRaised: boolean;
+  journal?: V1JPreflightDiagnosticJournal;
+  captureOnly: boolean;
+}): boolean {
+  if (!input.captureOnly) {
+    return false;
+  }
+  const toolCalls = input.message.content.filter((block) => block.type === "toolCall");
+  const expectedStopError =
+    input.stopSignalRaised &&
+    toolCalls.length === 0 &&
+    (input.message.stopReason === "error" || input.message.stopReason === "aborted");
+  if (expectedStopError) {
+    input.journal?.record("preflight-stop-assistant-error-observed", {
+      modelTurnIndex: input.modelTurnIndex,
+      providerInvocationCount: input.providerInvocationCount,
+      stopReason: input.message.stopReason,
+    });
+    return true;
+  }
+
+  const classification =
+    input.providerInvocationCount === 0
+      ? "UNACCOUNTED_MODEL_RESULT_SOURCE"
+      : "MODEL_RESULT_AFTER_PRE_DISPATCH_STOP";
+  input.journal?.record("preflight-unexpected-model-result", {
+    classification,
+    modelTurnIndex: input.modelTurnIndex,
+    providerInvocationCount: input.providerInvocationCount,
+    stopReason: input.message.stopReason,
+    toolCallCount: toolCalls.length,
+    toolCalls: toolCalls.map((call) => ({
+      toolName: call.name,
+      callIdSha256: sha256V1J(call.id),
+    })),
+    toolHandlerEntryCount: 0,
+    toolResultCallbackCount: 0,
+    secondModelLoopIterationAllowed: false,
+  });
+  throw new V1JUnexpectedPreflightModelResultError(classification);
 }
 
 function makeAssistantMessage(content: AssistantMessage["content"]): AssistantMessage {

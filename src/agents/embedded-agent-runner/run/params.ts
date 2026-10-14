@@ -198,6 +198,10 @@ export type EmbeddedCapabilityIntelligenceExperimentHooks = {
   onPostResponseCounter?: (counter: PostResponseCounter) => void;
   onRequestPreparationError?: (input: { error: unknown; stage: string }) => void;
   onProviderRequest?: (input: { payload: unknown; model: unknown }) => void | Promise<void>;
+  onProviderRequestBeforeDispatch?: (input: {
+    payload: unknown;
+    model: unknown;
+  }) => void | Promise<void>;
   onProviderResponse?: (input: { response: unknown; model: unknown }) => void | Promise<void>;
   /** Observes the normalized assistant response before any tool execution. */
   onAssistantMessage?: (message: AssistantMessage) => void;

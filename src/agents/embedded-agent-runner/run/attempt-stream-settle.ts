@@ -542,7 +542,12 @@ export async function prepareEmbeddedAttemptTransport(input: {
     : undefined;
   const observeProviderRequest = (streamFn: StreamFn | undefined): StreamFn | undefined => {
     const experiment = attempt.capabilityIntelligenceExperiment;
-    if (!streamFn || (!experiment?.onProviderRequest && !experiment?.onProviderResponse)) {
+    if (
+      !streamFn ||
+      (!experiment?.onProviderRequest &&
+        !experiment?.onProviderRequestBeforeDispatch &&
+        !experiment?.onProviderResponse)
+    ) {
       return streamFn;
     }
     let providerRequestCallbackIndex = 0;
@@ -585,6 +590,20 @@ export async function prepareEmbeddedAttemptTransport(input: {
             promptAssemblySource: "provider stream onPayload chain",
             callbackIndex,
           });
+          // Capture-only diagnostics stop here: provider adapters invoke their
+          // request after onPayload resolves, so this is the last no-network seam.
+          try {
+            await experiment.onProviderRequestBeforeDispatch?.({
+              payload: finalPayload,
+              model: payloadModel,
+            });
+          } catch (error) {
+            experiment.onRequestPreparationError?.({
+              error,
+              stage: "provider-request-before-dispatch",
+            });
+            throw error;
+          }
           return finalPayload;
         },
         onResponse: async (response, responseModel) => {

@@ -2881,6 +2881,56 @@ describe("agentLoop tool termination", () => {
     expect(endEvent?.executionStarted).toBe(false);
   });
 
+  it("does not execute a tool or continue the loop when an awaited assistant observer fails", async () => {
+    const executed: string[] = [];
+    const stop = new Error("preflight rejected the assistant tool call");
+    let streamCalls = 0;
+    let toolResultCallbacks = 0;
+    const observedEvents: AgentEvent[] = [];
+    const streamFn: StreamFn = () => {
+      streamCalls += 1;
+      const stream = createAssistantMessageEventStream();
+      queueMicrotask(() => {
+        const message = makeAssistantMessage([
+          { type: "toolCall", id: "call-read", name: "read", arguments: {} },
+        ]);
+        stream.push({ type: "done", reason: "toolUse", message });
+        stream.end();
+      });
+      return stream;
+    };
+
+    await expect(
+      runAgentLoop(
+        [{ role: "user", content: "inspect", timestamp: 1 }],
+        { systemPrompt: "", messages: [], tools: [makeTool("read", executed)] },
+        config,
+        async (event) => {
+          observedEvents.push(event);
+          if (event.type === "message_end" && event.message.role === "assistant") {
+            throw stop;
+          }
+          if (event.type === "tool_execution_end") {
+            toolResultCallbacks += 1;
+          }
+        },
+        undefined,
+        streamFn,
+      ),
+    ).rejects.toBe(stop);
+
+    expect(streamCalls).toBe(1);
+    expect(executed).toEqual([]);
+    expect(toolResultCallbacks).toBe(0);
+    expect(
+      observedEvents.some(
+        (event) =>
+          event.type === "tool_execution_end" ||
+          (event.type === "message_end" && event.message.role === "toolResult"),
+      ),
+    ).toBe(false);
+  });
+
   it("marks argument validation failures with typed provenance", async () => {
     const executed: string[] = [];
     const afterToolOutcome = vi.fn(async () => ({

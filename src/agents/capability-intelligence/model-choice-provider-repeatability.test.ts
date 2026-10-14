@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   V1J_PROVIDER_CONTROL_MODEL_CONFIG_SHA256,
   V1J_PROVIDER_CONTROL_PREREGISTRATION_SHA256,
@@ -11,6 +11,7 @@ import {
 import {
   assertV1JRawRepeatabilityPreflight,
   createV1JRawRepeatabilityJournal,
+  runV1JPreflightWithHeartbeat,
   runV1JRawRepeatabilityTransport,
   summarizeV1JRawRepeatabilityRequest,
   V1J_RAW_REPEATABILITY_AUTHORIZED_FLAG,
@@ -299,6 +300,137 @@ describe("v1J raw-only provider repeatability", () => {
       ).toBe(false);
     } finally {
       fs.rmSync(repoRoot, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    { stage: "lmstudio-discovery", startEvent: "lmstudio-discovery-start" },
+    { stage: "prepared-runtime-acquisition", startEvent: "prepared-runtime-start" },
+    { stage: "provider-bound-capture", startEvent: "provider-bound-capture-start" },
+  ])("durably heartbeats while $stage is stalled", async ({ stage, startEvent }) => {
+    vi.useFakeTimers();
+    const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), "v1j-preflight-heartbeat-"));
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const events: { event: string; details?: Record<string, unknown> }[] = [];
+    try {
+      const journal = createV1JRawRepeatabilityJournal({
+        repoRoot,
+        harnessCommit: commit,
+        modelId: "qwen/qwen3.5-9b",
+        provider: "lmstudio",
+        contextLength: 262_144,
+        modelConfigHash: V1J_PROVIDER_CONTROL_MODEL_CONFIG_SHA256,
+        startedAt: "2026-01-01T00:00:00.000Z",
+      });
+      journal.record({ event: "raw-repeatability-test-start" });
+      journal.record({ event: "preregistration-loaded" });
+      journal.record({ event: "repeatability-journal-created" });
+      journal.record({ event: startEvent });
+      const heartbeat = vi.fn();
+      const operation = runV1JPreflightWithHeartbeat({
+        operation: () => pending,
+        stage: () => stage,
+        record: (event) => {
+          events.push(event);
+          journal.record(event);
+        },
+        heartbeat,
+        heartbeatMs: 25_000,
+        now: () => Date.now(),
+      });
+
+      await vi.advanceTimersByTimeAsync(25_000);
+      expect(heartbeat).toHaveBeenCalledWith({ stage, elapsedMs: 25_000 });
+      expect(events.at(-1)).toEqual({
+        event: "preflight-heartbeat",
+        details: { stage, elapsedMs: 25_000 },
+      });
+      const journalText = fs.readFileSync(
+        path.join(journal.artifactRoot, "transport-events.jsonl"),
+        "utf8",
+      );
+      const lastJournalEvent = JSON.parse(journalText.trim().split("\n").at(-1) ?? "null") as {
+        event: string;
+        details?: { stage?: string };
+      };
+      expect(lastJournalEvent).toEqual({
+        event: "preflight-heartbeat",
+        details: { stage, elapsedMs: 25_000 },
+      });
+      expect(journalText).not.toContain("PRIVATE_PROMPT");
+      const manifest = JSON.parse(
+        fs.readFileSync(path.join(journal.artifactRoot, "manifest.json"), "utf8"),
+      ) as Record<string, unknown>;
+      expect(manifest.preflightProviderDispatches).toBe(0);
+      expect(manifest.preflightToolExecutions).toBe(0);
+      expect(manifest.providerToolSchemaSha256).toBeNull();
+
+      // No transport work is started until the awaited preflight settles.
+      let rawDispatches = 0;
+      const afterPreflight = operation.then(async () => {
+        await runV1JRawRepeatabilityTransport({
+          endpoint: makeCapture().endpoint,
+          authorization: "Bearer PRIVATE_CREDENTIAL",
+          capture: makeCapture(),
+          fetchImpl: async () => {
+            rawDispatches += 1;
+            return responseWithMarker("data: [DONE]\n\n");
+          },
+          timeoutMs: 100,
+          heartbeatMs: 1_000,
+          record: journal.record,
+        });
+      });
+      expect(rawDispatches).toBe(0);
+      release();
+      await afterPreflight;
+      expect(rawDispatches).toBe(V1J_RAW_REPEATABILITY_REQUEST_COUNT);
+      expect(
+        fs.existsSync(path.join(repoRoot, V1J_RAW_REPEATABILITY_PARENT, "real-exact-run1")),
+      ).toBe(false);
+      expect(
+        fs.existsSync(path.join(repoRoot, V1J_RAW_REPEATABILITY_PARENT, `smoke-${commit}`)),
+      ).toBe(false);
+    } finally {
+      vi.useRealTimers();
+      fs.rmSync(repoRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("records stage transitions without exposing request or prompt content", async () => {
+    vi.useFakeTimers();
+    let stage = "prepared-runtime-acquisition";
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const events: { event: string; details?: Record<string, unknown> }[] = [];
+    const operation = runV1JPreflightWithHeartbeat({
+      operation: () => pending,
+      stage: () => stage,
+      record: (event) => events.push(event),
+      heartbeatMs: 25_000,
+    });
+    try {
+      await vi.advanceTimersByTimeAsync(25_000);
+      stage = "provider-bound-capture";
+      await vi.advanceTimersByTimeAsync(25_000);
+      expect(events.map((event) => event.details?.stage)).toEqual([
+        "prepared-runtime-acquisition",
+        "provider-bound-capture",
+      ]);
+      expect(JSON.stringify(events)).not.toMatch(/prompt|message|credential|response body/iu);
+      release();
+      await operation;
+      const completedEvents = events.length;
+      await vi.advanceTimersByTimeAsync(50_000);
+      expect(events).toHaveLength(completedEvents);
+    } finally {
+      vi.useRealTimers();
+      release();
     }
   });
 });

@@ -45,6 +45,38 @@ export type V1JRawRepeatabilityJournal = {
   record: (event: V1JProviderControlEvent) => void;
 };
 
+export async function runV1JPreflightWithHeartbeat<T>(input: {
+  operation: () => Promise<T>;
+  stage: () => string;
+  record: (event: V1JProviderControlEvent) => void;
+  heartbeat?: (event: { stage: string; elapsedMs: number }) => void;
+  heartbeatMs?: number;
+  now?: () => number;
+}): Promise<T> {
+  const now = input.now ?? Date.now;
+  const startedAt = now();
+  let currentStage = input.stage();
+  let stageStartedAt = startedAt;
+  const timer = setInterval(() => {
+    const nextStage = input.stage();
+    if (nextStage !== currentStage) {
+      currentStage = nextStage;
+      stageStartedAt = now();
+    }
+    const event = {
+      stage: currentStage,
+      elapsedMs: Math.max(0, now() - stageStartedAt),
+    };
+    input.record({ event: "preflight-heartbeat", details: event });
+    input.heartbeat?.(event);
+  }, input.heartbeatMs ?? 25_000);
+  try {
+    return await input.operation();
+  } finally {
+    clearInterval(timer);
+  }
+}
+
 export function assertV1JRawRepeatabilityPreflight(input: {
   env: Record<string, string | undefined>;
   head: string;
@@ -181,8 +213,8 @@ export function createV1JRawRepeatabilityJournal(input: {
   provider: string;
   contextLength: number;
   modelConfigHash: string;
-  providerToolSchemaSha256: string;
-  requestSummary: V1JRawRepeatabilityRequestSummary;
+  providerToolSchemaSha256?: string;
+  requestSummary?: V1JRawRepeatabilityRequestSummary;
   startedAt: string;
 }): V1JRawRepeatabilityJournal {
   if (!/^[0-9a-f]{40}$/.test(input.harnessCommit)) {
@@ -211,9 +243,9 @@ export function createV1JRawRepeatabilityJournal(input: {
     provider: input.provider,
     contextLength: input.contextLength,
     modelConfigHash: input.modelConfigHash,
-    providerToolCount: input.requestSummary.toolCount,
-    providerToolSchemaSha256: input.providerToolSchemaSha256,
-    requestSummary: input.requestSummary,
+    providerToolCount: input.requestSummary?.toolCount ?? null,
+    providerToolSchemaSha256: input.providerToolSchemaSha256 ?? null,
+    requestSummary: input.requestSummary ?? null,
     requestCount: V1J_RAW_REPEATABILITY_REQUEST_COUNT,
     sequential: true,
     retries: 0,

@@ -78,6 +78,7 @@ import {
 import {
   assertV1JRawRepeatabilityPreflight,
   createV1JRawRepeatabilityJournal,
+  runV1JPreflightWithHeartbeat,
   runV1JRawRepeatabilityTransport,
   summarizeV1JRawRepeatabilityRequest,
   V1J_RAW_REPEATABILITY_AUTHORIZED_FLAG,
@@ -2359,7 +2360,33 @@ describeV1JRawRepeatability("v1J raw-only provider repeatability", () => {
         throw new Error("v1J raw repeatability preflight isolation guard failed");
       }
 
-      await assertLiveModelAvailable();
+      const modelConfigHash = hashV1ICanonical(modelConfigIdentity());
+      const journal = createV1JRawRepeatabilityJournal({
+        repoRoot,
+        harnessCommit: head,
+        modelId: protocol.model.id,
+        provider: protocol.model.provider,
+        contextLength: protocol.model.contextLength,
+        modelConfigHash,
+        startedAt: new Date().toISOString(),
+      });
+      journal.record({ event: "raw-repeatability-test-start" });
+      journal.record({
+        event: "preregistration-loaded",
+        details: { preregistrationSha256: protocolSha256 },
+      });
+      journal.record({ event: "repeatability-journal-created" });
+
+      journal.record({ event: "lmstudio-discovery-start" });
+      await runV1JPreflightWithHeartbeat({
+        operation: () => assertLiveModelAvailable(),
+        stage: () => "lmstudio-discovery",
+        record: journal.record,
+        heartbeat: ({ stage, elapsedMs }) => {
+          process.stdout.write(`v1J preflight waiting stage=${stage} elapsedMs=${elapsedMs}\n`);
+        },
+      });
+      journal.record({ event: "lmstudio-discovery-complete" });
       const cell = buildV1JSmokeSchedule(protocol).find(
         (candidate) => candidate.cellId === "smoke-tool-required:A:1",
       );
@@ -2368,23 +2395,58 @@ describeV1JRawRepeatability("v1J raw-only provider repeatability", () => {
       }
       let preflightRequestCount = 0;
       let capture: V1JRawRepeatabilityCapture | undefined;
-      const surface = await captureV1JPreflightSurface(protocol, "A", head, undefined, {
-        benchmarkCase: v1jSmokeBenchmark(cell),
-        prepareWorkspace: (workspaceDir) =>
-          fs.writeFileSync(path.join(workspaceDir, "smoke-reference.txt"), "smoke-token-47\n", {
-            encoding: "utf8",
-            flag: "wx",
+      let preflightStage = "prepared-runtime-acquisition";
+      let preparedRuntimeRecorded = false;
+      journal.record({ event: "prepared-runtime-start" });
+      const surface = await runV1JPreflightWithHeartbeat({
+        operation: () =>
+          captureV1JPreflightSurface(protocol, "A", head, undefined, {
+            benchmarkCase: v1jSmokeBenchmark(cell),
+            prepareWorkspace: (workspaceDir) =>
+              fs.writeFileSync(path.join(workspaceDir, "smoke-reference.txt"), "smoke-token-47\n", {
+                encoding: "utf8",
+                flag: "wx",
+              }),
+            onCheckpoint: (checkpoint) => {
+              if (!preparedRuntimeRecorded && checkpoint.stage === "client-preparation-completed") {
+                preparedRuntimeRecorded = true;
+                journal.record({ event: "prepared-runtime-complete" });
+                preflightStage = "provider-bound-capture";
+                journal.record({ event: "provider-bound-capture-start" });
+              }
+            },
+            onCapturedRequest: () => {
+              journal.record({ event: "request-observer-enter" });
+            },
+            onProviderBoundRequest: ({ request, rawBody, requestIndex, dispatchOrdinal }) => {
+              preflightRequestCount += 1;
+              if (preflightRequestCount !== 1 || requestIndex !== 1 || dispatchOrdinal !== 1) {
+                throw new Error(
+                  "v1J raw repeatability preflight exceeded its single-request bound",
+                );
+              }
+              capture = {
+                endpoint: request.url,
+                rawBody,
+                requestObject: structuredClone(request.body),
+              };
+              const capturedSummary = summarizeV1JRawRepeatabilityRequest(capture);
+              journal.record({
+                event: "provider-bound-request-captured",
+                details: capturedSummary,
+              });
+            },
+            onPreflightStopRaised: () => {
+              journal.record({ event: "preflight-stop-raised" });
+            },
+            onPreflightStopCaught: () => {
+              journal.record({ event: "preflight-stop-caught" });
+            },
           }),
-        onProviderBoundRequest: ({ request, rawBody, requestIndex, dispatchOrdinal }) => {
-          preflightRequestCount += 1;
-          if (preflightRequestCount !== 1 || requestIndex !== 1 || dispatchOrdinal !== 1) {
-            throw new Error("v1J raw repeatability preflight exceeded its single-request bound");
-          }
-          capture = {
-            endpoint: request.url,
-            rawBody,
-            requestObject: structuredClone(request.body),
-          };
+        stage: () => preflightStage,
+        record: journal.record,
+        heartbeat: ({ stage, elapsedMs }) => {
+          process.stdout.write(`v1J preflight waiting stage=${stage} elapsedMs=${elapsedMs}\n`);
         },
       });
       if (!capture || preflightRequestCount !== 1 || ACTIVE_FILTERING_ENABLED !== false) {
@@ -2421,17 +2483,7 @@ describeV1JRawRepeatability("v1J raw-only provider repeatability", () => {
         );
       }
 
-      const journal = createV1JRawRepeatabilityJournal({
-        repoRoot,
-        harnessCommit: head,
-        modelId: protocol.model.id,
-        provider: protocol.model.provider,
-        contextLength: protocol.model.contextLength,
-        modelConfigHash: hashV1ICanonical(modelConfigIdentity()),
-        providerToolSchemaSha256: surface.providerToolSchemaSha256,
-        requestSummary,
-        startedAt: new Date().toISOString(),
-      });
+      journal.record({ event: "preflight-complete" });
       journal.record({
         event: "provider-bound-preflight-complete",
         details: {
@@ -2720,6 +2772,8 @@ async function captureV1JPreflightSurface(
       requestIndex: number;
       dispatchOrdinal: number;
     }) => void;
+    onPreflightStopRaised?: () => void;
+    onPreflightStopCaught?: () => void;
     onCheckpoint?: (checkpoint: EmbeddedCapabilityCheckpoint) => void;
     onProgress?: (stage: string) => void;
   },
@@ -2822,6 +2876,9 @@ async function captureV1JPreflightSurface(
               },
             }
           : {}),
+        ...(options?.onPreflightStopRaised
+          ? { onPreflightStopRaised: options.onPreflightStopRaised }
+          : {}),
         onProviderDispatchAttempt: (count) => {
           dispatchAttempts = count;
         },
@@ -2846,6 +2903,7 @@ async function captureV1JPreflightSurface(
     options?.onProgress?.("schema-preflight-validation-start");
     const failureName = observation.requestPreparationDiagnostics?.failure?.errorName;
     if (failureName === V1IProviderRequestCapturedError.name) {
+      options?.onPreflightStopCaught?.();
       preflightDiagnostics?.increment(
         "preflightStopSignalCaught",
         `arm-${arm.toLowerCase()}-preflight-stop-signal-caught`,
@@ -2857,6 +2915,7 @@ async function captureV1JPreflightSurface(
       errorName: error instanceof Error ? error.name : typeof error,
     });
     if (error instanceof V1IProviderRequestCapturedError) {
+      options?.onPreflightStopCaught?.();
       preflightDiagnostics?.increment(
         "preflightStopSignalCaught",
         `arm-${arm.toLowerCase()}-preflight-stop-signal-caught`,
@@ -6037,6 +6096,7 @@ async function runOne(input: {
       requestIndex: number;
       dispatchOrdinal: number;
     }) => void | Promise<void>;
+    onPreflightStopRaised?: () => void;
     onDelegatedRequest?: () => void;
     onResponseSummary?: (summary: ProviderResponseSummary) => void;
     onAssistantMessage?: (message: AssistantMessage, modelTurnIndex: number) => void;
@@ -8153,6 +8213,7 @@ function captureModelPayloads(
       requestIndex: number;
       dispatchOrdinal: number;
     }) => void | Promise<void>;
+    onPreflightStopRaised?: () => void;
     onDelegatedRequest?: () => void;
     onResponseSummary?: (summary: ProviderResponseSummary) => void;
     lifecycleJournal?: V1JLifecycleJournal;
@@ -8278,6 +8339,7 @@ function captureModelPayloads(
           const stopSignal = new V1IProviderRequestCapturedError();
           providerRequestGateFailed = true;
           providerRequestGateError = stopSignal;
+          options.onPreflightStopRaised?.();
           options?.preflightDiagnostics?.increment(
             "preflightStopSignalRaised",
             preflightEvent("stop-after-provider-bound-capture-signal"),

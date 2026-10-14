@@ -188,7 +188,7 @@ jobs:
         id: mantis_status_token
         if: ${{ steps.resolve.outputs.pr_number != '' }}
         continue-on-error: true
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
         with:
           app-id: ${{ secrets.MANTIS_GITHUB_APP_ID }}
           private-key: ${{ secrets.MANTIS_GITHUB_APP_PRIVATE_KEY }}
@@ -303,7 +303,7 @@ jobs:
       # so uv is a lane runtime dependency, not developer convenience. The runner image does
       # not ship it.
       - name: Setup uv for the Telegram user driver
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
 
       - name: Install local proof tools
         shell: bash
@@ -822,7 +822,7 @@ jobs:
           sudo chmod 0700 "$proof_worktree_root"
 
       - name: Prepare Codex action runtime
-        uses: openai/codex-action@52fe01ec70a42f454c9d2ebd47598f9fd6893d56
+        uses: openai/codex-action@bdf19a4a223ec2549a3e2274a0cf61556bc07675
         with:
           openai-api-key: ${{ secrets.OPENCLAW_MANTIS_AGENT_OPENAI_API_KEY || secrets.OPENAI_API_KEY }}
           codex-home: /tmp/mantis-codex-home-${{ github.run_id }}
@@ -1286,7 +1286,7 @@ jobs:
       - name: Upload Mantis Telegram desktop artifacts
         id: upload_artifact
         if: ${{ always() && steps.inspect.outputs.output_dir != '' && (steps.trusted_evidence.outcome == 'success' || steps.trusted_evidence_failure.outcome == 'success') }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: mantis-telegram-desktop-proof-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
@@ -1300,7 +1300,7 @@ jobs:
       - name: Create Mantis GitHub App token
         id: mantis_app_token
         if: ${{ always() && needs.resolve_request.outputs.pr_number != '' }}
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
         with:
           app-id: ${{ secrets.MANTIS_GITHUB_APP_ID }}
           private-key: ${{ secrets.MANTIS_GITHUB_APP_PRIVATE_KEY }}
@@ -1443,7 +1443,7 @@ jobs:
 
       - name: Create Mantis GitHub App token
         id: mantis_app_token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
         with:
           app-id: ${{ secrets.MANTIS_GITHUB_APP_ID }}
           private-key: ${{ secrets.MANTIS_GITHUB_APP_PRIVATE_KEY }}

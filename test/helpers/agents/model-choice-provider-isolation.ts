@@ -24,7 +24,15 @@ export const V1J_PROVIDER_CONTROL_SCHEMA_BASELINE = {
   providerToolSchemaSha256: "e87b23c436597f65b0a76c5f91a49b53440178731718efdbc70a7a048cbf39b2",
 } as const;
 
-export type V1JProviderControlMode = "stream-false" | "stream-true" | "A" | "B" | "C";
+export type V1JProviderControlMode =
+  | "stream-false"
+  | "stream-true"
+  | "A"
+  | "B"
+  | "C"
+  | "repeat-1"
+  | "repeat-2"
+  | "repeat-3";
 
 export type V1JProviderControlRequest = {
   mode: V1JProviderControlMode;
@@ -36,8 +44,11 @@ export type V1JProviderControlMetrics = {
   model: string;
   maxTokens: number;
   stream: boolean;
+  requestSha256: string;
+  requestCanonicalSha256: string;
   requestJsonBytes: number;
   messageCount: number;
+  messageHashes: readonly { index: number; role: string; contentSha256: string }[];
   totalMessageContentBytes: number;
   toolCount: number;
   toolSchemaJsonBytes: number;
@@ -46,6 +57,10 @@ export type V1JProviderControlMetrics = {
 export type V1JProviderControlResult = V1JProviderControlMetrics & {
   mode: V1JProviderControlMode;
   startedAt: string;
+  dispatchStartedAt: string | null;
+  headersSeenAt: string | null;
+  firstBodyByteAt: string | null;
+  completionAt: string | null;
   elapsedMs: number;
   requestDispatchStarted: boolean;
   requestDispatchCompleted: boolean;
@@ -70,6 +85,7 @@ export type V1JProviderControlEvent = {
   chunkCount?: number;
   byteCount?: number;
   result?: V1JProviderControlResult;
+  details?: Record<string, unknown>;
 };
 
 export type V1JProviderControlFetch = (
@@ -161,6 +177,39 @@ function safeErrorCode(error: unknown): string | null {
   return typeof code === "string" && /^[A-Z0-9_]{1,64}$/.test(code) ? code : null;
 }
 
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalJson).join(",")}]`;
+  }
+  if (value && typeof value === "object") {
+    const entries = Object.entries(value).toSorted(([left], [right]) =>
+      left < right ? -1 : left > right ? 1 : 0,
+    );
+    return `{${entries.map(([key, entry]) => `${JSON.stringify(key)}:${canonicalJson(entry)}`).join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+
+function requestMessageHashes(request: Record<string, unknown>) {
+  if (!Array.isArray(request.messages)) {
+    return [];
+  }
+  return request.messages.map((message, index) => {
+    const row = message && typeof message === "object" ? (message as Record<string, unknown>) : {};
+    const content = row.content;
+    return {
+      index,
+      role: typeof row.role === "string" ? row.role : "unknown",
+      contentSha256: createHash("sha256")
+        .update(
+          typeof content === "string" ? content : (JSON.stringify(content ?? null) ?? "null"),
+          "utf8",
+        )
+        .digest("hex"),
+    };
+  });
+}
+
 function writeDurably(filePath: string, contents: string, exclusive: boolean): void {
   const fd = fs.openSync(filePath, exclusive ? "wx" : "a");
   try {
@@ -235,8 +284,10 @@ export async function runV1JProviderTransportControls(input: {
   for (const { mode, requestObject, serializedRequestBody } of requests) {
     const stream = requestObject.stream === true;
     const requestBody = serializedRequestBody ?? JSON.stringify(requestObject);
+    const parsedBody = JSON.parse(requestBody) as Record<string, unknown>;
     const startedAtMs = (input.now ?? Date.now)();
-    const startedAt = (input.wallNow ?? (() => new Date().toISOString()))();
+    const wallNow = input.wallNow ?? (() => new Date().toISOString());
+    const startedAt = wallNow();
     const controller = new AbortController();
     const timeoutMs = input.timeoutMs ?? V1J_PROVIDER_CONTROL_TIMEOUT_MS;
     const heartbeatMs = input.heartbeatMs ?? V1J_PROVIDER_CONTROL_HEARTBEAT_MS;
@@ -248,8 +299,13 @@ export async function runV1JProviderTransportControls(input: {
           : V1J_PROVIDER_CONTROL_MAX_TOKENS,
       stream,
       mode,
+      requestSha256: createHash("sha256").update(requestBody, "utf8").digest("hex"),
+      requestCanonicalSha256: createHash("sha256")
+        .update(canonicalJson(parsedBody), "utf8")
+        .digest("hex"),
       requestJsonBytes: Buffer.byteLength(requestBody, "utf8"),
       messageCount: Array.isArray(requestObject.messages) ? requestObject.messages.length : 0,
+      messageHashes: requestMessageHashes(requestObject),
       totalMessageContentBytes: Array.isArray(requestObject.messages)
         ? requestObject.messages.reduce((total, message) => {
             if (!message || typeof message !== "object" || !("content" in message)) {
@@ -266,6 +322,10 @@ export async function runV1JProviderTransportControls(input: {
         ? Buffer.byteLength(JSON.stringify(requestObject.tools), "utf8")
         : 0,
       startedAt,
+      dispatchStartedAt: null,
+      headersSeenAt: null,
+      firstBodyByteAt: null,
+      completionAt: null,
       elapsedMs: 0,
       requestDispatchStarted: false,
       requestDispatchCompleted: false,
@@ -287,6 +347,7 @@ export async function runV1JProviderTransportControls(input: {
     let timeout: ReturnType<typeof setTimeout> | undefined;
     const operation = async () => {
       result.requestDispatchStarted = true;
+      result.dispatchStartedAt = wallNow();
       input.record({ event: "request-dispatch-start", mode });
       const response = await input.fetchImpl(input.endpoint, {
         method: "POST",
@@ -301,6 +362,7 @@ export async function runV1JProviderTransportControls(input: {
       result.httpStatus = response.status;
       result.contentType = response.headers.get("content-type");
       result.providerResponseObserved = true;
+      result.headersSeenAt = wallNow();
       input.record({ event: "request-dispatch-complete", mode });
       input.record({ event: "http-response-headers", mode });
 
@@ -324,6 +386,7 @@ export async function runV1JProviderTransportControls(input: {
           const elapsedMs = (input.now ?? Date.now)() - startedAtMs;
           if (result.responseFirstByteMs === null) {
             result.responseFirstByteMs = elapsedMs;
+            result.firstBodyByteAt = wallNow();
             input.record({ event: "response-first-byte", mode, elapsedMs });
           }
           result.responseChunkCount += 1;
@@ -415,6 +478,7 @@ export async function runV1JProviderTransportControls(input: {
       }
       clearInterval(activeHeartbeatTimer);
       result.elapsedMs = (input.now ?? Date.now)() - startedAtMs;
+      result.completionAt = wallNow();
       input.record({ event: "control-complete", mode, result });
     }
     results.push(result);

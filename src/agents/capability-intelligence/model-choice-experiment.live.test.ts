@@ -74,6 +74,7 @@ import {
   V1J_PROVIDER_CONTROL_MODEL_CONFIG_SHA256,
   V1J_PROVIDER_CONTROL_SCHEMA_BASELINE,
 } from "../../../test/helpers/agents/model-choice-provider-isolation.js";
+import { recordV1JProviderMaterializationTrace } from "../../../test/helpers/agents/model-choice-provider-materialization-trace.js";
 import { runV1JPayloadDecompositionDiagnostic } from "../../../test/helpers/agents/model-choice-provider-payload-decomposition-live.js";
 import {
   V1J_PAYLOAD_DECOMPOSITION_AUTHORIZED_FLAG,
@@ -251,6 +252,35 @@ if (
   )
 ) {
   throw new Error("v1J provider capture preflight cannot share another v1I/v1J mode");
+}
+const V1J_MATERIALIZATION_TRACE_PREFLIGHT_RUN_FLAG = "OPENCLAW_V1J_MATERIALIZATION_TRACE_PREFLIGHT";
+const V1J_MATERIALIZATION_TRACE_PREFLIGHT_AUTHORIZED_FLAG =
+  "OPENCLAW_V1J_MATERIALIZATION_TRACE_PREFLIGHT_AUTHORIZED";
+const V1J_MATERIALIZATION_TRACE_PREFLIGHT_COMMIT_FLAG =
+  "OPENCLAW_V1J_MATERIALIZATION_TRACE_PREFLIGHT_COMMIT";
+const V1J_MATERIALIZATION_TRACE_PREFLIGHT =
+  process.env[V1J_MATERIALIZATION_TRACE_PREFLIGHT_RUN_FLAG] === "1";
+const V1J_MATERIALIZATION_TRACE_PREFLIGHT_FLAGS = new Set([
+  V1J_MATERIALIZATION_TRACE_PREFLIGHT_RUN_FLAG,
+  V1J_MATERIALIZATION_TRACE_PREFLIGHT_AUTHORIZED_FLAG,
+  V1J_MATERIALIZATION_TRACE_PREFLIGHT_COMMIT_FLAG,
+]);
+const anyV1JMaterializationTracePreflightFlag = [...V1J_MATERIALIZATION_TRACE_PREFLIGHT_FLAGS].some(
+  (name) => process.env[name] !== undefined,
+);
+if (anyV1JMaterializationTracePreflightFlag && !V1J_MATERIALIZATION_TRACE_PREFLIGHT) {
+  throw new Error("v1J materialization trace preflight requires its dedicated run flag");
+}
+if (
+  V1J_MATERIALIZATION_TRACE_PREFLIGHT &&
+  Object.entries(process.env).some(
+    ([name, value]) =>
+      value !== undefined &&
+      /^(OPENCLAW_V1[IJ]_)/.test(name) &&
+      !V1J_MATERIALIZATION_TRACE_PREFLIGHT_FLAGS.has(name),
+  )
+) {
+  throw new Error("v1J materialization trace preflight cannot share another v1I/v1J mode");
 }
 const V1J_ADAPTER_DIFFERENTIAL_FLAGS = new Set([
   V1J_ADAPTER_DIFFERENTIAL_RUN_FLAG,
@@ -1767,6 +1797,9 @@ const describeV1JRawRepeatability = V1J_RAW_REPEATABILITY ? describe : describe.
 const describeV1JProviderCapturePreflight = V1J_PROVIDER_CAPTURE_PREFLIGHT
   ? describe
   : describe.skip;
+const describeV1JProviderMaterializationTracePreflight = V1J_MATERIALIZATION_TRACE_PREFLIGHT
+  ? describe
+  : describe.skip;
 const describeFullLive =
   LIVE &&
   !SMOKE_TEST &&
@@ -2780,6 +2813,22 @@ describe("v1J pre-capture re-entry trace", () => {
     ).toEqual(["$.materializationFactors.boundaryTimezoneConfigured"]);
     expect(JSON.stringify([first, changed])).not.toContain(privateSystem);
     expect(JSON.stringify([first, changed])).not.toContain(privateUser);
+    expect([...V1J_PROMPT_MATERIALIZATION_STAGES]).toEqual([
+      "prompt-context-built",
+      "prompt-submit-enter",
+      "prompt-history-normalized",
+      "model-prompt-transform-enter",
+      "model-prompt-transform-complete",
+      "agent-llm-boundary-input",
+      "agent-llm-boundary-normalized",
+      "agent-llm-boundary-relocated",
+      "agent-llm-boundary-converted",
+      "provider-adapter-input",
+      "provider-message-conversion-input",
+      "provider-message-conversion-output",
+      "provider-request-object-constructed",
+      "provider-onPayload-transform-enter",
+    ]);
   });
 
   it("journals same-run transcript growth with appended roles and hashes only", () => {
@@ -2896,472 +2945,518 @@ describe("v1J pre-capture re-entry trace", () => {
   });
 });
 
-describeV1JProviderCapturePreflight("v1J provider-bound capture preflight only", () => {
+describeV1JProviderCapturePreflight("v1J provider-bound body capture preflight only", () => {
   it(
     "captures one serialized request and terminates before every dispatch path",
     { timeout: 600_000 },
     async () => {
-      if (
-        !V1J_PROVIDER_CAPTURE_PREFLIGHT ||
-        process.env[V1J_PROVIDER_CAPTURE_PREFLIGHT_AUTHORIZED_FLAG] !== "1" ||
-        LIVE ||
-        V1J_ACTION_LIVE_TEST ||
-        V1J_ACTION_LIVE_AUTHORIZED ||
-        V1J_ACTION_SMOKE_TEST ||
-        V1J_ACTION_SMOKE_AUTHORIZED ||
-        V1J_ADAPTER_DIFFERENTIAL ||
-        V1J_PROVIDER_RESPONSE_DIAGNOSTIC ||
-        V1J_ARM_C_PREFLIGHT_DIAGNOSTIC ||
-        V1J_SCHEMA_CAPTURE_MODE !== undefined ||
-        process.env.OPENCLAW_V1I_MODE !== undefined ||
-        process.env.OPENCLAW_V1I_CELL_ALLOWLIST !== undefined ||
-        process.env.OPENCLAW_V1I_MAX_CELLS !== undefined
-      ) {
-        throw new Error("v1J provider capture preflight requires only its dedicated flags");
-      }
-
-      const protocol = readV1JPreregistration();
-      const head = assertV1JCommittedHarness(protocol);
-      const repoRoot = process.cwd();
-      if (process.env[V1J_PROVIDER_CAPTURE_PREFLIGHT_COMMIT_FLAG] !== head) {
-        throw new Error("v1J provider capture preflight commit authorization mismatch");
-      }
-      const protocolPath = path.resolve(repoRoot, V1J_PREREGISTRATION_PATH);
-      const protocolBytes = fs.readFileSync(protocolPath);
-      const protocolSha256 = createHash("sha256").update(protocolBytes).digest("hex");
-      const detachedHash = fs.readFileSync(protocolPath.replace(/\.json$/u, ".sha256"), "utf8");
-      const provenance = JSON.parse(
-        fs.readFileSync(path.resolve(repoRoot, V1J_SMOKE_PROVENANCE_PATH), "utf8"),
-      ) as unknown;
-      assertV1JSmokeProvenance(provenance, protocol, head);
-
-      const modelConfigHash = hashV1ICanonical(modelConfigIdentity());
-      const formalRoot = path.resolve(repoRoot, V1J_FORMAL_ARTIFACT_RELATIVE_PATH);
-      const normalSmokeRoot = resolveV1JSmokeRoot(repoRoot, head);
-      const bodyArtifactRoot = path.resolve(repoRoot, V1J_PROVIDER_BOUND_BODY_PARENT, head);
-      const formalStateExists = fs.existsSync(formalRoot);
-      const normalSmokeStateExists = fs.existsSync(normalSmokeRoot);
-      const bodyArtifactExists = fs.existsSync(bodyArtifactRoot);
-      const measuredSchemaMatches =
-        protocol.schemaBaseline.authorizedToolCount ===
-          V1J_PROVIDER_CONTROL_SCHEMA_BASELINE.authorizedToolCount &&
-        protocol.schemaBaseline.providerToolCount ===
-          V1J_PROVIDER_CONTROL_SCHEMA_BASELINE.providerToolCount &&
-        protocol.schemaBaseline.authorizedToolNameSha256 ===
-          V1J_PROVIDER_CONTROL_SCHEMA_BASELINE.authorizedToolNameSha256 &&
-        protocol.schemaBaseline.providerToolNameSha256 ===
-          V1J_PROVIDER_CONTROL_SCHEMA_BASELINE.providerToolNameSha256 &&
-        protocol.schemaBaseline.authorizedToolSchemaSha256 ===
-          V1J_PROVIDER_CONTROL_SCHEMA_BASELINE.authorizedToolSchemaSha256 &&
-        protocol.schemaBaseline.providerToolSchemaSha256 ===
-          V1J_PROVIDER_CONTROL_SCHEMA_BASELINE.providerToolSchemaSha256;
-      if (
-        protocolSha256 !== V1J_PREREGISTRATION_SHA256 ||
-        detachedHash.trim().split(/\s+/)[0]?.toLowerCase() !== V1J_PREREGISTRATION_SHA256 ||
-        protocol.model.id !== MODEL_ID ||
-        protocol.model.provider !== PROVIDER ||
-        protocol.model.contextLength !== CONTEXT_LENGTH ||
-        modelConfigHash !== V1J_PROVIDER_CONTROL_MODEL_CONFIG_SHA256 ||
-        protocol.base.productionFrozen.activeFilteringEnabled !== false ||
-        ACTIVE_FILTERING_ENABLED !== false ||
-        !measuredSchemaMatches ||
-        formalStateExists ||
-        normalSmokeStateExists ||
-        bodyArtifactExists
-      ) {
-        throw new Error("v1J provider capture preflight frozen gates failed");
-      }
-
-      const cell = buildV1JSmokeSchedule(protocol).find(
-        (candidate) => candidate.cellId === "smoke-tool-required:A:1",
-      );
-      if (!cell || cell.arm !== "A" || cell.stratum !== "TOOL_REQUIRED") {
-        throw new Error("v1J provider capture preflight request-construction case changed");
-      }
-      const journal = createV1JPreflightDiagnosticJournal({
-        repoRoot,
-        harnessCommit: head,
-        arm: "A",
-        caseId: cell.caseId,
-        preflightId: `provider-bound-capture-${head.slice(0, 8)}-${process.pid}`,
-        pid: process.pid,
-      });
-      let preflightStage = "lmstudio-discovery";
-      let providerBoundCaptureCount = 0;
-      let requestSummary: ReturnType<typeof summarizeV1JRawRepeatabilityRequest> | undefined;
-      let bodyArtifact: ReturnType<typeof publishAndVerifyV1JProviderBoundBodyArtifact> | undefined;
-      const providerCaptureStages: string[] = [];
-      const callbackStageStartedAt = new Map<string, string>();
-      const recordCaptureStage = (event: V1JProviderControlEvent) => {
-        preflightStage = event.event;
-        providerCaptureStages.push(event.event);
-        const observedAt = new Date().toISOString();
-        const stageName = event.event.replace(
-          /-(?:start|complete|failed|enter|exit|raised|caught)$/,
-          "",
-        );
-        const phase =
-          event.event.match(/(?:start|complete|failed|enter|exit|raised|caught)$/)?.[0] ?? "event";
-        const enteredAt =
-          phase === "start" || phase === "enter"
-            ? observedAt
-            : callbackStageStartedAt.get(stageName);
-        if (phase === "start" || phase === "enter") {
-          callbackStageStartedAt.set(stageName, observedAt);
-        }
-        if (
-          phase === "complete" ||
-          phase === "failed" ||
-          phase === "exit" ||
-          phase === "raised" ||
-          phase === "caught"
-        ) {
-          callbackStageStartedAt.delete(stageName);
-        }
-        const allowedDetails = new Set([
-          "canonicalRequestSha256",
-          "rawBodySha256",
-          "componentFingerprint",
-          "callbackIndex",
-          "contentBytes",
-          "errorName",
-          "messageCount",
-          "requestJsonBytes",
-          "stageName",
-          "awaited",
-          "awaitTargetClass",
-          "phase",
-          "enteredAt",
-          "completedAt",
-          "targetEvent",
-          "toolCount",
-        ]);
-        const details = Object.fromEntries(
-          Object.entries(event.details ?? {}).filter(([key]) => allowedDetails.has(key)),
-        );
-        journal.record(`provider-capture-${event.event}`, {
-          stageName,
-          phase,
-          enteredAt: enteredAt ?? observedAt,
-          completedAt:
-            phase === "complete" ||
-            phase === "failed" ||
-            phase === "exit" ||
-            phase === "raised" ||
-            phase === "caught"
-              ? observedAt
-              : null,
-          awaited: event.details?.awaited === true,
-          awaitTargetClass:
-            typeof event.details?.awaitTargetClass === "string"
-              ? event.details.awaitTargetClass
-              : null,
-          ...(event.elapsedMs === undefined ? {} : { elapsedMs: event.elapsedMs }),
-          ...(Object.keys(details).length === 0 ? {} : { details }),
-        });
-      };
-      const recordCallbackJournalEvent = (event: string, details: Record<string, unknown> = {}) => {
-        recordV1JPreflightCallbackJournalEvent(journal, event, details, recordCaptureStage);
-      };
-      try {
-        journal.record("provider-capture-preflight-start", {
-          harnessCommit: head,
-          v2Sha256: protocolSha256,
-          activeFilteringEnabled: false,
-          providerDispatches: 0,
-          rawRequestsSent: 0,
-          toolExecutions: 0,
-        });
-        journal.record("lmstudio-discovery-start");
-        await runV1JPreflightWithHeartbeat({
-          operation: () => assertLiveModelAvailable(),
-          stage: () => preflightStage,
-          record: (event) => journal.record(event.event, event.details),
-          heartbeat: ({ stage, elapsedMs }) =>
-            process.stdout.write(
-              `v1J capture preflight waiting stage=${stage} elapsedMs=${elapsedMs}\n`,
-            ),
-        });
-        journal.record("lmstudio-discovery-complete");
-        preflightStage = "prepared-runtime";
-        journal.record("prepared-runtime-start");
-        const surface = await runV1JPreflightWithHeartbeat({
-          operation: () =>
-            captureV1JPreflightSurface(protocol, "A", head, journal, {
-              benchmarkCase: v1jSmokeBenchmark(cell),
-              prepareWorkspace: (workspaceDir) =>
-                fs.writeFileSync(
-                  path.join(workspaceDir, "smoke-reference.txt"),
-                  "smoke-token-47\n",
-                  { encoding: "utf8", flag: "wx" },
-                ),
-              onCheckpoint: (checkpoint) => {
-                if (checkpoint.stage === "client-preparation-completed") {
-                  preflightStage = "provider-bound-capture";
-                  journal.record("prepared-runtime-complete", { checkpoint: checkpoint.stage });
-                  journal.record("provider-bound-capture-start");
-                }
-              },
-              onProgress: (stage) => {
-                preflightStage = stage;
-                journal.record("preflight-progress", { stage });
-              },
-              onProviderCaptureStage: recordCaptureStage,
-              onProviderBoundRequest: ({ request, rawBody, requestIndex, dispatchOrdinal }) => {
-                providerBoundCaptureCount += 1;
-                if (
-                  providerBoundCaptureCount !== 1 ||
-                  requestIndex !== 1 ||
-                  dispatchOrdinal !== 1
-                ) {
-                  throw new Error("v1J provider capture preflight exceeded its one-request bound");
-                }
-                recordCallbackJournalEvent("capture-record-build-start", {
-                  awaited: false,
-                  stageName: "capture-record-build",
-                });
-                requestSummary = summarizeV1JRawRepeatabilityRequest(
-                  { endpoint: request.url, rawBody, requestObject: request.body },
-                  recordCaptureStage,
-                );
-                const previousCaptureComponents: V1JProviderRequestFingerprintComponent[] = [
-                  {
-                    path: "$.messageCount",
-                    sha256: createHash("sha256").update("2", "utf8").digest("hex"),
-                    bytes: null,
-                  },
-                  {
-                    path: "$.toolCount",
-                    sha256: createHash("sha256").update("15", "utf8").digest("hex"),
-                    bytes: null,
-                  },
-                  {
-                    path: "$.requestJsonBytes",
-                    sha256: createHash("sha256").update("26653", "utf8").digest("hex"),
-                    bytes: null,
-                  },
-                  {
-                    path: "$.canonicalRequest",
-                    sha256: "66ea318a79db06b91146e433ed7765f9b4edc14a0d73d744db57aa80b500fd7a",
-                    bytes: null,
-                  },
-                  {
-                    path: "$.messages[0].role",
-                    sha256: createHash("sha256").update('"system"', "utf8").digest("hex"),
-                    bytes: null,
-                  },
-                  {
-                    path: "$.messages[0].content",
-                    sha256: "807473baaf56fe2403b3456e2461a9ccaf1b151c73d3cf17431b1de89e4c2d74",
-                    bytes: 4866,
-                  },
-                  {
-                    path: "$.messages[1].role",
-                    sha256: createHash("sha256").update('"user"', "utf8").digest("hex"),
-                    bytes: null,
-                  },
-                  {
-                    path: "$.messages[1].content",
-                    sha256: "a0f77b7bf2790c81ea52130a4226671601df6c12f95d5ec06d1ebdaa73d45e00",
-                    bytes: 156,
-                  },
-                  {
-                    path: "$.tools.canonicalNameSet",
-                    sha256: "741f7983e4ba7652384ee83fed16b67f81e567b2231cfccbba8f58c19ee6837b",
-                    bytes: null,
-                  },
-                  {
-                    path: "$.tools.canonicalSchemaSet",
-                    sha256: "e87b23c436597f65b0a76c5f91a49b53440178731718efdbc70a7a048cbf39b2",
-                    bytes: null,
-                  },
-                ];
-                const drift = diffV1JProviderRequestFingerprintComponents(
-                  previousCaptureComponents,
-                  requestSummary.componentFingerprint.components,
-                );
-                journal.record("canonical-request-drift-diagnosis", {
-                  priorCaptureCommit: "7782b3fc1ff68fccc021b61611dfc478a21c0d55",
-                  priorCanonicalRequestSha256:
-                    "66ea318a79db06b91146e433ed7765f9b4edc14a0d73d744db57aa80b500fd7a",
-                  priorRequestJsonBytes: 26653,
-                  currentCanonicalRequestSha256: requestSummary.requestCanonicalSha256,
-                  currentRawBodySha256: requestSummary.requestSha256,
-                  currentRequestJsonBytes: requestSummary.requestJsonBytes,
-                  comparedPaths: drift.comparedPaths,
-                  canonicalDriftPaths: drift.differences
-                    .filter(
-                      ({ path: componentPath }) =>
-                        componentPath !== "$.canonicalRequest" &&
-                        componentPath !== "$.rawSerializedBody",
-                    )
-                    .map(({ path: componentPath }) => componentPath),
-                  differences: drift.differences,
-                  priorEvidenceUnavailablePaths: [
-                    "$.rootKeys",
-                    "$.model",
-                    "$.stream",
-                    "$.tool_choice",
-                    "$.providerOptions",
-                    "$.messages[0].toolCalls",
-                    "$.messages[1].toolCalls",
-                    "$.tools.names",
-                    "$.tools.schemas",
-                    "$.rawSerializedBody",
-                  ],
-                });
-                bodyArtifact = publishAndVerifyV1JProviderBoundBodyArtifact({
-                  repoRoot,
-                  captureCommit: head,
-                  endpoint: request.url,
-                  provider: protocol.model.provider,
-                  model: protocol.model.id,
-                  rawBody,
-                  expectedCanonicalRequestSha256: V1J_PROVIDER_BOUND_REQUEST_CANONICAL_SHA256,
-                });
-                if (
-                  bodyArtifact.metadata.bodyBytes !== requestSummary.requestJsonBytes ||
-                  bodyArtifact.metadata.canonicalRequestSha256 !==
-                    requestSummary.requestCanonicalSha256
-                ) {
-                  throw new Error(
-                    "v1J provider-bound body export metadata differs from captured request",
-                  );
-                }
-                journal.record("provider-bound-body-export-complete", {
-                  captureCommit: bodyArtifact.metadata.captureCommit,
-                  bodyBytes: bodyArtifact.metadata.bodyBytes,
-                  rawBodySha256: bodyArtifact.metadata.rawBodySha256,
-                  canonicalRequestSha256: bodyArtifact.metadata.canonicalRequestSha256,
-                  messageCount: bodyArtifact.metadata.messageCount,
-                  toolCount: bodyArtifact.metadata.toolCount,
-                  provider: bodyArtifact.metadata.provider,
-                  model: bodyArtifact.metadata.model,
-                });
-                recordCallbackJournalEvent("capture-record-build-complete", {
-                  awaited: false,
-                  stageName: "capture-record-build",
-                  messageCount: requestSummary.messageCount,
-                  toolCount: requestSummary.toolCount,
-                  requestJsonBytes: requestSummary.requestJsonBytes,
-                  canonicalRequestSha256: requestSummary.requestCanonicalSha256,
-                });
-              },
-              onPreflightStopRaised: () => {
-                recordCaptureStage({
-                  event: "stop-signal-raise",
-                  details: { stageName: "preflight-stop-signal", awaited: false },
-                });
-                recordCallbackJournalEvent("preflight-stop-signal-raised");
-              },
-              onPreflightStopCaught: () => {
-                recordCaptureStage({
-                  event: "stop-signal-caught",
-                  details: { stageName: "preflight-stop-signal", awaited: false },
-                });
-                recordCallbackJournalEvent("preflight-stop-signal-caught");
-              },
-            }),
-          stage: () => preflightStage,
-          record: (event) => journal.record(event.event, event.details),
-          heartbeat: ({ stage, elapsedMs }) =>
-            process.stdout.write(
-              `v1J capture preflight waiting stage=${stage} elapsedMs=${elapsedMs}\n`,
-            ),
-        });
-        const counters = journal.counters();
-        if (
-          !requestSummary ||
-          providerBoundCaptureCount !== 1 ||
-          counters.providerDispatchAttempts !== 0 ||
-          counters.providerCallbackInvocations !== 0 ||
-          counters.modelRequestCounter !== 0 ||
-          counters.preflightStopSignalRaised !== 1 ||
-          counters.preflightStopSignalCaught !== 1 ||
-          counters.preflightCompleted !== 1 ||
-          ACTIVE_FILTERING_ENABLED !== false
-        ) {
-          throw new Error(
-            "v1J provider capture preflight did not terminate on its no-dispatch gate",
-          );
-        }
-        if (fs.existsSync(formalRoot) || fs.existsSync(normalSmokeRoot)) {
-          throw new Error("v1J provider capture preflight observed formal or smoke state");
-        }
-        if (!bodyArtifact || !requestSummary) {
-          throw new Error("v1J provider-bound body was not verified before preflight stop");
-        }
-        if (
-          bodyArtifact.metadata.bodyBytes !== requestSummary.requestJsonBytes ||
-          bodyArtifact.metadata.canonicalRequestSha256 !== requestSummary.requestCanonicalSha256
-        ) {
-          throw new Error("v1J provider-bound body metadata changed after callback verification");
-        }
-        journal.record("provider-capture-preflight-complete", {
-          ...counters,
-          authorizedToolCount: surface.authorizedToolCount,
-          providerToolCount: surface.providerToolCount,
-          messageCount: requestSummary.messageCount,
-          toolCount: requestSummary.toolCount,
-          requestJsonBytes: requestSummary.requestJsonBytes,
-          canonicalRequestSha256: requestSummary.requestCanonicalSha256,
-          rawBodySha256: bodyArtifact.metadata.rawBodySha256,
-          bodyArtifactRoot: bodyArtifact.artifactRoot,
-          providerDispatches: 0,
-          rawRequestsSent: 0,
-          toolExecutions: 0,
-          formalStateTouched: false,
-          normalSmokeStateTouched: false,
-        });
-        process.stdout.write(
-          `${JSON.stringify({
-            harnessCommit: head,
-            requestObserverInvocations: counters.requestObserverInvocations,
-            requestObjectReceived: providerBoundCaptureCount === 1,
-            providerBoundCaptured: true,
-            providerCaptureStages,
-            preflightStopRaised: counters.preflightStopSignalRaised === 1,
-            preflightStopCaught: counters.preflightStopSignalCaught === 1,
-            preflightCompleted: true,
-            messageCount: requestSummary.messageCount,
-            toolCount: requestSummary.toolCount,
-            requestJsonBytes: requestSummary.requestJsonBytes,
-            canonicalRequestSha256: requestSummary.requestCanonicalSha256,
-            rawBodySha256: bodyArtifact.metadata.rawBodySha256,
-            bodyArtifactRoot: bodyArtifact.artifactRoot,
-            providerDispatches: 0,
-            rawRequestsSent: 0,
-            toolExecutions: 0,
-            activeFilteringEnabled: false,
-            formalStateTouched: false,
-            normalSmokeStateTouched: false,
-            artifactPath: journal.filePath,
-          })}\n`,
-        );
-      } catch (error) {
-        try {
-          recordCaptureStage({
-            event: "outer-catch-enter",
-            details: {
-              stageName: "provider-capture-preflight",
-              awaited: false,
-              errorName: error instanceof Error ? error.name : "NonErrorThrown",
-            },
-          });
-          journal.record("provider-capture-preflight-failed", {
-            errorName: error instanceof Error ? error.name : "NonErrorThrown",
-            lastCheckpoint: preflightStage,
-          });
-        } catch {
-          // A failed diagnostic sink must not replace the callback's original failure.
-        }
-        throw error;
-      } finally {
-        journal.close();
-      }
+      await runV1JProviderCapturePreflight("body-export");
     },
   );
 });
+
+describeV1JProviderMaterializationTracePreflight(
+  "v1J provider materialization trace preflight only",
+  () => {
+    it(
+      "records materialization fingerprints without publishing the provider body",
+      { timeout: 600_000 },
+      async () => {
+        await runV1JProviderCapturePreflight("materialization-trace");
+      },
+    );
+  },
+);
+
+async function runV1JProviderCapturePreflight(mode: "body-export" | "materialization-trace") {
+  const materializationTraceOnly = mode === "materialization-trace";
+  const runFlag = materializationTraceOnly
+    ? V1J_MATERIALIZATION_TRACE_PREFLIGHT
+    : V1J_PROVIDER_CAPTURE_PREFLIGHT;
+  const authorizedFlag = materializationTraceOnly
+    ? process.env[V1J_MATERIALIZATION_TRACE_PREFLIGHT_AUTHORIZED_FLAG]
+    : process.env[V1J_PROVIDER_CAPTURE_PREFLIGHT_AUTHORIZED_FLAG];
+  const commitFlag = materializationTraceOnly
+    ? process.env[V1J_MATERIALIZATION_TRACE_PREFLIGHT_COMMIT_FLAG]
+    : process.env[V1J_PROVIDER_CAPTURE_PREFLIGHT_COMMIT_FLAG];
+  if (
+    !runFlag ||
+    authorizedFlag !== "1" ||
+    LIVE ||
+    V1J_ACTION_LIVE_TEST ||
+    V1J_ACTION_LIVE_AUTHORIZED ||
+    V1J_ACTION_SMOKE_TEST ||
+    V1J_ACTION_SMOKE_AUTHORIZED ||
+    V1J_ADAPTER_DIFFERENTIAL ||
+    V1J_PROVIDER_RESPONSE_DIAGNOSTIC ||
+    V1J_ARM_C_PREFLIGHT_DIAGNOSTIC ||
+    V1J_SCHEMA_CAPTURE_MODE !== undefined ||
+    process.env.OPENCLAW_V1I_MODE !== undefined ||
+    process.env.OPENCLAW_V1I_CELL_ALLOWLIST !== undefined ||
+    process.env.OPENCLAW_V1I_MAX_CELLS !== undefined
+  ) {
+    throw new Error("v1J provider preflight requires only its dedicated flags");
+  }
+
+  const protocol = readV1JPreregistration();
+  const head = assertV1JCommittedHarness(protocol);
+  const repoRoot = process.cwd();
+  if (commitFlag !== head) {
+    throw new Error("v1J provider preflight commit authorization mismatch");
+  }
+  const protocolPath = path.resolve(repoRoot, V1J_PREREGISTRATION_PATH);
+  const protocolBytes = fs.readFileSync(protocolPath);
+  const protocolSha256 = createHash("sha256").update(protocolBytes).digest("hex");
+  const detachedHash = fs.readFileSync(protocolPath.replace(/\.json$/u, ".sha256"), "utf8");
+  const provenance = JSON.parse(
+    fs.readFileSync(path.resolve(repoRoot, V1J_SMOKE_PROVENANCE_PATH), "utf8"),
+  ) as unknown;
+  assertV1JSmokeProvenance(provenance, protocol, head);
+
+  const modelConfigHash = hashV1ICanonical(modelConfigIdentity());
+  const formalRoot = path.resolve(repoRoot, V1J_FORMAL_ARTIFACT_RELATIVE_PATH);
+  const normalSmokeRoot = resolveV1JSmokeRoot(repoRoot, head);
+  const bodyArtifactRoot = path.resolve(repoRoot, V1J_PROVIDER_BOUND_BODY_PARENT, head);
+  const formalStateExists = fs.existsSync(formalRoot);
+  const normalSmokeStateExists = fs.existsSync(normalSmokeRoot);
+  const bodyArtifactExists = fs.existsSync(bodyArtifactRoot);
+  const measuredSchemaMatches =
+    protocol.schemaBaseline.authorizedToolCount ===
+      V1J_PROVIDER_CONTROL_SCHEMA_BASELINE.authorizedToolCount &&
+    protocol.schemaBaseline.providerToolCount ===
+      V1J_PROVIDER_CONTROL_SCHEMA_BASELINE.providerToolCount &&
+    protocol.schemaBaseline.authorizedToolNameSha256 ===
+      V1J_PROVIDER_CONTROL_SCHEMA_BASELINE.authorizedToolNameSha256 &&
+    protocol.schemaBaseline.providerToolNameSha256 ===
+      V1J_PROVIDER_CONTROL_SCHEMA_BASELINE.providerToolNameSha256 &&
+    protocol.schemaBaseline.authorizedToolSchemaSha256 ===
+      V1J_PROVIDER_CONTROL_SCHEMA_BASELINE.authorizedToolSchemaSha256 &&
+    protocol.schemaBaseline.providerToolSchemaSha256 ===
+      V1J_PROVIDER_CONTROL_SCHEMA_BASELINE.providerToolSchemaSha256;
+  if (
+    protocolSha256 !== V1J_PREREGISTRATION_SHA256 ||
+    detachedHash.trim().split(/\s+/)[0]?.toLowerCase() !== V1J_PREREGISTRATION_SHA256 ||
+    protocol.model.id !== MODEL_ID ||
+    protocol.model.provider !== PROVIDER ||
+    protocol.model.contextLength !== CONTEXT_LENGTH ||
+    modelConfigHash !== V1J_PROVIDER_CONTROL_MODEL_CONFIG_SHA256 ||
+    protocol.base.productionFrozen.activeFilteringEnabled !== false ||
+    ACTIVE_FILTERING_ENABLED !== false ||
+    !measuredSchemaMatches ||
+    formalStateExists ||
+    normalSmokeStateExists ||
+    bodyArtifactExists
+  ) {
+    throw new Error("v1J provider preflight frozen gates failed");
+  }
+
+  const cell = buildV1JSmokeSchedule(protocol).find(
+    (candidate) => candidate.cellId === "smoke-tool-required:A:1",
+  );
+  if (!cell || cell.arm !== "A" || cell.stratum !== "TOOL_REQUIRED") {
+    throw new Error("v1J provider capture preflight request-construction case changed");
+  }
+  const journal = createV1JPreflightDiagnosticJournal({
+    repoRoot,
+    harnessCommit: head,
+    arm: "A",
+    caseId: cell.caseId,
+    preflightId: `provider-bound-capture-${head.slice(0, 8)}-${process.pid}`,
+    pid: process.pid,
+  });
+  let preflightStage = "lmstudio-discovery";
+  let providerBoundCaptureCount = 0;
+  let requestSummary: ReturnType<typeof summarizeV1JRawRepeatabilityRequest> | undefined;
+  let bodyArtifact: ReturnType<typeof publishAndVerifyV1JProviderBoundBodyArtifact> | undefined;
+  const providerCaptureStages: string[] = [];
+  const callbackStageStartedAt = new Map<string, string>();
+  const recordCaptureStage = (event: V1JProviderControlEvent) => {
+    preflightStage = event.event;
+    providerCaptureStages.push(event.event);
+    const observedAt = new Date().toISOString();
+    const stageName = event.event.replace(
+      /-(?:start|complete|failed|enter|exit|raised|caught)$/,
+      "",
+    );
+    const phase =
+      event.event.match(/(?:start|complete|failed|enter|exit|raised|caught)$/)?.[0] ?? "event";
+    const enteredAt =
+      phase === "start" || phase === "enter" ? observedAt : callbackStageStartedAt.get(stageName);
+    if (phase === "start" || phase === "enter") {
+      callbackStageStartedAt.set(stageName, observedAt);
+    }
+    if (
+      phase === "complete" ||
+      phase === "failed" ||
+      phase === "exit" ||
+      phase === "raised" ||
+      phase === "caught"
+    ) {
+      callbackStageStartedAt.delete(stageName);
+    }
+    const allowedDetails = new Set([
+      "canonicalRequestSha256",
+      "rawBodySha256",
+      "componentFingerprint",
+      "callbackIndex",
+      "contentBytes",
+      "errorName",
+      "messageCount",
+      "requestJsonBytes",
+      "stageName",
+      "awaited",
+      "awaitTargetClass",
+      "phase",
+      "enteredAt",
+      "completedAt",
+      "targetEvent",
+      "toolCount",
+    ]);
+    const details = Object.fromEntries(
+      Object.entries(event.details ?? {}).filter(([key]) => allowedDetails.has(key)),
+    );
+    journal.record(`provider-capture-${event.event}`, {
+      stageName,
+      phase,
+      enteredAt: enteredAt ?? observedAt,
+      completedAt:
+        phase === "complete" ||
+        phase === "failed" ||
+        phase === "exit" ||
+        phase === "raised" ||
+        phase === "caught"
+          ? observedAt
+          : null,
+      awaited: event.details?.awaited === true,
+      awaitTargetClass:
+        typeof event.details?.awaitTargetClass === "string" ? event.details.awaitTargetClass : null,
+      ...(event.elapsedMs === undefined ? {} : { elapsedMs: event.elapsedMs }),
+      ...(Object.keys(details).length === 0 ? {} : { details }),
+    });
+  };
+  const recordCallbackJournalEvent = (event: string, details: Record<string, unknown> = {}) => {
+    recordV1JPreflightCallbackJournalEvent(journal, event, details, recordCaptureStage);
+  };
+  try {
+    journal.record("provider-capture-preflight-start", {
+      preflightMode: materializationTraceOnly ? "materialization-trace-only" : mode,
+      harnessCommit: head,
+      v2Sha256: protocolSha256,
+      activeFilteringEnabled: false,
+      providerDispatches: 0,
+      rawRequestsSent: 0,
+      toolExecutions: 0,
+    });
+    journal.record("lmstudio-discovery-start");
+    await runV1JPreflightWithHeartbeat({
+      operation: () => assertLiveModelAvailable(),
+      stage: () => preflightStage,
+      record: (event) => journal.record(event.event, event.details),
+      heartbeat: ({ stage, elapsedMs }) =>
+        process.stdout.write(
+          `v1J capture preflight waiting stage=${stage} elapsedMs=${elapsedMs}\n`,
+        ),
+    });
+    journal.record("lmstudio-discovery-complete");
+    preflightStage = "prepared-runtime";
+    journal.record("prepared-runtime-start");
+    const surface = await runV1JPreflightWithHeartbeat({
+      operation: () =>
+        captureV1JPreflightSurface(protocol, "A", head, journal, {
+          benchmarkCase: v1jSmokeBenchmark(cell),
+          prepareWorkspace: (workspaceDir) =>
+            fs.writeFileSync(path.join(workspaceDir, "smoke-reference.txt"), "smoke-token-47\n", {
+              encoding: "utf8",
+              flag: "wx",
+            }),
+          onCheckpoint: (checkpoint) => {
+            if (checkpoint.stage === "client-preparation-completed") {
+              preflightStage = "provider-bound-capture";
+              journal.record("prepared-runtime-complete", { checkpoint: checkpoint.stage });
+              journal.record("provider-bound-capture-start");
+            }
+          },
+          onProgress: (stage) => {
+            preflightStage = stage;
+            journal.record("preflight-progress", { stage });
+          },
+          onProviderCaptureStage: recordCaptureStage,
+          onProviderBoundRequest: ({ request, rawBody, requestIndex, dispatchOrdinal }) => {
+            providerBoundCaptureCount += 1;
+            if (providerBoundCaptureCount !== 1 || requestIndex !== 1 || dispatchOrdinal !== 1) {
+              throw new Error("v1J provider capture preflight exceeded its one-request bound");
+            }
+            recordCallbackJournalEvent("capture-record-build-start", {
+              awaited: false,
+              stageName: "capture-record-build",
+            });
+            if (materializationTraceOnly) {
+              requestSummary = recordV1JProviderMaterializationTrace({
+                capture: { request, rawBody },
+                expectedCanonicalSha256: V1J_PROVIDER_BOUND_REQUEST_CANONICAL_SHA256,
+                record: (event, details) => journal.record(event, details),
+                onStage: recordCaptureStage,
+              });
+            } else {
+              requestSummary = summarizeV1JRawRepeatabilityRequest(
+                { endpoint: request.url, rawBody, requestObject: request.body },
+                recordCaptureStage,
+              );
+            }
+            const previousCaptureComponents: V1JProviderRequestFingerprintComponent[] = [
+              {
+                path: "$.messageCount",
+                sha256: createHash("sha256").update("2", "utf8").digest("hex"),
+                bytes: null,
+              },
+              {
+                path: "$.toolCount",
+                sha256: createHash("sha256").update("15", "utf8").digest("hex"),
+                bytes: null,
+              },
+              {
+                path: "$.requestJsonBytes",
+                sha256: createHash("sha256").update("26653", "utf8").digest("hex"),
+                bytes: null,
+              },
+              {
+                path: "$.canonicalRequest",
+                sha256: "66ea318a79db06b91146e433ed7765f9b4edc14a0d73d744db57aa80b500fd7a",
+                bytes: null,
+              },
+              {
+                path: "$.messages[0].role",
+                sha256: createHash("sha256").update('"system"', "utf8").digest("hex"),
+                bytes: null,
+              },
+              {
+                path: "$.messages[0].content",
+                sha256: "807473baaf56fe2403b3456e2461a9ccaf1b151c73d3cf17431b1de89e4c2d74",
+                bytes: 4866,
+              },
+              {
+                path: "$.messages[1].role",
+                sha256: createHash("sha256").update('"user"', "utf8").digest("hex"),
+                bytes: null,
+              },
+              {
+                path: "$.messages[1].content",
+                sha256: "a0f77b7bf2790c81ea52130a4226671601df6c12f95d5ec06d1ebdaa73d45e00",
+                bytes: 156,
+              },
+              {
+                path: "$.tools.canonicalNameSet",
+                sha256: "741f7983e4ba7652384ee83fed16b67f81e567b2231cfccbba8f58c19ee6837b",
+                bytes: null,
+              },
+              {
+                path: "$.tools.canonicalSchemaSet",
+                sha256: "e87b23c436597f65b0a76c5f91a49b53440178731718efdbc70a7a048cbf39b2",
+                bytes: null,
+              },
+            ];
+            const drift = diffV1JProviderRequestFingerprintComponents(
+              previousCaptureComponents,
+              requestSummary.componentFingerprint.components,
+            );
+            journal.record("canonical-request-drift-diagnosis", {
+              priorCaptureCommit: "7782b3fc1ff68fccc021b61611dfc478a21c0d55",
+              priorCanonicalRequestSha256:
+                "66ea318a79db06b91146e433ed7765f9b4edc14a0d73d744db57aa80b500fd7a",
+              priorRequestJsonBytes: 26653,
+              currentCanonicalRequestSha256: requestSummary.requestCanonicalSha256,
+              currentRawBodySha256: requestSummary.requestSha256,
+              currentRequestJsonBytes: requestSummary.requestJsonBytes,
+              comparedPaths: drift.comparedPaths,
+              canonicalDriftPaths: drift.differences
+                .filter(
+                  ({ path: componentPath }) =>
+                    componentPath !== "$.canonicalRequest" &&
+                    componentPath !== "$.rawSerializedBody",
+                )
+                .map(({ path: componentPath }) => componentPath),
+              differences: drift.differences,
+              priorEvidenceUnavailablePaths: [
+                "$.rootKeys",
+                "$.model",
+                "$.stream",
+                "$.tool_choice",
+                "$.providerOptions",
+                "$.messages[0].toolCalls",
+                "$.messages[1].toolCalls",
+                "$.tools.names",
+                "$.tools.schemas",
+                "$.rawSerializedBody",
+              ],
+            });
+            if (materializationTraceOnly) {
+              journal.record("provider-body-publication-skipped", {
+                bodyPublicationCalls: 0,
+                bodyArtifactCreated: false,
+                canonicalPinMatches:
+                  requestSummary.requestCanonicalSha256 ===
+                  V1J_PROVIDER_BOUND_REQUEST_CANONICAL_SHA256,
+              });
+            } else {
+              bodyArtifact = publishAndVerifyV1JProviderBoundBodyArtifact({
+                repoRoot,
+                captureCommit: head,
+                endpoint: request.url,
+                provider: protocol.model.provider,
+                model: protocol.model.id,
+                rawBody,
+                expectedCanonicalRequestSha256: V1J_PROVIDER_BOUND_REQUEST_CANONICAL_SHA256,
+              });
+              if (
+                bodyArtifact.metadata.bodyBytes !== requestSummary.requestJsonBytes ||
+                bodyArtifact.metadata.canonicalRequestSha256 !==
+                  requestSummary.requestCanonicalSha256
+              ) {
+                throw new Error(
+                  "v1J provider-bound body export metadata differs from captured request",
+                );
+              }
+              journal.record("provider-bound-body-export-complete", {
+                captureCommit: bodyArtifact.metadata.captureCommit,
+                bodyBytes: bodyArtifact.metadata.bodyBytes,
+                rawBodySha256: bodyArtifact.metadata.rawBodySha256,
+                canonicalRequestSha256: bodyArtifact.metadata.canonicalRequestSha256,
+                messageCount: bodyArtifact.metadata.messageCount,
+                toolCount: bodyArtifact.metadata.toolCount,
+                provider: bodyArtifact.metadata.provider,
+                model: bodyArtifact.metadata.model,
+              });
+            }
+            recordCallbackJournalEvent("capture-record-build-complete", {
+              awaited: false,
+              stageName: "capture-record-build",
+              messageCount: requestSummary.messageCount,
+              toolCount: requestSummary.toolCount,
+              requestJsonBytes: requestSummary.requestJsonBytes,
+              canonicalRequestSha256: requestSummary.requestCanonicalSha256,
+            });
+          },
+          onPreflightStopRaised: () => {
+            recordCaptureStage({
+              event: "stop-signal-raise",
+              details: { stageName: "preflight-stop-signal", awaited: false },
+            });
+            recordCallbackJournalEvent("preflight-stop-signal-raised");
+          },
+          onPreflightStopCaught: () => {
+            recordCaptureStage({
+              event: "stop-signal-caught",
+              details: { stageName: "preflight-stop-signal", awaited: false },
+            });
+            recordCallbackJournalEvent("preflight-stop-signal-caught");
+          },
+        }),
+      stage: () => preflightStage,
+      record: (event) => journal.record(event.event, event.details),
+      heartbeat: ({ stage, elapsedMs }) =>
+        process.stdout.write(
+          `v1J capture preflight waiting stage=${stage} elapsedMs=${elapsedMs}\n`,
+        ),
+    });
+    const counters = journal.counters();
+    if (
+      !requestSummary ||
+      providerBoundCaptureCount !== 1 ||
+      counters.providerDispatchAttempts !== 0 ||
+      counters.providerCallbackInvocations !== 0 ||
+      counters.modelRequestCounter !== 0 ||
+      counters.preflightStopSignalRaised !== 1 ||
+      counters.preflightStopSignalCaught !== 1 ||
+      counters.preflightCompleted !== 1 ||
+      ACTIVE_FILTERING_ENABLED !== false
+    ) {
+      throw new Error("v1J provider preflight did not terminate on its no-dispatch gate");
+    }
+    if (fs.existsSync(formalRoot) || fs.existsSync(normalSmokeRoot)) {
+      throw new Error("v1J provider capture preflight observed formal or smoke state");
+    }
+    if (materializationTraceOnly) {
+      if (bodyArtifact || fs.existsSync(bodyArtifactRoot)) {
+        throw new Error("v1J materialization trace created a provider-bound body artifact");
+      }
+    } else {
+      if (!bodyArtifact) {
+        throw new Error("v1J provider-bound body was not verified before preflight stop");
+      }
+      if (
+        bodyArtifact.metadata.bodyBytes !== requestSummary.requestJsonBytes ||
+        bodyArtifact.metadata.canonicalRequestSha256 !== requestSummary.requestCanonicalSha256
+      ) {
+        throw new Error("v1J provider-bound body metadata changed after callback verification");
+      }
+    }
+    journal.record("provider-capture-preflight-complete", {
+      ...counters,
+      authorizedToolCount: surface.authorizedToolCount,
+      providerToolCount: surface.providerToolCount,
+      messageCount: requestSummary.messageCount,
+      toolCount: requestSummary.toolCount,
+      requestJsonBytes: requestSummary.requestJsonBytes,
+      canonicalRequestSha256: requestSummary.requestCanonicalSha256,
+      rawBodySha256: requestSummary.requestSha256,
+      ...(bodyArtifact ? { bodyArtifactRoot: bodyArtifact.artifactRoot } : {}),
+      bodyPublicationCalls: materializationTraceOnly ? 0 : 1,
+      bodyArtifactCreated: !materializationTraceOnly,
+      providerDispatches: 0,
+      rawRequestsSent: 0,
+      toolExecutions: 0,
+      formalStateTouched: false,
+      normalSmokeStateTouched: false,
+    });
+    process.stdout.write(
+      `${JSON.stringify({
+        harnessCommit: head,
+        requestObserverInvocations: counters.requestObserverInvocations,
+        requestObjectReceived: providerBoundCaptureCount === 1,
+        providerBoundCaptured: true,
+        providerCaptureStages,
+        preflightStopRaised: counters.preflightStopSignalRaised === 1,
+        preflightStopCaught: counters.preflightStopSignalCaught === 1,
+        preflightCompleted: true,
+        messageCount: requestSummary.messageCount,
+        toolCount: requestSummary.toolCount,
+        requestJsonBytes: requestSummary.requestJsonBytes,
+        canonicalRequestSha256: requestSummary.requestCanonicalSha256,
+        rawBodySha256: requestSummary.requestSha256,
+        ...(bodyArtifact ? { bodyArtifactRoot: bodyArtifact.artifactRoot } : {}),
+        bodyPublicationCalls: materializationTraceOnly ? 0 : 1,
+        bodyArtifactCreated: !materializationTraceOnly,
+        providerDispatches: 0,
+        rawRequestsSent: 0,
+        toolExecutions: 0,
+        activeFilteringEnabled: false,
+        formalStateTouched: false,
+        normalSmokeStateTouched: false,
+        artifactPath: journal.filePath,
+      })}\n`,
+    );
+  } catch (error) {
+    try {
+      recordCaptureStage({
+        event: "outer-catch-enter",
+        details: {
+          stageName: "provider-capture-preflight",
+          awaited: false,
+          errorName: error instanceof Error ? error.name : "NonErrorThrown",
+        },
+      });
+      journal.record("provider-capture-preflight-failed", {
+        errorName: error instanceof Error ? error.name : "NonErrorThrown",
+        lastCheckpoint: preflightStage,
+      });
+    } catch {
+      // A failed diagnostic sink must not replace the callback's original failure.
+    }
+    throw error;
+  } finally {
+    journal.close();
+  }
+}
 
 describeV1JRawRepeatability("v1J raw-only provider repeatability", () => {
   it(
@@ -4795,6 +4890,79 @@ describe("v1J schema-capture dispatch guard", () => {
     }
   });
 
+  it("runs the materialization-only callback without creating a body artifact or dispatching", async () => {
+    const privateSystem = "private trace-only system";
+    const privateUser = "private trace-only user";
+    const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), "v1j-materialization-only-callback-"));
+    const captureCommit = "8".repeat(40);
+    const bodyArtifactRoot = path.resolve(repoRoot, V1J_PROVIDER_BOUND_BODY_PARENT, captureCommit);
+    const requestBody = JSON.stringify({
+      model: MODEL_ID,
+      messages: [
+        { role: "system", content: privateSystem },
+        { role: "user", content: privateUser },
+      ],
+      tools: Array.from({ length: 15 }, (_, index) => ({
+        type: "function",
+        function: { name: `tool-${index}`, parameters: { type: "object" } },
+      })),
+      stream: true,
+    });
+    const journalRows: Array<{ event: string; details: Record<string, unknown> }> = [];
+    let callbackInvocations = 0;
+    let providerFetches = 0;
+    const payloadCapture = captureModelPayloads(undefined, {
+      stopAfterProviderBoundCapture: true,
+      onProviderRequestBeforeDispatch: (captured) => {
+        callbackInvocations += 1;
+        recordV1JProviderMaterializationTrace({
+          capture: { request: captured.request, rawBody: captured.rawBody },
+          expectedCanonicalSha256: V1J_PROVIDER_BOUND_REQUEST_CANONICAL_SHA256,
+          record: (event, details) => journalRows.push({ event, details }),
+        });
+      },
+    });
+    const wrappedFetch = payloadCapture.wrapFetch(async () => {
+      providerFetches += 1;
+      return new Response("{}");
+    });
+    try {
+      await expect(
+        wrappedFetch(`${LM_STUDIO_BASE_URL}/chat/completions`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: requestBody,
+        }),
+      ).rejects.toBeInstanceOf(V1IProviderRequestCapturedError);
+
+      expect(callbackInvocations).toBe(1);
+      expect(journalRows).toMatchObject([
+        {
+          event: "provider-bound-materialization-fingerprints",
+          details: {
+            preflightMode: "materialization-trace-only",
+            bodyPublicationCalls: 0,
+            bodyArtifactCreated: false,
+            messageCount: 2,
+            toolCount: 15,
+          },
+        },
+      ]);
+      expect(payloadCapture.providerDispatchAttempts).toBe(0);
+      expect(payloadCapture.providerInvocationCount).toBe(0);
+      expect(payloadCapture.delegatedRequests).toBe(0);
+      expect(providerFetches).toBe(0);
+      expect(fs.existsSync(bodyArtifactRoot)).toBe(false);
+      expect(fs.existsSync(path.resolve(repoRoot, V1J_FORMAL_ARTIFACT_RELATIVE_PATH))).toBe(false);
+      expect(fs.existsSync(resolveV1JSmokeRoot(repoRoot, captureCommit))).toBe(false);
+      expect(JSON.stringify(journalRows)).not.toContain(privateSystem);
+      expect(JSON.stringify(journalRows)).not.toContain(privateUser);
+    } finally {
+      payloadCapture.restore();
+      fs.rmSync(repoRoot, { recursive: true, force: true });
+    }
+  });
+
   it("fails closed and records a safe stage when provider-body serialization fails", async () => {
     const events: V1JProviderControlEvent[] = [];
     const payloadCapture = captureModelPayloads(undefined, {
@@ -5190,13 +5358,41 @@ describe("v1J schema-capture dispatch guard", () => {
       expect(traceStages).toContain("prompt-context-built");
       expect(traceStages).toContain("prompt-submit-enter");
       expect(traceStages).toContain("prompt-history-normalized");
+      expect(traceStages).toContain("model-prompt-transform-enter");
+      expect(traceStages).toContain("model-prompt-transform-complete");
       expect(traceStages).toContain("agent-llm-boundary-input");
       expect(traceStages).toContain("agent-llm-boundary-normalized");
+      expect(traceStages).toContain("agent-llm-boundary-relocated");
       expect(traceStages).toContain("agent-llm-boundary-converted");
       expect(traceStages).toContain("provider-adapter-input");
       expect(traceStages).toContain("provider-message-conversion-input");
       expect(traceStages).toContain("provider-message-conversion-output");
       expect(traceStages).toContain("provider-request-object-constructed");
+      expect(traceStages).toContain("provider-onPayload-transform-enter");
+      const materializationRows = rows.filter(
+        (row) => row.event === "prompt-materialization-boundary",
+      );
+      expect(materializationRows.map((row) => row.stage)).toEqual(
+        expect.arrayContaining([...V1J_PROMPT_MATERIALIZATION_STAGES]),
+      );
+      expect(
+        materializationRows.every(
+          (row) =>
+            typeof row.messageArrayIdentity === "number" &&
+            Array.isArray(row.messages) &&
+            (row.messages as Array<Record<string, unknown>>).every(
+              (message) =>
+                "messageObjectIdentity" in message &&
+                "contentObjectIdentity" in message &&
+                typeof message.contentSha256 === "string" &&
+                typeof message.contentBytes === "number" &&
+                !("content" in message),
+            ),
+        ),
+      ).toBe(true);
+      expect(JSON.stringify(materializationRows)).not.toContain(
+        protocol.arms.C.experimentalInstruction,
+      );
       const promptContexts = messageTraceRows.filter((row) => row.stage === "prompt-context-built");
       expect(promptContexts.map((row) => row.callbackIndex)).toEqual([1]);
       expect(promptContexts.map((row) => row.messageCount)).toEqual([0]);
@@ -5407,8 +5603,10 @@ describe("v1J schema-capture dispatch guard", () => {
         "callback-return-or-throw",
         "provider-bound-callback-enter",
         "capture-record-build-start",
+        "request-raw-body-fingerprint",
         "request-canonicalization-start",
         "request-canonicalization-complete",
+        "request-component-fingerprints",
         "provider-bound-body-published-and-verified",
         "capture-record-build-complete",
         "callback-return-or-throw",
@@ -8204,15 +8402,28 @@ async function runOne(input: {
           firstDivergentStage:
             previousMaterializationTrace && differingPaths.length > 0 ? event.stage : null,
           differingPaths,
+          source: summary.source,
+          messageArrayIdentity: summary.messageArrayIdentity,
           systemPromptFingerprint: summary.systemPromptFingerprint ?? null,
           materializationFactors: summary.materializationFactors ?? null,
           messageCount: summary.messageCount,
-          messages: summary.messages.map(({ index, role, contentSha256, contentBytes }) => ({
-            index,
-            role,
-            contentSha256,
-            contentBytes,
-          })),
+          messages: summary.messages.map(
+            ({
+              index,
+              role,
+              messageObjectIdentity,
+              contentObjectIdentity,
+              contentSha256,
+              contentBytes,
+            }) => ({
+              index,
+              role,
+              messageObjectIdentity,
+              contentObjectIdentity,
+              contentSha256,
+              contentBytes,
+            }),
+          ),
         });
         previousMaterializationTrace = summary;
       }

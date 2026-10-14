@@ -13,6 +13,7 @@ import {
   V1J_PROVIDER_CONTROL_SCHEMA_BASELINE,
   type V1JProviderControlFetch,
 } from "../../../test/helpers/agents/model-choice-provider-isolation.js";
+import { recordV1JProviderMaterializationTrace } from "../../../test/helpers/agents/model-choice-provider-materialization-trace.js";
 import {
   assertV1JRawRepeatabilityPreflight,
   createV1JRawRepeatabilityJournal,
@@ -24,6 +25,8 @@ import {
   runV1JRawRepeatabilityTransport,
   summarizeV1JRawRepeatabilityRequest,
   writeV1JProviderBoundBodyArtifact,
+  V1J_PROVIDER_BOUND_REQUEST_CANONICAL_SHA256,
+  V1J_PROVIDER_BOUND_BODY_PARENT,
   V1J_RAW_REPEATABILITY_AUTHORIZED_FLAG,
   V1J_RAW_REPEATABILITY_CAPTURE_COMMIT_FLAG,
   V1J_RAW_REPEATABILITY_COMMIT_FLAG,
@@ -184,6 +187,51 @@ describe("v1J raw-only provider repeatability", () => {
       expect(fs.readdirSync(path.dirname(exported.artifactRoot))).toEqual([captureCommit]);
     } finally {
       stdoutWrite.mockRestore();
+      fs.rmSync(repoRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("records provider materialization fingerprints without publishing a body artifact", () => {
+    const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), "v1j-materialization-trace-only-"));
+    const bodyArtifactRoot = path.join(repoRoot, V1J_PROVIDER_BOUND_BODY_PARENT, commit);
+    const capture = makeCapture();
+    const records: Array<{ event: string; details: Record<string, unknown> }> = [];
+    const stages: string[] = [];
+    try {
+      const summary = recordV1JProviderMaterializationTrace({
+        capture: {
+          request: { url: capture.endpoint, body: capture.requestObject },
+          rawBody: capture.rawBody,
+        },
+        expectedCanonicalSha256: V1J_PROVIDER_BOUND_REQUEST_CANONICAL_SHA256,
+        record: (event, details) => records.push({ event, details }),
+        onStage: (event) => stages.push(event.event),
+      });
+
+      expect(summary.requestCanonicalSha256).not.toBe(V1J_PROVIDER_BOUND_REQUEST_CANONICAL_SHA256);
+      expect(records).toMatchObject([
+        {
+          event: "provider-bound-materialization-fingerprints",
+          details: {
+            preflightMode: "materialization-trace-only",
+            canonicalPinMatches: false,
+            bodyPublicationCalls: 0,
+            bodyArtifactCreated: false,
+            messageCount: 2,
+            toolCount: 15,
+            messages: [
+              { index: 0, role: "system", contentBytes: 21 },
+              { index: 1, role: "user", contentBytes: 19 },
+            ],
+          },
+        },
+      ]);
+      expect(stages).toContain("request-raw-body-fingerprint");
+      expect(stages).toContain("request-canonicalization-complete");
+      expect(fs.existsSync(bodyArtifactRoot)).toBe(false);
+      expect(JSON.stringify(records)).not.toContain("PRIVATE_PROMPT_SYSTEM");
+      expect(JSON.stringify(records)).not.toContain("PRIVATE_PROMPT_USER");
+    } finally {
       fs.rmSync(repoRoot, { recursive: true, force: true });
     }
   });

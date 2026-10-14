@@ -4,6 +4,10 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import {
+  canonicalV1JToolNames,
+  canonicalV1JToolSchema,
+} from "../../../test/helpers/agents/model-choice-action-initiation.js";
+import {
   V1J_PROVIDER_CONTROL_MODEL_CONFIG_SHA256,
   V1J_PROVIDER_CONTROL_PREREGISTRATION_SHA256,
   V1J_PROVIDER_CONTROL_SCHEMA_BASELINE,
@@ -12,12 +16,14 @@ import {
 import {
   assertV1JRawRepeatabilityPreflight,
   createV1JRawRepeatabilityJournal,
+  diffV1JProviderRequestFingerprintComponents,
   readV1JProviderBoundBodyArtifact,
   publishAndVerifyV1JProviderBoundBodyArtifact,
   runV1JRawRepeatabilityFromArtifact,
   runV1JPreflightWithHeartbeat,
   runV1JRawRepeatabilityTransport,
   summarizeV1JRawRepeatabilityRequest,
+  writeV1JProviderBoundBodyArtifact,
   V1J_RAW_REPEATABILITY_AUTHORIZED_FLAG,
   V1J_RAW_REPEATABILITY_CAPTURE_COMMIT_FLAG,
   V1J_RAW_REPEATABILITY_COMMIT_FLAG,
@@ -178,6 +184,138 @@ describe("v1J raw-only provider repeatability", () => {
       expect(fs.readdirSync(path.dirname(exported.artifactRoot))).toEqual([captureCommit]);
     } finally {
       stdoutWrite.mockRestore();
+      fs.rmSync(repoRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("fingerprints request components without content and locates one changed field", () => {
+    const baselineCapture = makeCapture();
+    const baseline = summarizeV1JRawRepeatabilityRequest(baselineCapture);
+    const identical = summarizeV1JRawRepeatabilityRequest(makeCapture());
+    const changedObject = structuredClone(baselineCapture.requestObject);
+    const messages = changedObject.messages as Array<Record<string, unknown>>;
+    messages[1] = { ...messages[1], content: "PRIVATE_PROMPT_USXR" };
+    const changedCapture = {
+      ...baselineCapture,
+      requestObject: changedObject,
+      rawBody: JSON.stringify(changedObject),
+    };
+    const changed = summarizeV1JRawRepeatabilityRequest(changedCapture);
+    const changedOptionsObject = structuredClone(baselineCapture.requestObject);
+    changedOptionsObject.temperature = 0.25;
+    changedOptionsObject.top_p = 0.9;
+    changedOptionsObject.tool_choice = { type: "none" };
+    const changedOptions = summarizeV1JRawRepeatabilityRequest({
+      ...baselineCapture,
+      requestObject: changedOptionsObject,
+      rawBody: JSON.stringify(changedOptionsObject),
+    });
+    const stableDiff = diffV1JProviderRequestFingerprintComponents(
+      baseline.componentFingerprint.components,
+      identical.componentFingerprint.components,
+    );
+    const changedDiff = diffV1JProviderRequestFingerprintComponents(
+      baseline.componentFingerprint.components,
+      changed.componentFingerprint.components,
+    );
+    const fieldDifferences = changedDiff.differences
+      .map(({ path: componentPath }) => componentPath)
+      .filter(
+        (componentPath) =>
+          componentPath.startsWith("$.messages[") ||
+          componentPath.startsWith("$.tools") ||
+          componentPath.startsWith("$.model") ||
+          componentPath.startsWith("$.stream") ||
+          componentPath.startsWith("$.tool_choice") ||
+          componentPath.startsWith("$.temperature"),
+      );
+    const optionDiff = diffV1JProviderRequestFingerprintComponents(
+      baseline.componentFingerprint.components,
+      changedOptions.componentFingerprint.components,
+    );
+
+    expect(stableDiff.differences).toEqual([]);
+    expect(identical.componentFingerprint).toEqual(baseline.componentFingerprint);
+    expect(baseline.componentFingerprint.rootKeys).not.toContain("tool_choice");
+    expect(baseline.componentFingerprint.toolChoice).toEqual({
+      present: false,
+      valueSha256: null,
+    });
+    expect(baseline.componentFingerprint.model.present).toBe(true);
+    expect(baseline.componentFingerprint.stream.present).toBe(true);
+    expect(baseline.componentFingerprint.providerOptions).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ key: "max_tokens", present: true }),
+        expect.objectContaining({ key: "temperature", present: true }),
+        expect.objectContaining({ key: "top_p", present: false, valueSha256: null }),
+      ]),
+    );
+    expect(baseline.componentFingerprint.systemMessage?.bytes).toBeGreaterThan(0);
+    expect(baseline.componentFingerprint.userMessage?.bytes).toBeGreaterThan(0);
+    expect(baseline.componentFingerprint.canonicalToolNameSetSha256).toMatch(/^[a-f0-9]{64}$/);
+    expect(baseline.componentFingerprint.canonicalToolSchemaSetSha256).toMatch(/^[a-f0-9]{64}$/);
+    const tools = baselineCapture.requestObject.tools as unknown[];
+    expect(baseline.componentFingerprint.canonicalToolNameSetSha256).toBe(
+      createHash("sha256")
+        .update(JSON.stringify(canonicalV1JToolNames(tools)), "utf8")
+        .digest("hex"),
+    );
+    expect(baseline.componentFingerprint.canonicalToolSchemaSetSha256).toBe(
+      createHash("sha256").update(canonicalV1JToolSchema(tools), "utf8").digest("hex"),
+    );
+    expect(fieldDifferences).toEqual(["$.messages[1].content"]);
+    expect(
+      optionDiff.differences
+        .map(({ path: componentPath }) => componentPath)
+        .filter(
+          (componentPath) =>
+            componentPath === "$.temperature" ||
+            componentPath === "$.top_p" ||
+            componentPath === "$.tool_choice",
+        )
+        .toSorted(),
+    ).toEqual(["$.temperature", "$.tool_choice", "$.top_p"]);
+    expect(changedDiff.differences.map(({ path: componentPath }) => componentPath)).toContain(
+      "$.canonicalRequest",
+    );
+    expect(changedDiff.differences.map(({ path: componentPath }) => componentPath)).toContain(
+      "$.rawSerializedBody",
+    );
+    expect(JSON.stringify(baseline.componentFingerprint)).not.toContain("PRIVATE_PROMPT");
+    expect(JSON.stringify(changedDiff)).not.toContain("PRIVATE_PROMPT_USXR");
+  });
+
+  it("records raw-byte identity before pinned canonical failure and publishes no body", () => {
+    const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), "v1j-raw-before-canonical-gate-"));
+    const capture = makeCapture();
+    const events: { event: string; details?: Record<string, unknown> }[] = [];
+    try {
+      const summary = summarizeV1JRawRepeatabilityRequest(capture, (event) => events.push(event));
+      const rawEventIndex = events.findIndex(
+        (event) => event.event === "request-raw-body-fingerprint",
+      );
+      const canonicalStartIndex = events.findIndex(
+        (event) => event.event === "request-canonicalization-start",
+      );
+      expect(rawEventIndex).toBeGreaterThanOrEqual(0);
+      expect(rawEventIndex).toBeLessThan(canonicalStartIndex);
+      expect(events[rawEventIndex]?.details).toEqual({
+        rawBodySha256: summary.requestSha256,
+        requestJsonBytes: summary.requestJsonBytes,
+      });
+
+      expect(() =>
+        writeV1JProviderBoundBodyArtifact({
+          repoRoot,
+          captureCommit,
+          provider: "lmstudio",
+          model: "qwen/qwen3.5-9b",
+          rawBody: capture.rawBody,
+          expectedCanonicalRequestSha256: "0".repeat(64),
+        }),
+      ).toThrow(/canonical request hash mismatch/);
+      expect(fs.existsSync(path.join(repoRoot, "artifacts"))).toBe(false);
+    } finally {
       fs.rmSync(repoRoot, { recursive: true, force: true });
     }
   });

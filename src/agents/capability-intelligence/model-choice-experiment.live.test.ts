@@ -83,6 +83,7 @@ import {
 import {
   assertV1JRawRepeatabilityPreflight,
   createV1JRawRepeatabilityJournal,
+  diffV1JProviderRequestFingerprintComponents,
   publishAndVerifyV1JProviderBoundBodyArtifact,
   runV1JPreflightWithHeartbeat,
   runV1JRawRepeatabilityTransport,
@@ -97,6 +98,7 @@ import {
   V1J_RAW_REPEATABILITY_PREFIX,
   V1J_RAW_REPEATABILITY_RUN_FLAG,
   type V1JProviderControlEvent,
+  type V1JProviderRequestFingerprintComponent,
 } from "../../../test/helpers/agents/model-choice-provider-repeatability.js";
 import {
   createV1JProviderResponseDiagnosticJournal,
@@ -2910,6 +2912,8 @@ describeV1JProviderCapturePreflight("v1J provider-bound capture preflight only",
         }
         const allowedDetails = new Set([
           "canonicalRequestSha256",
+          "rawBodySha256",
+          "componentFingerprint",
           "callbackIndex",
           "contentBytes",
           "errorName",
@@ -3012,6 +3016,92 @@ describeV1JProviderCapturePreflight("v1J provider-bound capture preflight only",
                   { endpoint: request.url, rawBody, requestObject: request.body },
                   recordCaptureStage,
                 );
+                const previousCaptureComponents: V1JProviderRequestFingerprintComponent[] = [
+                  {
+                    path: "$.messageCount",
+                    sha256: createHash("sha256").update("2", "utf8").digest("hex"),
+                    bytes: null,
+                  },
+                  {
+                    path: "$.toolCount",
+                    sha256: createHash("sha256").update("15", "utf8").digest("hex"),
+                    bytes: null,
+                  },
+                  {
+                    path: "$.requestJsonBytes",
+                    sha256: createHash("sha256").update("26653", "utf8").digest("hex"),
+                    bytes: null,
+                  },
+                  {
+                    path: "$.canonicalRequest",
+                    sha256: "66ea318a79db06b91146e433ed7765f9b4edc14a0d73d744db57aa80b500fd7a",
+                    bytes: null,
+                  },
+                  {
+                    path: "$.messages[0].role",
+                    sha256: createHash("sha256").update('"system"', "utf8").digest("hex"),
+                    bytes: null,
+                  },
+                  {
+                    path: "$.messages[0].content",
+                    sha256: "807473baaf56fe2403b3456e2461a9ccaf1b151c73d3cf17431b1de89e4c2d74",
+                    bytes: 4866,
+                  },
+                  {
+                    path: "$.messages[1].role",
+                    sha256: createHash("sha256").update('"user"', "utf8").digest("hex"),
+                    bytes: null,
+                  },
+                  {
+                    path: "$.messages[1].content",
+                    sha256: "a0f77b7bf2790c81ea52130a4226671601df6c12f95d5ec06d1ebdaa73d45e00",
+                    bytes: 156,
+                  },
+                  {
+                    path: "$.tools.canonicalNameSet",
+                    sha256: "741f7983e4ba7652384ee83fed16b67f81e567b2231cfccbba8f58c19ee6837b",
+                    bytes: null,
+                  },
+                  {
+                    path: "$.tools.canonicalSchemaSet",
+                    sha256: "e87b23c436597f65b0a76c5f91a49b53440178731718efdbc70a7a048cbf39b2",
+                    bytes: null,
+                  },
+                ];
+                const drift = diffV1JProviderRequestFingerprintComponents(
+                  previousCaptureComponents,
+                  requestSummary.componentFingerprint.components,
+                );
+                journal.record("canonical-request-drift-diagnosis", {
+                  priorCaptureCommit: "7782b3fc1ff68fccc021b61611dfc478a21c0d55",
+                  priorCanonicalRequestSha256:
+                    "66ea318a79db06b91146e433ed7765f9b4edc14a0d73d744db57aa80b500fd7a",
+                  priorRequestJsonBytes: 26653,
+                  currentCanonicalRequestSha256: requestSummary.requestCanonicalSha256,
+                  currentRawBodySha256: requestSummary.requestSha256,
+                  currentRequestJsonBytes: requestSummary.requestJsonBytes,
+                  comparedPaths: drift.comparedPaths,
+                  canonicalDriftPaths: drift.differences
+                    .filter(
+                      ({ path: componentPath }) =>
+                        componentPath !== "$.canonicalRequest" &&
+                        componentPath !== "$.rawSerializedBody",
+                    )
+                    .map(({ path: componentPath }) => componentPath),
+                  differences: drift.differences,
+                  priorEvidenceUnavailablePaths: [
+                    "$.rootKeys",
+                    "$.model",
+                    "$.stream",
+                    "$.tool_choice",
+                    "$.providerOptions",
+                    "$.messages[0].toolCalls",
+                    "$.messages[1].toolCalls",
+                    "$.tools.names",
+                    "$.tools.schemas",
+                    "$.rawSerializedBody",
+                  ],
+                });
                 bodyArtifact = publishAndVerifyV1JProviderBoundBodyArtifact({
                   repoRoot,
                   captureCommit: head,
@@ -4550,8 +4640,10 @@ describe("v1J schema-capture dispatch guard", () => {
         "provider-bound-callback-enter",
         "callback-return-or-throw",
         "provider-bound-callback-enter",
+        "request-raw-body-fingerprint",
         "request-canonicalization-start",
         "request-canonicalization-complete",
+        "request-component-fingerprints",
         "capture-record-build-start",
         "capture-record-build-complete",
         "callback-return-or-throw",
@@ -4568,6 +4660,26 @@ describe("v1J schema-capture dispatch guard", () => {
       });
       expect(events[2]?.details).toMatchObject({ messageCount: 1, toolCount: 15 });
       expect(JSON.stringify(events)).not.toContain(privateText);
+      const rawFingerprintIndex = events.findIndex(
+        (event) => event.event === "request-raw-body-fingerprint",
+      );
+      const canonicalizationIndex = events.findIndex(
+        (event) => event.event === "request-canonicalization-start",
+      );
+      expect(rawFingerprintIndex).toBeLessThan(canonicalizationIndex);
+      expect(events[rawFingerprintIndex]?.details).toMatchObject({
+        rawBodySha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+        requestJsonBytes: Buffer.byteLength(requestBody, "utf8"),
+      });
+      expect(
+        events.find((event) => event.event === "request-component-fingerprints")?.details,
+      ).toMatchObject({
+        componentFingerprint: {
+          canonicalRequestSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+          rootKeySetSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+          toolCount: 15,
+        },
+      });
       expect(payloadCapture.providerDispatchAttempts).toBe(0);
       expect(underlyingFetches).toBe(0);
     } finally {
@@ -8625,17 +8737,19 @@ async function runOne(input: {
     if (typeof rawBody !== "string" || !payload || typeof payload !== "object") {
       throw new TypeError("v1J provider-bound payload is not serializable");
     }
+    const rawBodyBytes = Buffer.from(rawBody, "utf8");
+    const rawBodySha256 = createHash("sha256").update(rawBodyBytes).digest("hex");
+    journal?.record("provider-bound-request-captured", {
+      invocationIndex: callbackIndex,
+      requestJsonBytes: rawBodyBytes.byteLength,
+      rawBodySha256,
+      providerInvocationCount,
+    });
     const finalRequest: CapturedModelRequest = {
       body: payload as Record<string, unknown>,
       url: "provider-adapter",
     };
     capture.recordProviderRequest(finalRequest);
-    journal?.record("provider-bound-request-captured", {
-      invocationIndex: callbackIndex,
-      requestJsonBytes: Buffer.byteLength(rawBody, "utf8"),
-      requestBodySha256: hashV1ICanonical(finalRequest.body),
-      providerInvocationCount,
-    });
     input.requestCapture.onRequestCaptured?.(finalRequest);
     preDispatchCallbackInvoked = true;
     await input.requestCapture.onProviderRequestBeforeDispatch?.({

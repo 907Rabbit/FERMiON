@@ -56,7 +56,87 @@ export type V1JRawRepeatabilityRequestSummary = {
   }[];
   toolCount: number;
   toolSchemaJsonBytes: number;
+  componentFingerprint: V1JProviderRequestComponentFingerprint;
 };
+
+export type V1JProviderRequestFingerprintComponent = {
+  path: string;
+  sha256: string;
+  bytes: number | null;
+};
+
+export type V1JProviderRequestComponentFingerprint = {
+  rootKeys: readonly string[];
+  rootKeySetSha256: string;
+  model: { present: boolean; valueSha256: string | null };
+  stream: { present: boolean; valueSha256: string | null };
+  toolChoice: { present: boolean; valueSha256: string | null };
+  providerOptions: readonly {
+    key: string;
+    present: boolean;
+    valueSha256: string | null;
+  }[];
+  messageCount: number;
+  messages: readonly {
+    index: number;
+    role: string;
+    contentSha256: string;
+    contentBytes: number;
+    toolCallCount: number;
+    toolCallsSha256: string | null;
+  }[];
+  systemMessage: { sha256: string; bytes: number } | null;
+  userMessage: { sha256: string; bytes: number } | null;
+  toolCount: number;
+  orderedToolNameSha256: string;
+  canonicalToolNameSetSha256: string;
+  orderedToolSchemaSha256: string;
+  canonicalToolSchemaSetSha256: string;
+  toolSchemaJsonBytes: number;
+  canonicalRequestSha256: string;
+  components: readonly V1JProviderRequestFingerprintComponent[];
+};
+
+export function diffV1JProviderRequestFingerprintComponents(
+  previous: readonly V1JProviderRequestFingerprintComponent[],
+  current: readonly V1JProviderRequestFingerprintComponent[],
+): {
+  comparedPaths: string[];
+  differences: {
+    path: string;
+    previousSha256: string;
+    currentSha256: string;
+    previousBytes: number | null;
+    currentBytes: number | null;
+  }[];
+} {
+  const currentByPath = new Map(current.map((component) => [component.path, component]));
+  const comparedPaths: string[] = [];
+  const differences: {
+    path: string;
+    previousSha256: string;
+    currentSha256: string;
+    previousBytes: number | null;
+    currentBytes: number | null;
+  }[] = [];
+  for (const prior of previous) {
+    const next = currentByPath.get(prior.path);
+    if (!next) {
+      continue;
+    }
+    comparedPaths.push(prior.path);
+    if (prior.sha256 !== next.sha256 || prior.bytes !== next.bytes) {
+      differences.push({
+        path: prior.path,
+        previousSha256: prior.sha256,
+        currentSha256: next.sha256,
+        previousBytes: prior.bytes,
+        currentBytes: next.bytes,
+      });
+    }
+  }
+  return { comparedPaths, differences };
+}
 
 export type V1JRawRepeatabilityJournal = {
   artifactRoot: string;
@@ -320,6 +400,14 @@ export function summarizeV1JRawRepeatabilityRequest(
   capture: V1JRawRepeatabilityCapture,
   onStage?: (event: V1JProviderControlEvent) => void,
 ): V1JRawRepeatabilityRequestSummary {
+  // Persist the exact body identity before parsing or the pinned canonical-hash gate can fail.
+  const rawBodyBytes = Buffer.from(capture.rawBody, "utf8");
+  const requestSha256 = sha256(rawBodyBytes);
+  const requestJsonBytes = rawBodyBytes.byteLength;
+  onStage?.({
+    event: "request-raw-body-fingerprint",
+    details: { rawBodySha256: requestSha256, requestJsonBytes },
+  });
   const canonicalizationStartedAt = performance.now();
   onStage?.({ event: "request-canonicalization-start" });
   let parsed: unknown;
@@ -364,6 +452,27 @@ export function summarizeV1JRawRepeatabilityRequest(
     elapsedMs: Math.max(0, Math.round(performance.now() - canonicalizationStartedAt)),
     details: { canonicalRequestSha256: requestCanonicalSha256 },
   });
+  const baseFingerprint = fingerprintV1JProviderRequest(body, requestCanonicalSha256);
+  const componentFingerprint: V1JProviderRequestComponentFingerprint = {
+    ...baseFingerprint,
+    components: [
+      ...baseFingerprint.components,
+      {
+        path: "$.rawSerializedBody",
+        sha256: requestSha256,
+        bytes: requestJsonBytes,
+      },
+      {
+        path: "$.requestJsonBytes",
+        sha256: sha256(canonicalJson(requestJsonBytes)),
+        bytes: null,
+      },
+    ],
+  };
+  onStage?.({
+    event: "request-component-fingerprints",
+    details: { componentFingerprint },
+  });
   const messageHashes = body.messages.map((message, index) => {
     const row = message && typeof message === "object" ? (message as Record<string, unknown>) : {};
     const content = row.content;
@@ -376,13 +485,14 @@ export function summarizeV1JRawRepeatabilityRequest(
     };
   });
   return {
-    requestSha256: sha256(capture.rawBody),
+    requestSha256,
     requestCanonicalSha256,
-    requestJsonBytes: Buffer.byteLength(capture.rawBody, "utf8"),
+    requestJsonBytes,
     messageCount: messageHashes.length,
     messageHashes,
     toolCount: body.tools.length,
     toolSchemaJsonBytes: Buffer.byteLength(JSON.stringify(body.tools), "utf8"),
+    componentFingerprint,
   };
 }
 
@@ -629,6 +739,159 @@ function canonicalJson(value: unknown): string {
 
 function sha256(value: string | Buffer): string {
   return createHash("sha256").update(value).digest("hex");
+}
+
+function fingerprintV1JProviderRequest(
+  body: Record<string, unknown>,
+  canonicalRequestSha256: string,
+): V1JProviderRequestComponentFingerprint {
+  const knownProviderOptionKeys = [
+    "frequency_penalty",
+    "logit_bias",
+    "max_completion_tokens",
+    "max_tokens",
+    "n",
+    "parallel_tool_calls",
+    "presence_penalty",
+    "response_format",
+    "seed",
+    "service_tier",
+    "stop",
+    "stream_options",
+    "temperature",
+    "top_p",
+    "user",
+  ];
+  const rootKeys = Object.keys(body).toSorted();
+  const components: V1JProviderRequestFingerprintComponent[] = [];
+  const addComponent = (componentPath: string, value: unknown, bytes: number | null = null) => {
+    components.push({ path: componentPath, sha256: sha256(canonicalJson(value)), bytes });
+  };
+  const hasOwn = (key: string) => Object.hasOwn(body, key);
+  const requestMessages = body.messages as unknown[];
+  const tools = body.tools as unknown[];
+  const propertyFingerprint = (key: string) => ({
+    present: hasOwn(key),
+    valueSha256: hasOwn(key) ? sha256(canonicalJson(body[key])) : null,
+  });
+
+  addComponent("$.rootKeys", rootKeys);
+  components.push({ path: "$.canonicalRequest", sha256: canonicalRequestSha256, bytes: null });
+  addComponent("$.messageCount", requestMessages.length);
+  addComponent("$.toolCount", tools.length);
+  addComponent("$.model", {
+    present: hasOwn("model"),
+    value: hasOwn("model") ? body.model : null,
+  });
+  addComponent("$.stream", {
+    present: hasOwn("stream"),
+    value: hasOwn("stream") ? body.stream : null,
+  });
+  addComponent("$.tool_choice", {
+    present: hasOwn("tool_choice"),
+    value: hasOwn("tool_choice") ? body.tool_choice : null,
+  });
+  const providerOptionKeys = [
+    ...new Set([
+      ...knownProviderOptionKeys,
+      ...rootKeys.filter(
+        (key) => !["messages", "model", "stream", "tool_choice", "tools"].includes(key),
+      ),
+    ]),
+  ].toSorted();
+  const providerOptions = providerOptionKeys.map((key) => {
+    const present = hasOwn(key);
+    const valueSha256 = present ? sha256(canonicalJson(body[key])) : null;
+    addComponent(`$.${key}`, { present, value: present ? body[key] : null });
+    return { key, present, valueSha256 };
+  });
+
+  const messages = requestMessages.map((message, index) => {
+    const row =
+      message && typeof message === "object" && !Array.isArray(message)
+        ? (message as Record<string, unknown>)
+        : {};
+    const role = typeof row.role === "string" ? row.role : "unknown";
+    const content = row.content;
+    const canonicalContent = typeof content === "string" ? content : canonicalJson(content ?? null);
+    const contentSha256 = sha256(canonicalContent);
+    const contentBytes = Buffer.byteLength(canonicalContent, "utf8");
+    const toolCalls = row.tool_calls ?? row.function_call;
+    const toolCallCount = Array.isArray(row.tool_calls)
+      ? row.tool_calls.length
+      : toolCalls === undefined
+        ? 0
+        : 1;
+    const toolCallsSha256 = toolCalls === undefined ? null : sha256(canonicalJson(toolCalls));
+    addComponent(`$.messages[${index}].role`, row.role ?? null);
+    components.push({
+      path: `$.messages[${index}].content`,
+      sha256: contentSha256,
+      bytes: contentBytes,
+    });
+    if (toolCalls !== undefined) {
+      addComponent(`$.messages[${index}].toolCalls`, toolCalls);
+    }
+    return {
+      index,
+      role,
+      contentSha256,
+      contentBytes,
+      toolCallCount,
+      toolCallsSha256,
+    };
+  });
+
+  const toolNames = tools.map((tool) => {
+    const row = tool && typeof tool === "object" ? (tool as Record<string, unknown>) : {};
+    const fn =
+      row.function && typeof row.function === "object"
+        ? (row.function as Record<string, unknown>)
+        : {};
+    return typeof fn.name === "string" ? fn.name : typeof row.name === "string" ? row.name : null;
+  });
+  const orderedToolNameSha256 = sha256(canonicalJson(toolNames));
+  const orderedToolSchemaSha256 = sha256(canonicalJson(tools));
+  // Keep request order separate from the name-sorted schema baseline used by v2.
+  const canonicalToolEntries = tools
+    .map((tool, index) => ({ tool, name: toolNames[index] ?? "" }))
+    .toSorted((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0))
+    .map(({ tool }) => tool);
+  const canonicalToolNames = toolNames.toSorted();
+  const canonicalToolNameSetSha256 = sha256(canonicalJson(canonicalToolNames));
+  const canonicalToolSchemaSetSha256 = sha256(canonicalJson(canonicalToolEntries));
+  const toolSchemaJsonBytes = Buffer.byteLength(JSON.stringify(tools), "utf8");
+  const systemMessage = messages.find((message) => message.role === "system");
+  const userMessage = messages.find((message) => message.role === "user");
+  addComponent("$.tools.names", toolNames);
+  addComponent("$.tools.schemas", tools, toolSchemaJsonBytes);
+  addComponent("$.tools.canonicalNameSet", canonicalToolNames);
+  addComponent("$.tools.canonicalSchemaSet", canonicalToolEntries);
+
+  return {
+    rootKeys,
+    rootKeySetSha256: sha256(canonicalJson(rootKeys)),
+    model: propertyFingerprint("model"),
+    stream: propertyFingerprint("stream"),
+    toolChoice: propertyFingerprint("tool_choice"),
+    providerOptions,
+    messageCount: messages.length,
+    messages,
+    systemMessage: systemMessage
+      ? { sha256: systemMessage.contentSha256, bytes: systemMessage.contentBytes }
+      : null,
+    userMessage: userMessage
+      ? { sha256: userMessage.contentSha256, bytes: userMessage.contentBytes }
+      : null,
+    toolCount: tools.length,
+    orderedToolNameSha256,
+    canonicalToolNameSetSha256,
+    orderedToolSchemaSha256,
+    canonicalToolSchemaSetSha256,
+    toolSchemaJsonBytes,
+    canonicalRequestSha256,
+    components,
+  };
 }
 
 function summarizeProviderBoundBody(input: {

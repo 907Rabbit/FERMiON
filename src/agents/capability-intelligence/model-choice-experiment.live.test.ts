@@ -69,6 +69,10 @@ import {
   V1J_ADAPTER_DIFFERENTIAL_PREFIX,
   V1J_ADAPTER_DIFFERENTIAL_RUN_FLAG,
 } from "../../../test/helpers/agents/model-choice-adapter-differential.js";
+import {
+  V1J_PROVIDER_CONTROL_MODEL_CONFIG_SHA256,
+  V1J_PROVIDER_CONTROL_SCHEMA_BASELINE,
+} from "../../../test/helpers/agents/model-choice-provider-isolation.js";
 import { runV1JPayloadDecompositionDiagnostic } from "../../../test/helpers/agents/model-choice-provider-payload-decomposition-live.js";
 import {
   V1J_PAYLOAD_DECOMPOSITION_AUTHORIZED_FLAG,
@@ -212,6 +216,33 @@ if (
   )
 ) {
   throw new Error("v1J raw repeatability cannot share another v1I/v1J mode");
+}
+const V1J_PROVIDER_CAPTURE_PREFLIGHT_RUN_FLAG = "OPENCLAW_V1J_PROVIDER_CAPTURE_PREFLIGHT";
+const V1J_PROVIDER_CAPTURE_PREFLIGHT_AUTHORIZED_FLAG =
+  "OPENCLAW_V1J_PROVIDER_CAPTURE_PREFLIGHT_AUTHORIZED";
+const V1J_PROVIDER_CAPTURE_PREFLIGHT_COMMIT_FLAG = "OPENCLAW_V1J_PROVIDER_CAPTURE_PREFLIGHT_COMMIT";
+const V1J_PROVIDER_CAPTURE_PREFLIGHT = process.env[V1J_PROVIDER_CAPTURE_PREFLIGHT_RUN_FLAG] === "1";
+const V1J_PROVIDER_CAPTURE_PREFLIGHT_FLAGS = new Set([
+  V1J_PROVIDER_CAPTURE_PREFLIGHT_RUN_FLAG,
+  V1J_PROVIDER_CAPTURE_PREFLIGHT_AUTHORIZED_FLAG,
+  V1J_PROVIDER_CAPTURE_PREFLIGHT_COMMIT_FLAG,
+]);
+const anyV1JProviderCapturePreflightFlag = [...V1J_PROVIDER_CAPTURE_PREFLIGHT_FLAGS].some(
+  (name) => process.env[name] !== undefined,
+);
+if (anyV1JProviderCapturePreflightFlag && !V1J_PROVIDER_CAPTURE_PREFLIGHT) {
+  throw new Error("v1J provider capture preflight requires its dedicated run flag");
+}
+if (
+  V1J_PROVIDER_CAPTURE_PREFLIGHT &&
+  Object.entries(process.env).some(
+    ([name, value]) =>
+      value !== undefined &&
+      /^(OPENCLAW_V1[IJ]_)/.test(name) &&
+      !V1J_PROVIDER_CAPTURE_PREFLIGHT_FLAGS.has(name),
+  )
+) {
+  throw new Error("v1J provider capture preflight cannot share another v1I/v1J mode");
 }
 const V1J_ADAPTER_DIFFERENTIAL_FLAGS = new Set([
   V1J_ADAPTER_DIFFERENTIAL_RUN_FLAG,
@@ -1454,6 +1485,9 @@ const describeV1JArmCPreflightDiagnostic = V1J_ARM_C_PREFLIGHT_DIAGNOSTIC
 const describeV1JPayloadDecomposition = V1J_PAYLOAD_DECOMPOSITION ? describe : describe.skip;
 const describeV1JAdapterDifferential = V1J_ADAPTER_DIFFERENTIAL ? describe : describe.skip;
 const describeV1JRawRepeatability = V1J_RAW_REPEATABILITY ? describe : describe.skip;
+const describeV1JProviderCapturePreflight = V1J_PROVIDER_CAPTURE_PREFLIGHT
+  ? describe
+  : describe.skip;
 const describeFullLive =
   LIVE &&
   !SMOKE_TEST &&
@@ -2289,6 +2323,255 @@ describeV1JAdapterDifferential("v1J raw-transport versus adapter differential", 
           artifactRoot: journal.root,
         })}\n`,
       );
+    },
+  );
+});
+
+describeV1JProviderCapturePreflight("v1J provider-bound capture preflight only", () => {
+  it(
+    "captures one serialized request and terminates before every dispatch path",
+    { timeout: 600_000 },
+    async () => {
+      if (
+        !V1J_PROVIDER_CAPTURE_PREFLIGHT ||
+        process.env[V1J_PROVIDER_CAPTURE_PREFLIGHT_AUTHORIZED_FLAG] !== "1" ||
+        LIVE ||
+        V1J_ACTION_LIVE_TEST ||
+        V1J_ACTION_LIVE_AUTHORIZED ||
+        V1J_ACTION_SMOKE_TEST ||
+        V1J_ACTION_SMOKE_AUTHORIZED ||
+        V1J_ADAPTER_DIFFERENTIAL ||
+        V1J_PROVIDER_RESPONSE_DIAGNOSTIC ||
+        V1J_ARM_C_PREFLIGHT_DIAGNOSTIC ||
+        V1J_SCHEMA_CAPTURE_MODE !== undefined ||
+        process.env.OPENCLAW_V1I_MODE !== undefined ||
+        process.env.OPENCLAW_V1I_CELL_ALLOWLIST !== undefined ||
+        process.env.OPENCLAW_V1I_MAX_CELLS !== undefined
+      ) {
+        throw new Error("v1J provider capture preflight requires only its dedicated flags");
+      }
+
+      const protocol = readV1JPreregistration();
+      const head = assertV1JCommittedHarness(protocol);
+      const repoRoot = process.cwd();
+      if (process.env[V1J_PROVIDER_CAPTURE_PREFLIGHT_COMMIT_FLAG] !== head) {
+        throw new Error("v1J provider capture preflight commit authorization mismatch");
+      }
+      const protocolPath = path.resolve(repoRoot, V1J_PREREGISTRATION_PATH);
+      const protocolBytes = fs.readFileSync(protocolPath);
+      const protocolSha256 = createHash("sha256").update(protocolBytes).digest("hex");
+      const detachedHash = fs.readFileSync(protocolPath.replace(/\.json$/u, ".sha256"), "utf8");
+      const provenance = JSON.parse(
+        fs.readFileSync(path.resolve(repoRoot, V1J_SMOKE_PROVENANCE_PATH), "utf8"),
+      ) as unknown;
+      assertV1JSmokeProvenance(provenance, protocol, head);
+
+      const modelConfigHash = hashV1ICanonical(modelConfigIdentity());
+      const formalRoot = path.resolve(repoRoot, V1J_FORMAL_ARTIFACT_RELATIVE_PATH);
+      const normalSmokeRoot = resolveV1JSmokeRoot(repoRoot, head);
+      const formalStateExists = fs.existsSync(formalRoot);
+      const normalSmokeStateExists = fs.existsSync(normalSmokeRoot);
+      const measuredSchemaMatches =
+        protocol.schemaBaseline.authorizedToolCount ===
+          V1J_PROVIDER_CONTROL_SCHEMA_BASELINE.authorizedToolCount &&
+        protocol.schemaBaseline.providerToolCount ===
+          V1J_PROVIDER_CONTROL_SCHEMA_BASELINE.providerToolCount &&
+        protocol.schemaBaseline.authorizedToolNameSha256 ===
+          V1J_PROVIDER_CONTROL_SCHEMA_BASELINE.authorizedToolNameSha256 &&
+        protocol.schemaBaseline.providerToolNameSha256 ===
+          V1J_PROVIDER_CONTROL_SCHEMA_BASELINE.providerToolNameSha256 &&
+        protocol.schemaBaseline.authorizedToolSchemaSha256 ===
+          V1J_PROVIDER_CONTROL_SCHEMA_BASELINE.authorizedToolSchemaSha256 &&
+        protocol.schemaBaseline.providerToolSchemaSha256 ===
+          V1J_PROVIDER_CONTROL_SCHEMA_BASELINE.providerToolSchemaSha256;
+      if (
+        protocolSha256 !== V1J_PREREGISTRATION_SHA256 ||
+        detachedHash.trim().split(/\s+/)[0]?.toLowerCase() !== V1J_PREREGISTRATION_SHA256 ||
+        protocol.model.id !== MODEL_ID ||
+        protocol.model.provider !== PROVIDER ||
+        protocol.model.contextLength !== CONTEXT_LENGTH ||
+        modelConfigHash !== V1J_PROVIDER_CONTROL_MODEL_CONFIG_SHA256 ||
+        protocol.base.productionFrozen.activeFilteringEnabled !== false ||
+        ACTIVE_FILTERING_ENABLED !== false ||
+        !measuredSchemaMatches ||
+        formalStateExists ||
+        normalSmokeStateExists
+      ) {
+        throw new Error("v1J provider capture preflight frozen gates failed");
+      }
+
+      const cell = buildV1JSmokeSchedule(protocol).find(
+        (candidate) => candidate.cellId === "smoke-tool-required:A:1",
+      );
+      if (!cell || cell.arm !== "A" || cell.stratum !== "TOOL_REQUIRED") {
+        throw new Error("v1J provider capture preflight request-construction case changed");
+      }
+      const journal = createV1JPreflightDiagnosticJournal({
+        repoRoot,
+        harnessCommit: head,
+        arm: "A",
+        caseId: cell.caseId,
+        preflightId: `provider-bound-capture-${head.slice(0, 8)}-${process.pid}`,
+        pid: process.pid,
+      });
+      let preflightStage = "lmstudio-discovery";
+      let providerBoundCaptureCount = 0;
+      let requestSummary: ReturnType<typeof summarizeV1JRawRepeatabilityRequest> | undefined;
+      const providerCaptureStages: string[] = [];
+      const recordCaptureStage = (event: V1JProviderControlEvent) => {
+        preflightStage = event.event;
+        providerCaptureStages.push(event.event);
+        const allowedDetails = [
+          "canonicalRequestSha256",
+          "contentBytes",
+          "errorName",
+          "messageCount",
+          "requestJsonBytes",
+          "toolCount",
+        ];
+        const details = Object.fromEntries(
+          Object.entries(event.details ?? {}).filter(([key]) => allowedDetails.includes(key)),
+        );
+        journal.record(`provider-capture-${event.event}`, {
+          ...(event.elapsedMs === undefined ? {} : { elapsedMs: event.elapsedMs }),
+          ...(Object.keys(details).length === 0 ? {} : { details }),
+        });
+      };
+      try {
+        journal.record("provider-capture-preflight-start", {
+          harnessCommit: head,
+          v2Sha256: protocolSha256,
+          activeFilteringEnabled: false,
+          providerDispatches: 0,
+          rawRequestsSent: 0,
+          toolExecutions: 0,
+        });
+        journal.record("lmstudio-discovery-start");
+        await runV1JPreflightWithHeartbeat({
+          operation: () => assertLiveModelAvailable(),
+          stage: () => preflightStage,
+          record: (event) => journal.record(event.event, event.details),
+          heartbeat: ({ stage, elapsedMs }) =>
+            process.stdout.write(
+              `v1J capture preflight waiting stage=${stage} elapsedMs=${elapsedMs}\n`,
+            ),
+        });
+        journal.record("lmstudio-discovery-complete");
+        preflightStage = "prepared-runtime";
+        journal.record("prepared-runtime-start");
+        const surface = await runV1JPreflightWithHeartbeat({
+          operation: () =>
+            captureV1JPreflightSurface(protocol, "A", head, journal, {
+              benchmarkCase: v1jSmokeBenchmark(cell),
+              prepareWorkspace: (workspaceDir) =>
+                fs.writeFileSync(
+                  path.join(workspaceDir, "smoke-reference.txt"),
+                  "smoke-token-47\n",
+                  { encoding: "utf8", flag: "wx" },
+                ),
+              onCheckpoint: (checkpoint) => {
+                if (checkpoint.stage === "client-preparation-completed") {
+                  preflightStage = "provider-bound-capture";
+                  journal.record("prepared-runtime-complete", { checkpoint: checkpoint.stage });
+                  journal.record("provider-bound-capture-start");
+                }
+              },
+              onProgress: (stage) => {
+                preflightStage = stage;
+                journal.record("preflight-progress", { stage });
+              },
+              onProviderCaptureStage: recordCaptureStage,
+              onProviderBoundRequest: ({ request, rawBody, requestIndex, dispatchOrdinal }) => {
+                providerBoundCaptureCount += 1;
+                if (
+                  providerBoundCaptureCount !== 1 ||
+                  requestIndex !== 1 ||
+                  dispatchOrdinal !== 1
+                ) {
+                  throw new Error("v1J provider capture preflight exceeded its one-request bound");
+                }
+                journal.record("capture-record-build-start");
+                requestSummary = summarizeV1JRawRepeatabilityRequest(
+                  { endpoint: request.url, rawBody, requestObject: request.body },
+                  recordCaptureStage,
+                );
+                journal.record("capture-record-build-complete", requestSummary);
+              },
+              onPreflightStopRaised: () => journal.record("preflight-stop-signal-raised"),
+              onPreflightStopCaught: () => journal.record("preflight-stop-signal-caught"),
+            }),
+          stage: () => preflightStage,
+          record: (event) => journal.record(event.event, event.details),
+          heartbeat: ({ stage, elapsedMs }) =>
+            process.stdout.write(
+              `v1J capture preflight waiting stage=${stage} elapsedMs=${elapsedMs}\n`,
+            ),
+        });
+        const counters = journal.counters();
+        if (
+          !requestSummary ||
+          providerBoundCaptureCount !== 1 ||
+          counters.providerDispatchAttempts !== 0 ||
+          counters.providerCallbackInvocations !== 0 ||
+          counters.modelRequestCounter !== 0 ||
+          counters.preflightStopSignalRaised !== 1 ||
+          counters.preflightStopSignalCaught !== 1 ||
+          counters.preflightCompleted !== 1 ||
+          ACTIVE_FILTERING_ENABLED !== false
+        ) {
+          throw new Error(
+            "v1J provider capture preflight did not terminate on its no-dispatch gate",
+          );
+        }
+        if (fs.existsSync(formalRoot) || fs.existsSync(normalSmokeRoot)) {
+          throw new Error("v1J provider capture preflight observed formal or smoke state");
+        }
+        journal.record("provider-capture-preflight-complete", {
+          ...counters,
+          authorizedToolCount: surface.authorizedToolCount,
+          providerToolCount: surface.providerToolCount,
+          messageCount: requestSummary.messageCount,
+          toolCount: requestSummary.toolCount,
+          requestJsonBytes: requestSummary.requestJsonBytes,
+          canonicalRequestSha256: requestSummary.requestCanonicalSha256,
+          providerDispatches: 0,
+          rawRequestsSent: 0,
+          toolExecutions: 0,
+          formalStateTouched: false,
+          normalSmokeStateTouched: false,
+        });
+        process.stdout.write(
+          `${JSON.stringify({
+            harnessCommit: head,
+            requestObserverInvocations: counters.requestObserverInvocations,
+            requestObjectReceived: providerBoundCaptureCount === 1,
+            providerBoundCaptured: true,
+            providerCaptureStages,
+            preflightStopRaised: counters.preflightStopSignalRaised === 1,
+            preflightStopCaught: counters.preflightStopSignalCaught === 1,
+            preflightCompleted: true,
+            messageCount: requestSummary.messageCount,
+            toolCount: requestSummary.toolCount,
+            requestJsonBytes: requestSummary.requestJsonBytes,
+            canonicalRequestSha256: requestSummary.requestCanonicalSha256,
+            providerDispatches: 0,
+            rawRequestsSent: 0,
+            toolExecutions: 0,
+            activeFilteringEnabled: false,
+            formalStateTouched: false,
+            normalSmokeStateTouched: false,
+            artifactPath: journal.filePath,
+          })}\n`,
+        );
+      } catch (error) {
+        journal.record("provider-capture-preflight-failed", {
+          errorName: error instanceof Error ? error.name : "NonErrorThrown",
+          lastCheckpoint: preflightStage,
+        });
+        throw error;
+      } finally {
+        journal.close();
+      }
     },
   );
 });
@@ -4052,6 +4335,121 @@ describe("v1J schema-capture dispatch guard", () => {
       fs.rmSync(repoRoot, { recursive: true, force: true });
     }
   }, 120_000);
+
+  it("captures the provider-bound body and stops before dispatch or repeatability transport", async () => {
+    const privateText = "private preflight-only request content";
+    const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), "v1j-provider-bound-journal-test-"));
+    const commit = "9".repeat(40);
+    const journal = createV1JPreflightDiagnosticJournal({
+      repoRoot,
+      harnessCommit: commit,
+      arm: "A",
+      caseId: "offline-provider-capture",
+      preflightId: `offline-provider-capture-${process.pid}`,
+      pid: process.pid,
+    });
+    const requestBody = JSON.stringify({
+      model: MODEL_ID,
+      messages: [{ role: "user", content: privateText }],
+      tools: Array.from({ length: 15 }, (_, index) => ({
+        type: "function",
+        function: { name: `tool-${index}`, parameters: { type: "object" } },
+      })),
+      stream: true,
+    });
+    const events: V1JProviderControlEvent[] = [];
+    let providerDispatches = 0;
+    let rawRequests = 0;
+    journal.record("provider-bound-capture-start");
+    const capture = captureModelPayloads(undefined, {
+      stopAfterProviderBoundCapture: true,
+      preflightDiagnostics: journal,
+      onProviderCaptureStage: (event) => {
+        events.push(event);
+        journal.record(`provider-capture-${event.event}`, {
+          ...(event.elapsedMs === undefined ? {} : { elapsedMs: event.elapsedMs }),
+          ...(event.details === undefined ? {} : { details: event.details }),
+        });
+      },
+      onProviderDispatchAttempt: () => {
+        providerDispatches += 1;
+      },
+      onProviderRequestBeforeDispatch: ({ request, rawBody, requestIndex, dispatchOrdinal }) => {
+        expect(requestIndex).toBe(1);
+        expect(dispatchOrdinal).toBe(1);
+        events.push({ event: "capture-record-build-start" });
+        journal.record("capture-record-build-start");
+        const summary = summarizeV1JRawRepeatabilityRequest(
+          {
+            endpoint: `${LM_STUDIO_BASE_URL}/chat/completions`,
+            rawBody,
+            requestObject: request.body,
+          },
+          (event) => events.push(event),
+        );
+        expect(summary).toMatchObject({
+          messageCount: 1,
+          toolCount: 15,
+          requestJsonBytes: Buffer.byteLength(requestBody),
+        });
+        events.push({ event: "capture-record-build-complete" });
+        journal.record("capture-record-build-complete", summary);
+      },
+    });
+    const wrappedFetch = capture.wrapFetch(async () => {
+      rawRequests += 1;
+      return new Response("{}");
+    });
+    try {
+      await expect(
+        wrappedFetch(`${LM_STUDIO_BASE_URL}/chat/completions`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: requestBody,
+        }),
+      ).rejects.toBeInstanceOf(V1IProviderRequestCapturedError);
+      journal.increment("preflightStopSignalCaught", "preflight-stop-signal-caught", {
+        caughtAt: "offline-provider-capture-regression",
+      });
+      journal.increment("preflightCompleted", "preflight-complete");
+
+      expect(capture.requests).toHaveLength(1);
+      expect(capture.providerDispatchAttempts).toBe(0);
+      expect(capture.delegatedRequests).toBe(0);
+      expect(providerDispatches).toBe(0);
+      expect(rawRequests).toBe(0);
+      expect(events.map((event) => event.event)).toEqual([
+        "request-serialization-start",
+        "request-serialization-complete",
+        "request-object-received",
+        "capture-record-build-start",
+        "request-canonicalization-start",
+        "request-canonicalization-complete",
+        "capture-record-build-complete",
+        "provider-bound-request-captured",
+        "preflight-stop-signal-raised",
+      ]);
+      expect(JSON.stringify(events)).not.toContain(privateText);
+      expect(events.map((event) => event.event)).not.toContain("tool-execution-started");
+      expect(journal.counters()).toMatchObject({
+        providerDispatchAttempts: 0,
+        providerCallbackInvocations: 0,
+        modelRequestCounter: 0,
+        preflightStopSignalRaised: 1,
+        preflightStopSignalCaught: 1,
+        preflightCompleted: 1,
+      });
+      const journalText = fs.readFileSync(journal.filePath, "utf8");
+      expect(journalText).not.toContain(privateText);
+      expect(journalText).toContain("requestJsonBytes");
+      expect(fs.existsSync(path.resolve(repoRoot, V1J_FORMAL_ARTIFACT_RELATIVE_PATH))).toBe(false);
+      expect(fs.existsSync(resolveV1JSmokeRoot(repoRoot, commit))).toBe(false);
+    } finally {
+      capture.restore();
+      journal.close();
+      fs.rmSync(repoRoot, { recursive: true, force: true });
+    }
+  });
 
   it("records a blocked preflight separately from a provider dispatch and keeps the schedule closed", async () => {
     const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), "v1j-preflight-dispatch-test-"));

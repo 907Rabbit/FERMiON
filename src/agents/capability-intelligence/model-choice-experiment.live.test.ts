@@ -87,6 +87,7 @@ import {
   V1J_RAW_REPEATABILITY_PREFIX,
   V1J_RAW_REPEATABILITY_RUN_FLAG,
   type V1JRawRepeatabilityCapture,
+  type V1JProviderControlEvent,
 } from "../../../test/helpers/agents/model-choice-provider-repeatability.js";
 import {
   createV1JProviderResponseDiagnosticJournal,
@@ -2397,6 +2398,10 @@ describeV1JRawRepeatability("v1J raw-only provider repeatability", () => {
       let capture: V1JRawRepeatabilityCapture | undefined;
       let preflightStage = "prepared-runtime-acquisition";
       let preparedRuntimeRecorded = false;
+      const recordCaptureStage = (event: V1JProviderControlEvent) => {
+        preflightStage = event.event;
+        journal.record(event);
+      };
       journal.record({ event: "prepared-runtime-start" });
       const surface = await runV1JPreflightWithHeartbeat({
         operation: () =>
@@ -2415,9 +2420,7 @@ describeV1JRawRepeatability("v1J raw-only provider repeatability", () => {
                 journal.record({ event: "provider-bound-capture-start" });
               }
             },
-            onCapturedRequest: () => {
-              journal.record({ event: "request-observer-enter" });
-            },
+            onProviderCaptureStage: recordCaptureStage,
             onProviderBoundRequest: ({ request, rawBody, requestIndex, dispatchOrdinal }) => {
               preflightRequestCount += 1;
               if (preflightRequestCount !== 1 || requestIndex !== 1 || dispatchOrdinal !== 1) {
@@ -2425,22 +2428,40 @@ describeV1JRawRepeatability("v1J raw-only provider repeatability", () => {
                   "v1J raw repeatability preflight exceeded its single-request bound",
                 );
               }
-              capture = {
+              const candidate: V1JRawRepeatabilityCapture = {
                 endpoint: request.url,
                 rawBody,
-                requestObject: structuredClone(request.body),
+                requestObject: request.body,
               };
-              const capturedSummary = summarizeV1JRawRepeatabilityRequest(capture);
-              journal.record({
-                event: "provider-bound-request-captured",
-                details: capturedSummary,
+              const summary = summarizeV1JRawRepeatabilityRequest(candidate, recordCaptureStage);
+              recordCaptureStage({ event: "capture-record-build-start" });
+              const captureBuildStartedAt = performance.now();
+              try {
+                capture = {
+                  ...candidate,
+                  requestObject: structuredClone(request.body),
+                };
+              } catch (error) {
+                recordCaptureStage({
+                  event: "capture-record-build-failed",
+                  details: { errorName: error instanceof Error ? error.name : "NonErrorThrown" },
+                  elapsedMs: Math.max(0, Math.round(performance.now() - captureBuildStartedAt)),
+                });
+                throw error;
+              }
+              recordCaptureStage({
+                event: "capture-record-build-complete",
+                details: {
+                  requestJsonBytes: summary.requestJsonBytes,
+                  canonicalRequestSha256: summary.requestCanonicalSha256,
+                  messageCount: summary.messageCount,
+                  toolCount: summary.toolCount,
+                },
+                elapsedMs: Math.max(0, Math.round(performance.now() - captureBuildStartedAt)),
               });
             },
-            onPreflightStopRaised: () => {
-              journal.record({ event: "preflight-stop-raised" });
-            },
             onPreflightStopCaught: () => {
-              journal.record({ event: "preflight-stop-caught" });
+              recordCaptureStage({ event: "preflight-stop-signal-caught" });
             },
           }),
         stage: () => preflightStage,
@@ -2766,6 +2787,7 @@ async function captureV1JPreflightSurface(
     benchmarkCase?: ToolRankingBenchmarkCase;
     prepareWorkspace?: (workspaceDir: string) => void;
     onCapturedRequest?: (request: CapturedModelRequest) => void;
+    onProviderCaptureStage?: (event: V1JProviderControlEvent) => void;
     onProviderBoundRequest?: (input: {
       request: CapturedModelRequest;
       rawBody: string;
@@ -2820,6 +2842,7 @@ async function captureV1JPreflightSurface(
         stopAfterCapture: options?.onProviderBoundRequest === undefined,
         ...(options?.onProviderBoundRequest ? { stopAfterProviderBoundCapture: true } : {}),
         ...(preflightDiagnostics ? { preflightDiagnostics } : {}),
+        onProviderCaptureStage: options?.onProviderCaptureStage,
         capturePromptInstruction: v1jInstructionForArm(protocol, arm),
         onAuthorizedToolsCaptured: (tools) =>
           authorizedTools.splice(0, authorizedTools.length, ...tools),
@@ -3602,6 +3625,241 @@ describe("v1J schema-capture dispatch guard", () => {
       expect(underlyingFetches).toBe(0);
       expect(stopSignals).toBe(0);
     } finally {
+      payloadCapture.restore();
+    }
+  });
+
+  it("journals only structural capture stages and completes before provider dispatch", async () => {
+    const privateText = "never persist this diagnostic prompt";
+    const requestBody = JSON.stringify({
+      model: MODEL_ID,
+      messages: [{ role: "user", content: privateText }],
+      tools: Array.from({ length: 15 }, (_, index) => ({
+        type: "function",
+        function: { name: `tool-${index}`, parameters: { type: "object" } },
+      })),
+      stream: true,
+    });
+    const events: V1JProviderControlEvent[] = [];
+    let underlyingFetches = 0;
+    const capture = {
+      endpoint: `${LM_STUDIO_BASE_URL}/chat/completions`,
+      rawBody: requestBody,
+      requestObject: JSON.parse(requestBody) as Record<string, unknown>,
+    };
+    const payloadCapture = captureModelPayloads(undefined, {
+      stopAfterProviderBoundCapture: true,
+      onProviderCaptureStage: (event) => events.push(event),
+      onProviderRequestBeforeDispatch: ({ request, rawBody }) => {
+        summarizeV1JRawRepeatabilityRequest(
+          { ...capture, rawBody, requestObject: request.body },
+          (event) => events.push(event),
+        );
+        events.push({ event: "capture-record-build-start" });
+        events.push({ event: "capture-record-build-complete" });
+      },
+    });
+    const wrappedFetch = payloadCapture.wrapFetch(async () => {
+      underlyingFetches += 1;
+      return new Response("{}");
+    });
+    try {
+      await expect(
+        wrappedFetch(capture.endpoint, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: requestBody,
+        }),
+      ).rejects.toBeInstanceOf(V1IProviderRequestCapturedError);
+      expect(events.map((event) => event.event)).toEqual([
+        "request-serialization-start",
+        "request-serialization-complete",
+        "request-object-received",
+        "request-canonicalization-start",
+        "request-canonicalization-complete",
+        "capture-record-build-start",
+        "capture-record-build-complete",
+        "provider-bound-request-captured",
+        "preflight-stop-signal-raised",
+      ]);
+      expect(events[1]?.details).toMatchObject({
+        requestJsonBytes: Buffer.byteLength(requestBody),
+      });
+      expect(events[2]?.details).toMatchObject({ messageCount: 1, toolCount: 15 });
+      expect(JSON.stringify(events)).not.toContain(privateText);
+      expect(payloadCapture.providerDispatchAttempts).toBe(0);
+      expect(underlyingFetches).toBe(0);
+    } finally {
+      payloadCapture.restore();
+    }
+  });
+
+  it("fails closed and records a safe stage when provider-body serialization fails", async () => {
+    const events: V1JProviderControlEvent[] = [];
+    const payloadCapture = captureModelPayloads(undefined, {
+      onProviderCaptureStage: (event) => events.push(event),
+    });
+    let underlyingFetches = 0;
+    const wrappedFetch = payloadCapture.wrapFetch(async () => {
+      underlyingFetches += 1;
+      return new Response("{}");
+    });
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.error(new TypeError("private body failure detail"));
+      },
+    });
+    try {
+      const request = new Request(`${LM_STUDIO_BASE_URL}/chat/completions`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body,
+        duplex: "half",
+      } as RequestInit);
+      await expect(wrappedFetch(request)).rejects.toThrow();
+      expect(events.map((event) => event.event)).toEqual([
+        "request-serialization-start",
+        "request-serialization-failed",
+      ]);
+      expect(events[1]?.details).toEqual({ errorName: "TypeError" });
+      expect(JSON.stringify(events)).not.toContain("private body failure detail");
+      expect(underlyingFetches).toBe(0);
+      expect(payloadCapture.providerDispatchAttempts).toBe(0);
+    } finally {
+      payloadCapture.restore();
+    }
+  });
+
+  it("fails closed on canonicalization mismatch before dispatch", async () => {
+    const requestBody = JSON.stringify({
+      model: MODEL_ID,
+      messages: [{ role: "user", content: "private canonicalization prompt" }],
+      tools: Array.from({ length: 15 }, (_, index) => ({
+        type: "function",
+        function: { name: `tool-${index}`, parameters: { type: "object" } },
+      })),
+      stream: true,
+    });
+    const events: V1JProviderControlEvent[] = [];
+    const payloadCapture = captureModelPayloads(undefined, {
+      stopAfterProviderBoundCapture: true,
+      onProviderCaptureStage: (event) => events.push(event),
+      onProviderRequestBeforeDispatch: ({ request, rawBody }) => {
+        summarizeV1JRawRepeatabilityRequest(
+          {
+            endpoint: `${LM_STUDIO_BASE_URL}/chat/completions`,
+            rawBody,
+            requestObject: { ...request.body, model: "mismatched-model" },
+          },
+          (event) => events.push(event),
+        );
+      },
+    });
+    let underlyingFetches = 0;
+    const wrappedFetch = payloadCapture.wrapFetch(async () => {
+      underlyingFetches += 1;
+      return new Response("{}");
+    });
+    try {
+      await expect(
+        wrappedFetch(`${LM_STUDIO_BASE_URL}/chat/completions`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: requestBody,
+        }),
+      ).rejects.toThrow(/does not match its provider object/);
+      expect(events.map((event) => event.event)).toContain("request-canonicalization-failed");
+      expect(events.map((event) => event.event)).not.toContain("capture-record-build-start");
+      expect(events.map((event) => event.event)).not.toContain("provider-bound-request-captured");
+      expect(JSON.stringify(events)).not.toContain("private canonicalization prompt");
+      expect(underlyingFetches).toBe(0);
+      expect(payloadCapture.providerDispatchAttempts).toBe(0);
+    } finally {
+      payloadCapture.restore();
+    }
+  });
+
+  it("keeps the preflight heartbeat on a stalled request-serialization stage", async () => {
+    let bodyController: ReadableStreamDefaultController<Uint8Array> | undefined;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        bodyController = controller;
+      },
+    });
+    const events: V1JProviderControlEvent[] = [];
+    const heartbeats: V1JProviderControlEvent[] = [];
+    let resolveHeartbeat!: () => void;
+    const heartbeatObserved = new Promise<void>((resolve) => {
+      resolveHeartbeat = resolve;
+    });
+    let stage = "provider-bound-capture";
+    let underlyingFetches = 0;
+    const payloadCapture = captureModelPayloads(undefined, {
+      stopAfterProviderBoundCapture: true,
+      onProviderCaptureStage: (event) => {
+        events.push(event);
+        stage = event.event;
+      },
+      onProviderRequestBeforeDispatch: () => undefined,
+    });
+    const wrappedFetch = payloadCapture.wrapFetch(async () => {
+      underlyingFetches += 1;
+      return new Response("{}");
+    });
+    const request = new Request(`${LM_STUDIO_BASE_URL}/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body,
+      duplex: "half",
+    } as RequestInit);
+    let preflight: Promise<Response> | undefined;
+    let bodyReleased = false;
+    try {
+      preflight = runV1JPreflightWithHeartbeat({
+        operation: () => wrappedFetch(request),
+        stage: () => stage,
+        record: (event) => {
+          heartbeats.push(event);
+          if (event.event === "preflight-heartbeat") {
+            resolveHeartbeat();
+          }
+        },
+        heartbeatMs: 10,
+      });
+      void preflight.catch(() => undefined);
+      await heartbeatObserved;
+      expect(heartbeats[0]).toMatchObject({
+        event: "preflight-heartbeat",
+        details: { stage: "request-serialization-start" },
+      });
+      expect(underlyingFetches).toBe(0);
+      bodyController?.enqueue(
+        new TextEncoder().encode(
+          JSON.stringify({
+            model: MODEL_ID,
+            messages: [{ role: "user", content: "private heartbeat prompt" }],
+            tools: Array.from({ length: 15 }, (_, index) => ({
+              type: "function",
+              function: { name: `tool-${index}`, parameters: { type: "object" } },
+            })),
+            stream: true,
+          }),
+        ),
+      );
+      bodyController?.close();
+      bodyReleased = true;
+      await expect(preflight).rejects.toBeInstanceOf(V1IProviderRequestCapturedError);
+      expect(events.map((event) => event.event)).toContain("request-serialization-complete");
+      expect(events.map((event) => event.event)).toContain("provider-bound-request-captured");
+      expect(events.map((event) => event.event)).toContain("preflight-stop-signal-raised");
+      expect(payloadCapture.providerDispatchAttempts).toBe(0);
+      expect(underlyingFetches).toBe(0);
+      expect(JSON.stringify([...events, ...heartbeats])).not.toContain("private heartbeat prompt");
+    } finally {
+      if (!bodyReleased) {
+        bodyController?.error(new Error("test cleanup"));
+      }
+      await preflight?.catch(() => undefined);
       payloadCapture.restore();
     }
   });
@@ -6090,6 +6348,7 @@ async function runOne(input: {
     onImageFactoryResult?: (observation: V1JImageFactoryObservation) => void;
     onAuthorizedToolsCaptured?: (tools: readonly V1JAuthorizedToolSchema[]) => void;
     onRequestCaptured?: (request: CapturedModelRequest) => void;
+    onProviderCaptureStage?: (event: V1JProviderControlEvent) => void;
     onProviderRequestBeforeDispatch?: (input: {
       request: CapturedModelRequest;
       rawBody: string;
@@ -6145,6 +6404,16 @@ async function runOne(input: {
   const runProvider = input.provider ?? PROVIDER;
   const runModel = input.model ?? MODEL_ID;
   const diagnostics = createExperimentDiagnostics();
+  const recordProviderCaptureStage = (
+    event: string,
+    details?: Record<string, unknown>,
+    elapsedMs?: number,
+  ) =>
+    input.requestCapture?.onProviderCaptureStage?.({
+      event,
+      ...(details ? { details } : {}),
+      ...(elapsedMs === undefined ? {} : { elapsedMs: Math.max(0, Math.round(elapsedMs)) }),
+    });
   const promptMessageIdentities = new WeakMap<object, number>();
   let nextPromptMessageIdentity = 1;
   const identifyPromptObject = (value: object) => {
@@ -6162,6 +6431,15 @@ async function runOne(input: {
   const originalPromptMessageTrace = diagnostics.hooks.onPromptMessageTrace;
   diagnostics.hooks.onPromptMessageTrace = (event) => {
     originalPromptMessageTrace?.(event);
+    if (event.stage === "provider-onPayload-transform-start") {
+      recordProviderCaptureStage("provider-payload-transform-start", {
+        callbackIndex: event.callbackIndex ?? null,
+      });
+    } else if (event.stage === "provider-onPayload-transform-complete") {
+      recordProviderCaptureStage("provider-payload-transform-complete", {
+        callbackIndex: event.callbackIndex ?? null,
+      });
+    }
     const journal = input.requestCapture?.preflightDiagnostics;
     if (journal) {
       if (event.stage === "prompt-context-built") {
@@ -6355,6 +6633,10 @@ async function runOne(input: {
         : {};
     const request = { body, url: "provider-adapter" };
     const requestMessages = Array.isArray(body.messages) ? body.messages : [];
+    recordProviderCaptureStage("request-observer-enter", {
+      messageCount: requestMessages.length,
+      toolCount: Array.isArray(body.tools) ? body.tools.length : 0,
+    });
     const callbackEntry = summarizePromptMessageTrace(
       {
         stage: "request-observer-enter",
@@ -6440,8 +6722,29 @@ async function runOne(input: {
       toolCount: toolNames.length,
       representativeToolNames: toolNames,
     });
+    const observerStartedAt = performance.now();
+    recordProviderCaptureStage("request-observer-await-start", {
+      callbackIndex,
+      messageCount: requestMessages.length,
+      toolCount: toolNames.length,
+    });
     try {
       await diagnosticsProviderRequest?.({ payload, model });
+      recordProviderCaptureStage(
+        "request-observer-await-complete",
+        { callbackIndex },
+        performance.now() - observerStartedAt,
+      );
+    } catch (error) {
+      recordProviderCaptureStage(
+        "request-observer-await-failed",
+        {
+          callbackIndex,
+          errorName: error instanceof Error ? error.name : "NonErrorThrown",
+        },
+        performance.now() - observerStartedAt,
+      );
+      throw error;
     } finally {
       const callbackExit = summarizePromptMessageTrace(
         {
@@ -8207,6 +8510,7 @@ function captureModelPayloads(
     liveness?: V1JCaptureLiveness;
     onProviderDispatchAttempt?: (count: number, requestIndex: number) => void;
     onRequestCaptured?: (request: CapturedModelRequest) => void;
+    onProviderCaptureStage?: (event: V1JProviderControlEvent) => void;
     onProviderRequestBeforeDispatch?: (input: {
       request: CapturedModelRequest;
       rawBody: string;
@@ -8253,13 +8557,38 @@ function captureModelPayloads(
       );
       const url =
         typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
-      const body = await readCapturedFetchBody(input, init);
+      const isPotentialProviderRequest =
+        url.startsWith(LM_STUDIO_BASE_URL) ||
+        url.includes("/chat/completions") ||
+        url.includes("/responses");
+      const serializationStartedAt = performance.now();
+      if (isPotentialProviderRequest) {
+        options?.onProviderCaptureStage?.({ event: "request-serialization-start" });
+      }
+      let body: string | undefined;
+      try {
+        body = await readCapturedFetchBody(input, init);
+      } catch (error) {
+        if (isPotentialProviderRequest) {
+          options?.onProviderCaptureStage?.({
+            event: "request-serialization-failed",
+            elapsedMs: Math.max(0, Math.round(performance.now() - serializationStartedAt)),
+            details: { errorName: error instanceof Error ? error.name : "NonErrorThrown" },
+          });
+        }
+        throw error;
+      }
+      if (isPotentialProviderRequest) {
+        options?.onProviderCaptureStage?.({
+          event: "request-serialization-complete",
+          elapsedMs: Math.max(0, Math.round(performance.now() - serializationStartedAt)),
+          details: {
+            requestJsonBytes: body === undefined ? null : Buffer.byteLength(body, "utf8"),
+          },
+        });
+      }
       const isProviderRequest =
-        (url.startsWith(LM_STUDIO_BASE_URL) ||
-          url.includes("/chat/completions") ||
-          url.includes("/responses")) &&
-        typeof body === "string" &&
-        body.trim().startsWith("{");
+        isPotentialProviderRequest && typeof body === "string" && body.trim().startsWith("{");
       const requestIndex = isProviderRequest ? ++providerRequestIndex : 0;
       if (isProviderRequest && providerRequestGateFailed) {
         throw providerRequestGateError;
@@ -8268,8 +8597,29 @@ function captureModelPayloads(
         ? `${options?.requestCorrelationId ?? "v1j-request"}:${requestIndex}`
         : undefined;
       if (isProviderRequest) {
-        const parsed = JSON.parse(body) as Record<string, unknown>;
+        let parsed: Record<string, unknown>;
+        try {
+          const value: unknown = JSON.parse(body);
+          if (!value || typeof value !== "object" || Array.isArray(value)) {
+            throw new TypeError("provider request body is not a JSON object");
+          }
+          parsed = value as Record<string, unknown>;
+        } catch (error) {
+          options?.onProviderCaptureStage?.({
+            event: "request-object-parse-failed",
+            details: { errorName: error instanceof Error ? error.name : "NonErrorThrown" },
+          });
+          throw error;
+        }
         const request = { body: parsed, url };
+        options?.onProviderCaptureStage?.({
+          event: "request-object-received",
+          details: {
+            messageCount: Array.isArray(parsed.messages) ? parsed.messages.length : 0,
+            toolCount: Array.isArray(parsed.tools) ? parsed.tools.length : 0,
+            requestJsonBytes: Buffer.byteLength(body, "utf8"),
+          },
+        });
         if (!providerRequestRecorded) {
           requests.push(request);
           options?.preflightDiagnostics?.increment(
@@ -8330,6 +8680,7 @@ function captureModelPayloads(
             requestIndex,
             dispatchOrdinal: providerDispatchAttempts + 1,
           });
+          options?.onProviderCaptureStage?.({ event: "provider-bound-request-captured" });
         } catch (error) {
           providerRequestGateFailed = true;
           providerRequestGateError = error;
@@ -8340,6 +8691,7 @@ function captureModelPayloads(
           providerRequestGateFailed = true;
           providerRequestGateError = stopSignal;
           options.onPreflightStopRaised?.();
+          options?.onProviderCaptureStage?.({ event: "preflight-stop-signal-raised" });
           options?.preflightDiagnostics?.increment(
             "preflightStopSignalRaised",
             preflightEvent("stop-after-provider-bound-capture-signal"),

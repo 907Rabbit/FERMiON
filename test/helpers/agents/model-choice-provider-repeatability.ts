@@ -157,33 +157,52 @@ export function assertV1JRawRepeatabilityPreflight(input: {
 
 export function summarizeV1JRawRepeatabilityRequest(
   capture: V1JRawRepeatabilityCapture,
+  onStage?: (event: V1JProviderControlEvent) => void,
 ): V1JRawRepeatabilityRequestSummary {
+  const canonicalizationStartedAt = performance.now();
+  onStage?.({ event: "request-canonicalization-start" });
   let parsed: unknown;
+  let body: Record<string, unknown>;
+  let requestCanonicalSha256: string;
   try {
     parsed = JSON.parse(capture.rawBody);
-  } catch {
-    throw new Error("v1J raw repeatability captured provider request is not valid JSON");
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("v1J raw repeatability captured provider request is not a JSON object");
+    }
+    body = parsed as Record<string, unknown>;
+    if (canonicalJson(parsed) !== canonicalJson(capture.requestObject)) {
+      throw new Error(
+        "v1J raw repeatability captured request body does not match its provider object",
+      );
+    }
+    if (
+      body.model !== "qwen/qwen3.5-9b" ||
+      body.stream !== true ||
+      !Array.isArray(body.messages) ||
+      !Array.isArray(body.tools) ||
+      body.tools.length !== V1J_PROVIDER_CONTROL_SCHEMA_BASELINE.providerToolCount
+    ) {
+      throw new Error("v1J raw repeatability requires the frozen full streaming 15-tool request");
+    }
+    requestCanonicalSha256 = sha256(canonicalJson(body));
+  } catch (error) {
+    onStage?.({
+      event: "request-canonicalization-failed",
+      elapsedMs: Math.max(0, Math.round(performance.now() - canonicalizationStartedAt)),
+      details: { errorName: error instanceof Error ? error.name : "NonErrorThrown" },
+    });
+    if (error instanceof SyntaxError) {
+      throw new Error("v1J raw repeatability captured provider request is not valid JSON", {
+        cause: error,
+      });
+    }
+    throw error;
   }
-  if (
-    !parsed ||
-    typeof parsed !== "object" ||
-    Array.isArray(parsed) ||
-    canonicalJson(parsed) !== canonicalJson(capture.requestObject)
-  ) {
-    throw new Error(
-      "v1J raw repeatability captured request body does not match its provider object",
-    );
-  }
-  const body = parsed as Record<string, unknown>;
-  if (
-    body.model !== "qwen/qwen3.5-9b" ||
-    body.stream !== true ||
-    !Array.isArray(body.messages) ||
-    !Array.isArray(body.tools) ||
-    body.tools.length !== V1J_PROVIDER_CONTROL_SCHEMA_BASELINE.providerToolCount
-  ) {
-    throw new Error("v1J raw repeatability requires the frozen full streaming 15-tool request");
-  }
+  onStage?.({
+    event: "request-canonicalization-complete",
+    elapsedMs: Math.max(0, Math.round(performance.now() - canonicalizationStartedAt)),
+    details: { canonicalRequestSha256: requestCanonicalSha256 },
+  });
   const messageHashes = body.messages.map((message, index) => {
     const row = message && typeof message === "object" ? (message as Record<string, unknown>) : {};
     const content = row.content;
@@ -197,7 +216,7 @@ export function summarizeV1JRawRepeatabilityRequest(
   });
   return {
     requestSha256: sha256(capture.rawBody),
-    requestCanonicalSha256: sha256(canonicalJson(body)),
+    requestCanonicalSha256,
     requestJsonBytes: Buffer.byteLength(capture.rawBody, "utf8"),
     messageCount: messageHashes.length,
     messageHashes,

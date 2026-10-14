@@ -8,6 +8,13 @@ import {
   canonicalV1JToolSchema,
 } from "../../../test/helpers/agents/model-choice-action-initiation.js";
 import {
+  diffV1JSystemPromptSectionFingerprints,
+  fingerprintV1JSystemPromptParagraphs,
+  fingerprintV1JSystemPromptSections,
+  summarizeV1JPromptContentDelta,
+  summarizeV1JPromptMessageContentDeltas,
+} from "../../../test/helpers/agents/model-choice-prompt-content-delta.js";
+import {
   V1J_PROVIDER_CONTROL_MODEL_CONFIG_SHA256,
   V1J_PROVIDER_CONTROL_PREREGISTRATION_SHA256,
   V1J_PROVIDER_CONTROL_SCHEMA_BASELINE,
@@ -126,6 +133,76 @@ function preflightInput() {
 }
 
 describe("v1J raw-only provider repeatability", () => {
+  it("classifies byte-level prompt deltas without retaining message content", () => {
+    const append = summarizeV1JPromptContentDelta("prompt", "prompt!");
+    expect(append).toMatchObject({
+      classification: "byte-content-change",
+      beforeBytes: 6,
+      afterBytes: 7,
+      prefixCommonBytes: 6,
+      suffixCommonBytes: 0,
+      insertedByteCount: 1,
+      deletedByteCount: 0,
+      substitutedByteCount: 0,
+      firstDifferenceOffset: 6,
+      lastDifferenceOffset: 6,
+    });
+
+    const lineEndings = summarizeV1JPromptContentDelta("line\nnext", "line\r\nnext");
+    expect(lineEndings.classification).toBe("line-ending-normalization");
+    expect(lineEndings.lfCountBefore).toBe(1);
+    expect(lineEndings.crCountBefore).toBe(0);
+    expect(lineEndings.lfCountAfter).toBe(1);
+    expect(lineEndings.crCountAfter).toBe(1);
+    expect(summarizeV1JPromptContentDelta("tail", "tail\n").classification).toBe(
+      "trailing-newline-change",
+    );
+    expect(summarizeV1JPromptContentDelta("tail ", "tail").classification).toBe(
+      "trailing-whitespace-normalization",
+    );
+    expect(summarizeV1JPromptContentDelta(" tail", "tail").classification).toBe(
+      "leading-whitespace-normalization",
+    );
+    expect(summarizeV1JPromptContentDelta("e\u0301", "é").classification).toBe(
+      "unicode-normalization",
+    );
+
+    const messages = summarizeV1JPromptMessageContentDeltas(
+      [{ role: "user", content: "PRIVATE_BEFORE" }],
+      [{ role: "user", content: "PRIVATE_AFTER" }],
+    );
+    expect(messages).toHaveLength(1);
+    expect(JSON.stringify({ append, lineEndings, messages })).not.toContain("PRIVATE_");
+    expect(JSON.stringify({ append, lineEndings, messages })).not.toContain("prompt!");
+  });
+
+  it("localizes system prompt section drift by named section fingerprint", () => {
+    const before = fingerprintV1JSystemPromptSections({
+      base: "base instructions",
+      toolCapabilities: "tool block",
+      runtimeMetadata: undefined,
+    });
+    const after = fingerprintV1JSystemPromptSections({
+      base: "base instructions",
+      toolCapabilities: "changed tool block",
+      runtimeMetadata: "cwd-independent metadata",
+    });
+
+    expect(diffV1JSystemPromptSectionFingerprints(before, after)).toEqual([
+      "runtimeMetadata",
+      "toolCapabilities",
+    ]);
+    expect(JSON.stringify(after)).not.toContain("changed tool block");
+    expect(JSON.stringify(after)).not.toContain("cwd-independent metadata");
+
+    const priorParagraphs = fingerprintV1JSystemPromptParagraphs("base block\n\nskills block");
+    const currentParagraphs = fingerprintV1JSystemPromptParagraphs("base block\n\nskills changed");
+    expect(diffV1JSystemPromptSectionFingerprints(priorParagraphs, currentParagraphs)).toEqual([
+      "paragraph-1",
+    ]);
+    expect(JSON.stringify(currentParagraphs)).not.toContain("skills changed");
+  });
+
   it("requires the exact clean, commit-bound, isolated preflight", () => {
     expect(() => assertV1JRawRepeatabilityPreflight(preflightInput())).not.toThrow();
     expect(() =>

@@ -71,6 +71,12 @@ import {
 } from "../../../test/helpers/agents/model-choice-adapter-differential.js";
 import { recordV1JPromptAwaitDiagnostic } from "../../../test/helpers/agents/model-choice-prompt-await-diagnostic.js";
 import {
+  fingerprintV1JSystemPromptParagraphs,
+  fingerprintV1JSystemPromptSections,
+  summarizeV1JPromptMessageContentDeltas,
+  type V1JPromptMessageContent,
+} from "../../../test/helpers/agents/model-choice-prompt-content-delta.js";
+import {
   V1J_PROVIDER_CONTROL_MODEL_CONFIG_SHA256,
   V1J_PROVIDER_CONTROL_SCHEMA_BASELINE,
 } from "../../../test/helpers/agents/model-choice-provider-isolation.js";
@@ -5390,7 +5396,64 @@ describe("v1J schema-capture dispatch guard", () => {
             ),
         ),
       ).toBe(true);
+      const normalizedBoundary = materializationRows.find(
+        (row) => row.stage === "agent-llm-boundary-normalized",
+      );
+      expect(normalizedBoundary?.contentDeltas).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            index: expect.any(Number),
+            beforeRole: expect.any(String),
+            afterRole: expect.any(String),
+            delta: expect.objectContaining({
+              beforeBytes: expect.any(Number),
+              afterBytes: expect.any(Number),
+              prefixCommonBytes: expect.any(Number),
+              suffixCommonBytes: expect.any(Number),
+              insertedByteCount: expect.any(Number),
+              deletedByteCount: expect.any(Number),
+              substitutedByteCount: expect.any(Number),
+              beforeTailSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+              afterTailSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+              newlineCountBefore: expect.any(Number),
+              newlineCountAfter: expect.any(Number),
+              crCountBefore: expect.any(Number),
+              crCountAfter: expect.any(Number),
+              lfCountBefore: expect.any(Number),
+              lfCountAfter: expect.any(Number),
+              utf8CodepointCountBefore: expect.any(Number),
+              utf8CodepointCountAfter: expect.any(Number),
+            }),
+          }),
+        ]),
+      );
+      expect(normalizedBoundary?.systemPromptSections).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            sectionName: "providerSystemMessage",
+            present: false,
+            sha256: null,
+            utf8Bytes: null,
+          }),
+        ]),
+      );
       expect(JSON.stringify(materializationRows)).not.toContain(
+        protocol.arms.C.experimentalInstruction,
+      );
+      const providerMessageBoundary = materializationRows.find(
+        (row) => row.stage === "provider-message-conversion-output",
+      );
+      expect(providerMessageBoundary?.systemPromptParagraphs).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            sectionName: expect.stringMatching(/^paragraph-\d+$/u),
+            present: true,
+            sha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+            utf8Bytes: expect.any(Number),
+          }),
+        ]),
+      );
+      expect(JSON.stringify(providerMessageBoundary?.systemPromptParagraphs)).not.toContain(
         protocol.arms.C.experimentalInstruction,
       );
       const promptContexts = messageTraceRows.filter((row) => row.stage === "prompt-context-built");
@@ -8265,6 +8328,7 @@ async function runOne(input: {
       }
     | undefined;
   let previousMaterializationTrace: ReturnType<typeof summarizePromptMessageTrace> | undefined;
+  let previousMaterializationContent: V1JPromptMessageContent[] | undefined;
   let materializationRequestIndex = 0;
   const preCaptureObserverTraces: V1JPreCaptureObserverTrace[] = [];
   const preCaptureTranscriptGrowth: V1JPreCaptureTranscriptGrowth[] = [];
@@ -8325,11 +8389,13 @@ async function runOne(input: {
     if (journal) {
       if (event.stage === "prompt-context-built") {
         previousMaterializationTrace = undefined;
+        previousMaterializationContent = undefined;
         materializationRequestIndex = 0;
       } else if (event.stage === "provider-adapter-input") {
         materializationRequestIndex += 1;
         if (materializationRequestIndex > 1) {
           previousMaterializationTrace = undefined;
+          previousMaterializationContent = undefined;
         }
       }
       if (event.stage === "prompt-context-built") {
@@ -8395,6 +8461,23 @@ async function runOne(input: {
         const differingPaths = previousMaterializationTrace
           ? diffPromptMaterializationSnapshots(previousMaterializationTrace, summary)
           : [];
+        const materializationContent = event.messages.map((message) => {
+          const row =
+            message && typeof message === "object" && !Array.isArray(message)
+              ? (message as Record<string, unknown>)
+              : {};
+          return {
+            role: typeof row.role === "string" ? row.role : null,
+            content: typeof row.content === "string" ? row.content : "",
+          };
+        });
+        const contentDeltas = previousMaterializationContent
+          ? summarizeV1JPromptMessageContentDeltas(
+              previousMaterializationContent,
+              materializationContent,
+            )
+          : [];
+        const systemMessage = materializationContent.find((message) => message.role === "system");
         journal.record("prompt-materialization-boundary", {
           materializationRequestIndex,
           previousStage: previousMaterializationTrace?.stage ?? null,
@@ -8407,6 +8490,11 @@ async function runOne(input: {
           systemPromptFingerprint: summary.systemPromptFingerprint ?? null,
           materializationFactors: summary.materializationFactors ?? null,
           messageCount: summary.messageCount,
+          contentDeltas,
+          systemPromptSections: fingerprintV1JSystemPromptSections({
+            providerSystemMessage: systemMessage?.content,
+          }),
+          systemPromptParagraphs: fingerprintV1JSystemPromptParagraphs(systemMessage?.content),
           messages: summary.messages.map(
             ({
               index,
@@ -8426,6 +8514,7 @@ async function runOne(input: {
           ),
         });
         previousMaterializationTrace = summary;
+        previousMaterializationContent = materializationContent;
       }
       const transcriptStages = new Set([
         "prompt-submit-enter",

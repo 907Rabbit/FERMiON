@@ -59,6 +59,22 @@ export type V1JRawRepeatabilityRequestSummary = {
   componentFingerprint: V1JProviderRequestComponentFingerprint;
 };
 
+export type V1JAgentSessionTimestampDecoration = {
+  source: "normalizeMessagesForLlmBoundary.stampUserTextWithMessageTimestamp";
+  messageIndex: number;
+  prefixSha256: string;
+  originalContentSha256: string;
+  originalContentBytes: number;
+  prefixBytes: number;
+};
+
+export type V1JProviderRequestIdentity = {
+  rawBodySha256: string;
+  historicalExactCanonicalSha256: string;
+  providerRequestSha256: string;
+  stableProviderRequestSha256: string;
+};
+
 export type V1JProviderRequestFingerprintComponent = {
   path: string;
   sha256: string;
@@ -493,6 +509,82 @@ export function summarizeV1JRawRepeatabilityRequest(
     toolCount: body.tools.length,
     toolSchemaJsonBytes: Buffer.byteLength(JSON.stringify(body.tools), "utf8"),
     componentFingerprint,
+  };
+}
+
+export function identifyV1JProviderRequest(input: {
+  capture: V1JRawRepeatabilityCapture;
+  provider: string;
+  timestampDecoration?: V1JAgentSessionTimestampDecoration;
+}): V1JProviderRequestIdentity {
+  const rawBodyBytes = Buffer.from(input.capture.rawBody, "utf8");
+  const parsed = JSON.parse(input.capture.rawBody) as unknown;
+  if (
+    !parsed ||
+    typeof parsed !== "object" ||
+    Array.isArray(parsed) ||
+    canonicalJson(parsed) !== canonicalJson(input.capture.requestObject)
+  ) {
+    throw new Error(
+      "v1J stable provider identity requires matching serialized and parsed requests",
+    );
+  }
+  const body = structuredClone(parsed) as Record<string, unknown>;
+  const decoration = input.timestampDecoration;
+  if (typeof input.provider !== "string" || input.provider.length === 0) {
+    throw new Error("v1J stable provider identity requires a provider id");
+  }
+
+  // Missing producer provenance leaves the request exact; a generic timestamp-looking prefix
+  // is not sufficient evidence to normalize user content.
+  if (decoration) {
+    const messages = body.messages;
+    if (
+      !Array.isArray(messages) ||
+      !Number.isInteger(decoration.messageIndex) ||
+      decoration.messageIndex < 0 ||
+      decoration.prefixBytes !== 28 ||
+      !/^[a-f0-9]{64}$/.test(decoration.prefixSha256) ||
+      !Number.isInteger(decoration.originalContentBytes) ||
+      decoration.originalContentBytes < 0 ||
+      !/^[a-f0-9]{64}$/.test(decoration.originalContentSha256)
+    ) {
+      throw new Error("v1J stable provider identity requires valid timestamp provenance");
+    }
+    if (decoration.source !== "normalizeMessagesForLlmBoundary.stampUserTextWithMessageTimestamp") {
+      throw new Error("v1J stable provider identity rejects unknown timestamp provenance");
+    }
+
+    const message = messages[decoration.messageIndex];
+    if (!message || typeof message !== "object" || Array.isArray(message)) {
+      throw new Error("v1J timestamp provenance does not identify a provider user message");
+    }
+    const row = message as Record<string, unknown>;
+    if (row.role !== "user" || typeof row.content !== "string") {
+      throw new Error("v1J timestamp provenance does not identify string user content");
+    }
+    const contentBytes = Buffer.from(row.content, "utf8");
+    const timestampPrefix = contentBytes.subarray(0, decoration.prefixBytes);
+    const originalContent = contentBytes.subarray(decoration.prefixBytes);
+    if (
+      timestampPrefix.byteLength !== decoration.prefixBytes ||
+      sha256(timestampPrefix) !== decoration.prefixSha256 ||
+      originalContent.byteLength !== decoration.originalContentBytes ||
+      sha256(originalContent) !== decoration.originalContentSha256
+    ) {
+      throw new Error("v1J timestamp provenance does not match the provider user message");
+    }
+
+    // Only the explicitly traced AgentSession decoration is normalized. All other request
+    // fields remain in the canonical identity so semantic request changes still change its hash.
+    row.content = `<TIMESTAMP> ${new TextDecoder("utf-8", { fatal: true }).decode(originalContent)}`;
+  }
+  return {
+    rawBodySha256: sha256(rawBodyBytes),
+    historicalExactCanonicalSha256: sha256(canonicalJson(parsed)),
+    // Bind the provider separately because provider identity is not part of the serialized body.
+    providerRequestSha256: sha256(canonicalJson({ provider: input.provider, request: parsed })),
+    stableProviderRequestSha256: sha256(canonicalJson({ provider: input.provider, request: body })),
   };
 }
 

@@ -10,10 +10,12 @@ import {
   assertV1JAdapterDifferentialRequestBudget,
   assertV1JAdapterDifferentialRequestMatch,
   assertV1JAdapterDifferentialPreflight,
+  compareV1JAdapterDifferentialRequests,
   createV1JAdapterDifferentialJournal,
   installV1JAdapterDifferentialToolGuard,
   reportV1JAdapterDifferentialProgress,
   runV1JAdapterDifferentialRawTransport,
+  recordV1JAdapterDifferentialRequestFingerprint,
   summarizeV1JAdapterDifferentialRequest,
   withV1JAdapterDifferentialProgress,
   V1J_ADAPTER_DIFFERENTIAL_AUTHORIZED_FLAG,
@@ -48,6 +50,7 @@ const requestBody = {
   model: "qwen/qwen3.5-9b",
   messages: [{ role: "user", content: "safe fixture prompt" }],
   tools: Array.from({ length: 15 }, (_, index) => ({ function: { name: `tool_${index}` } })),
+  max_tokens: 128,
   stream: true,
 };
 
@@ -125,29 +128,98 @@ describe("v1J adapter differential diagnostics", () => {
       messageCount: 1,
       toolCount: 15,
       totalMessageContentBytes: Buffer.byteLength("safe fixture prompt"),
+      messages: [
+        {
+          index: 0,
+          role: "user",
+          contentSha256: expect.stringMatching(/^[0-9a-f]{64}$/),
+          contentBytes: Buffer.byteLength("safe fixture prompt"),
+        },
+      ],
+      providerOptions: expect.arrayContaining([
+        {
+          name: "model",
+          valueType: "string",
+          valueSha256: expect.any(String),
+          safeValue: requestBody.model,
+        },
+        {
+          name: "max_tokens",
+          valueType: "number",
+          valueSha256: expect.any(String),
+          safeValue: 128,
+        },
+        { name: "stream", valueType: "boolean", valueSha256: expect.any(String), safeValue: true },
+      ]),
     });
     expect(JSON.stringify(summary)).not.toContain("safe fixture prompt");
     expect(JSON.stringify(summary)).not.toContain("tool_0");
+    expect(JSON.stringify(summary)).not.toContain("response-body-secret");
+    expect(summary.requestSha256).toMatch(/^[0-9a-f]{64}$/);
+    expect(summary.messagesCanonicalSha256).toMatch(/^[0-9a-f]{64}$/);
+    expect(summary.toolsCanonicalSha256).toMatch(/^[0-9a-f]{64}$/);
   });
 
-  it("compares canonical request identity while preserving array order", () => {
+  it("accepts canonical key-order parity while reporting wire-byte hashes separately", () => {
     const reorderedKeys = {
       stream: true,
+      max_tokens: requestBody.max_tokens,
       tools: requestBody.tools,
       messages: requestBody.messages,
       model: requestBody.model,
     };
-    expect(
-      assertV1JAdapterDifferentialRequestMatch(requestBody, reorderedKeys).rawRequestSha256,
-    ).toBe(
-      assertV1JAdapterDifferentialRequestMatch(requestBody, reorderedKeys).adapterRequestSha256,
-    );
+    const comparison = assertV1JAdapterDifferentialRequestMatch(requestBody, reorderedKeys);
+    expect(comparison.canonicalMatch).toBe(true);
+    expect(comparison.requestMatch).toBe(false);
+    expect(comparison.rawRequestSha256).not.toBe(comparison.adapterRequestSha256);
+    expect(comparison.differingPaths).toEqual([]);
     expect(() =>
       assertV1JAdapterDifferentialRequestMatch(requestBody, {
         ...reorderedKeys,
         tools: [...requestBody.tools].toReversed(),
       }),
     ).toThrow(/request bodies differ/);
+  });
+
+  it("reports only structural field paths for message, schema, and option differences", () => {
+    const changedMessage = {
+      ...requestBody,
+      messages: [{ role: "user", content: "different private prompt" }],
+    };
+    const changedToolSchema = structuredClone(requestBody);
+    changedToolSchema.tools[0] = {
+      function: {
+        name: "tool_0",
+        parameters: { type: "object", properties: { path: { type: "string" } } },
+      },
+    };
+    const changedGenerationOption = { ...requestBody, temperature: 0.25 };
+
+    expect(
+      compareV1JAdapterDifferentialRequests(requestBody, changedMessage).differingPaths,
+    ).toEqual(["messages.0.content"]);
+    expect(
+      compareV1JAdapterDifferentialRequests(requestBody, changedToolSchema).differingPaths,
+    ).toEqual(["tools.0.function.parameters"]);
+    expect(
+      compareV1JAdapterDifferentialRequests(requestBody, changedGenerationOption).differingPaths,
+    ).toEqual(["temperature"]);
+  });
+
+  it("does not mistake a three-message follow-up candidate for the initial request", () => {
+    const followup = {
+      ...requestBody,
+      messages: [
+        ...requestBody.messages,
+        { role: "assistant", content: "private response text" },
+        { role: "user", content: "private follow-up text" },
+      ],
+    };
+    const comparison = compareV1JAdapterDifferentialRequests(requestBody, followup);
+    expect(summarizeV1JAdapterDifferentialRequest(followup).messageCount).toBe(3);
+    expect(comparison.canonicalMatch).toBe(false);
+    expect(comparison.differingPaths).toEqual(["messages.1", "messages.2"]);
+    expect(JSON.stringify(comparison)).not.toContain("private");
   });
 
   it("keeps raw-plus-adapter dispatches within one raw and two adapter requests", () => {
@@ -397,6 +469,36 @@ describe("v1J adapter differential diagnostics", () => {
       expect(events).not.toContain("adapter-tool-execution-guard");
       expect(events).not.toContain("safe fixture prompt");
       expect(events).not.toContain("tool_0");
+      expect(events).not.toContain("call-raw-only");
+      recordV1JAdapterDifferentialRequestFingerprint({
+        journal,
+        event: "adapter-initial-request-candidate",
+        body: requestBody,
+        requestIndex: 1,
+        dispatched: false,
+      });
+      recordV1JAdapterDifferentialRequestFingerprint({
+        journal,
+        event: "adapter-followup-request-candidate",
+        body: {
+          ...requestBody,
+          messages: [
+            ...requestBody.messages,
+            { role: "assistant", content: "response-secret" },
+            { role: "user", content: "followup-secret" },
+          ],
+        },
+        requestIndex: 2,
+        dispatched: false,
+      });
+      const fingerprintEvents = fs.readFileSync(journal.filePath, "utf8");
+      expect(fingerprintEvents).toContain('"event":"adapter-initial-request-candidate"');
+      expect(fingerprintEvents).toContain('"event":"adapter-followup-request-candidate"');
+      expect(fingerprintEvents).toContain('"messageCount":3');
+      expect(fingerprintEvents).toContain('"dispatched":false');
+      expect(fingerprintEvents).not.toContain("safe fixture prompt");
+      expect(fingerprintEvents).not.toContain("response-secret");
+      expect(fingerprintEvents).not.toContain("followup-secret");
     } finally {
       journal.close();
       fs.rmSync(root, { recursive: true, force: true });

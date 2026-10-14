@@ -48,13 +48,14 @@ import {
   type V1JProtocol,
 } from "../../../test/helpers/agents/model-choice-action-initiation.js";
 import {
-  assertV1JAdapterDifferentialRequestMatch,
+  compareV1JAdapterDifferentialRequests,
   assertV1JAdapterDifferentialPreflight,
   assertV1JAdapterDifferentialRequestBudget,
   createV1JAdapterDifferentialJournal,
   installV1JAdapterDifferentialToolGuard,
   reportV1JAdapterDifferentialProgress,
   runV1JAdapterDifferentialRawTransport,
+  recordV1JAdapterDifferentialRequestFingerprint,
   summarizeV1JAdapterDifferentialRequest,
   withV1JAdapterDifferentialProgress,
   V1J_ADAPTER_DIFFERENTIAL_AUTHORIZED_FLAG,
@@ -1840,6 +1841,7 @@ describeV1JAdapterDifferential("v1J raw-transport versus adapter differential", 
         stage: "lmstudio-discovery",
         operation: () => assertLiveModelAvailable(),
       });
+      const modelDiscoveryStatus = "available-at-preflight";
 
       const cell = buildV1JSmokeSchedule(protocol).find(
         (candidate) => candidate.cellId === "smoke-tool-required:A:1",
@@ -1849,6 +1851,7 @@ describeV1JAdapterDifferential("v1J raw-transport versus adapter differential", 
       }
       const benchmark = v1jSmokeBenchmark(cell);
       const capturedBodies: Record<string, unknown>[] = [];
+      let schemaPreflightPreparedRuntimeReadyAtMs: number | undefined;
       const schemaSurface = await withV1JAdapterDifferentialProgress({
         stage: "schema-preflight",
         operation: (checkpoint) => {
@@ -1863,6 +1866,9 @@ describeV1JAdapterDifferential("v1J raw-transport versus adapter differential", 
               ),
             onCapturedRequest: (request) => capturedBodies.push(structuredClone(request.body)),
             onCheckpoint: (runtimeCheckpoint) => {
+              if (runtimeCheckpoint.stage === "client-preparation-completed") {
+                schemaPreflightPreparedRuntimeReadyAtMs = Date.now();
+              }
               if (
                 runtimeCheckpoint.stage.startsWith("prepared-runtime-") ||
                 runtimeCheckpoint.stage.startsWith("plugin-prep-")
@@ -1899,6 +1905,7 @@ describeV1JAdapterDifferential("v1J raw-transport versus adapter differential", 
       ) {
         throw new Error("v1J adapter differential did not capture the frozen Arm-A request shape");
       }
+      const schemaPreflightCompletedAtMs = Date.now();
       const controlC = buildV1JPayloadDecompositionRequests({
         capturedArmARequest,
       }).find((request) => request.control === "C");
@@ -1927,9 +1934,8 @@ describeV1JAdapterDifferential("v1J raw-transport versus adapter differential", 
       let observation: V1JObservation | undefined;
       let adapterDispatches = 0;
       let adapterToolGuard: ReturnType<typeof installV1JAdapterDifferentialToolGuard> | undefined;
-      let adapterRequestMatch:
-        | { rawRequestSha256: string; adapterRequestSha256: string }
-        | undefined;
+      let adapterRequestMatch: ReturnType<typeof compareV1JAdapterDifferentialRequests> | undefined;
+      let adapterPreparedRuntimeReadyAtMs: number | undefined;
       try {
         journal.record("captured-arm-a-request-ready", requestMetrics);
         rawResult = await withV1JAdapterDifferentialProgress({
@@ -1941,6 +1947,12 @@ describeV1JAdapterDifferential("v1J raw-transport versus adapter differential", 
               requestBody: controlC.body,
               fetchImpl: fetch,
               journal,
+              dispatchContext: {
+                preparedRuntimeReadyAtMs: schemaPreflightPreparedRuntimeReadyAtMs,
+                schemaPreflightCompletedAtMs,
+                modelDiscoveryStatus,
+                requestTimeoutMs: 120_000,
+              },
             }),
         });
         journal.record("raw-transport-complete", {
@@ -1975,27 +1987,93 @@ describeV1JAdapterDifferential("v1J raw-transport versus adapter differential", 
               lifecycleJournal: journal,
               onAssistantMessage: () => adapterToolGuard?.ensureInstalled(),
               onRequestCaptured: (request, requestIndex) => {
-                if (requestIndex === 1) {
-                  adapterRequestMatch = assertV1JAdapterDifferentialRequestMatch(
-                    controlC.body,
-                    request.body,
-                  );
-                  journal.record("adapter-request-body-matched", {
-                    ...adapterRequestMatch,
-                    ...summarizeV1JAdapterDifferentialRequest(request.body),
-                  });
+                recordV1JAdapterDifferentialRequestFingerprint({
+                  journal,
+                  event:
+                    requestIndex === 1
+                      ? "adapter-initial-request-candidate"
+                      : "adapter-followup-request-candidate",
+                  body: request.body,
+                  requestIndex,
+                  dispatched: false,
+                });
+              },
+              onProviderRequestBeforeDispatch: ({
+                request,
+                rawBody,
+                requestIndex,
+                dispatchOrdinal,
+              }) => {
+                const adapterSummary = recordV1JAdapterDifferentialRequestFingerprint({
+                  journal,
+                  event:
+                    requestIndex === 1
+                      ? "adapter-initial-wire-request-pre-dispatch"
+                      : "adapter-followup-wire-request-pre-dispatch",
+                  body: request.body,
+                  rawBody,
+                  requestIndex,
+                  dispatchOrdinal,
+                  dispatched: false,
+                });
+                if (requestIndex !== 1) {
                   return;
                 }
-                journal.record("adapter-followup-request", {
+                const comparison = compareV1JAdapterDifferentialRequests(
+                  controlC.body,
+                  request.body,
+                  rawBody,
+                );
+                adapterRequestMatch = comparison;
+                journal.record("adapter-request-parity", {
                   requestIndex,
-                  ...summarizeV1JAdapterDifferentialRequest(request.body),
+                  dispatchOrdinal,
+                  requestMatch: comparison.requestMatch,
+                  canonicalMatch: comparison.canonicalMatch,
+                  rawRequestSha256: comparison.rawRequestSha256,
+                  adapterRequestSha256: comparison.adapterRequestSha256,
+                  rawCanonicalRequestSha256: comparison.rawCanonicalRequestSha256,
+                  adapterCanonicalRequestSha256: comparison.adapterCanonicalRequestSha256,
+                  requestJsonBytes: adapterSummary.requestJsonBytes,
                 });
+                for (const differingPath of comparison.differingPaths) {
+                  journal.record("adapter-request-difference", {
+                    requestIndex,
+                    dispatchOrdinal,
+                    differingPath,
+                  });
+                }
+                if (!comparison.canonicalMatch) {
+                  throw new Error(
+                    `v1J actual adapter request differs from raw Control C at: ${comparison.differingPaths.join(",")}`,
+                  );
+                }
+              },
+              onCheckpoint: (checkpoint) => {
+                if (checkpoint.stage === "client-preparation-completed") {
+                  adapterPreparedRuntimeReadyAtMs = Date.now();
+                }
               },
               onProviderDispatchAttempt: (count) => {
                 adapterDispatches = count;
                 assertV1JAdapterDifferentialRequestBudget({
                   rawRequests: rawResult?.requestDispatchStarted ? 1 : 0,
                   adapterRequests: count,
+                });
+                const dispatchStartedAt = Date.now();
+                journal.record("adapter-request-dispatch-start", {
+                  dispatchOrdinal: count,
+                  dispatchStartedAt: new Date(dispatchStartedAt).toISOString(),
+                  timeSincePreparedRuntimeReadyMs:
+                    adapterPreparedRuntimeReadyAtMs === undefined
+                      ? undefined
+                      : Math.max(0, dispatchStartedAt - adapterPreparedRuntimeReadyAtMs),
+                  timeSinceSchemaPreflightCompleteMs: Math.max(
+                    0,
+                    dispatchStartedAt - schemaPreflightCompletedAtMs,
+                  ),
+                  modelDiscoveryStatus,
+                  requestTimeoutMs: 120_000,
                 });
                 journal.record("adapter-dispatch-attempt", {
                   requestIndex: count,
@@ -2007,6 +2085,9 @@ describeV1JAdapterDifferential("v1J raw-transport versus adapter differential", 
               },
             }),
         });
+        if (!adapterRequestMatch?.canonicalMatch) {
+          throw new Error("v1J initial adapter request did not prove parity with raw Control C");
+        }
         if (adapterToolGuard.blockedToolCalls() > 0) {
           throw new Error("v1J adapter differential blocked an unapproved tool selection");
         }
@@ -2608,8 +2689,21 @@ async function executeV1JCell(input: {
   runIdPrefix?: string;
   lifecycleJournal?: V1JLifecycleJournal;
   onRequestCaptured?: (request: CapturedModelRequest, requestIndex: number) => void;
+  onProviderRequestBeforeDispatch?: (input: {
+    request: CapturedModelRequest;
+    rawBody: string;
+    requestIndex: number;
+    dispatchOrdinal: number;
+  }) => void;
   onAssistantMessage?: (message: AssistantMessage, modelTurnIndex: number) => void;
   onProviderDispatchAttempt?: (count: number) => void;
+  onCheckpoint?: (
+    checkpoint: NonNullable<
+      NonNullable<RunEmbeddedAgentParams["capabilityIntelligenceExperiment"]>["onCheckpoint"]
+    > extends (checkpoint: infer T) => void
+      ? T
+      : never,
+  ) => void;
 }): Promise<V1JObservation> {
   const { protocol, cell, attempt, head } = input;
   const benchmark =
@@ -2708,6 +2802,7 @@ async function executeV1JCell(input: {
             throw gateFailure;
           }
         },
+        onProviderRequestBeforeDispatch: input.onProviderRequestBeforeDispatch,
         onProviderDispatchAttempt: (count) => {
           dispatchAttempts = count;
           input.onProviderDispatchAttempt?.(count);
@@ -2717,6 +2812,7 @@ async function executeV1JCell(input: {
         },
         onResponseSummary: (summary) => responseSummaries.push(summary),
       },
+      onCheckpoint: input.onCheckpoint,
     });
   } catch (error) {
     if (!gateFailure) {
@@ -3377,6 +3473,56 @@ describe("v1J schema-capture dispatch guard", () => {
       expect(normalFetchCalls).toBe(1);
     } finally {
       normal.restore();
+    }
+  });
+
+  it("fails final-request parity before the wrapped provider fetch is invoked", async () => {
+    const mismatch = new Error("final request differs from raw control");
+    const rawControlBody = {
+      model: MODEL_ID,
+      messages: [{ role: "user", content: "raw control message" }],
+      tools: [],
+      stream: true,
+    };
+    let observedRawBody: string | undefined;
+    let delegatedFetchCalls = 0;
+    const capture = captureModelPayloads(undefined, {
+      onProviderRequestBeforeDispatch: ({ request, rawBody, requestIndex, dispatchOrdinal }) => {
+        observedRawBody = rawBody;
+        expect(requestIndex).toBe(1);
+        expect(dispatchOrdinal).toBe(1);
+        const comparison = compareV1JAdapterDifferentialRequests(
+          rawControlBody,
+          request.body,
+          rawBody,
+        );
+        expect(comparison.canonicalMatch).toBe(false);
+        expect(comparison.differingPaths).toEqual(["messages.0.content"]);
+        if (!comparison.canonicalMatch) {
+          throw mismatch;
+        }
+      },
+    });
+    const finalProviderBody = JSON.stringify({
+      ...rawControlBody,
+      messages: [{ role: "user", content: "final transformed message" }],
+    });
+    try {
+      await expect(
+        capture.wrapFetch(async () => {
+          delegatedFetchCalls += 1;
+          return new Response("{}", { headers: { "content-type": "application/json" } });
+        })(`${LM_STUDIO_BASE_URL}/chat/completions`, {
+          method: "POST",
+          body: finalProviderBody,
+        }),
+      ).rejects.toBe(mismatch);
+      expect(observedRawBody).toBe(finalProviderBody);
+      expect(delegatedFetchCalls).toBe(0);
+      expect(capture.providerDispatchAttempts).toBe(0);
+      expect(capture.delegatedRequests).toBe(0);
+    } finally {
+      capture.restore();
     }
   });
 });
@@ -5210,6 +5356,12 @@ async function runOne(input: {
     onImageFactoryResult?: (observation: V1JImageFactoryObservation) => void;
     onAuthorizedToolsCaptured?: (tools: readonly V1JAuthorizedToolSchema[]) => void;
     onRequestCaptured?: (request: CapturedModelRequest) => void;
+    onProviderRequestBeforeDispatch?: (input: {
+      request: CapturedModelRequest;
+      rawBody: string;
+      requestIndex: number;
+      dispatchOrdinal: number;
+    }) => void;
     onDelegatedRequest?: () => void;
     onResponseSummary?: (summary: ProviderResponseSummary) => void;
     onAssistantMessage?: (message: AssistantMessage, modelTurnIndex: number) => void;
@@ -7319,6 +7471,12 @@ function captureModelPayloads(
     liveness?: V1JCaptureLiveness;
     onProviderDispatchAttempt?: (count: number) => void;
     onRequestCaptured?: (request: CapturedModelRequest) => void;
+    onProviderRequestBeforeDispatch?: (input: {
+      request: CapturedModelRequest;
+      rawBody: string;
+      requestIndex: number;
+      dispatchOrdinal: number;
+    }) => void;
     onDelegatedRequest?: () => void;
     onResponseSummary?: (summary: ProviderResponseSummary) => void;
     lifecycleJournal?: V1JLifecycleJournal;
@@ -7423,6 +7581,12 @@ function captureModelPayloads(
             signal?.addEventListener("abort", () => reject(abortReason(signal)), { once: true });
           });
         }
+        options?.onProviderRequestBeforeDispatch?.({
+          request,
+          rawBody: body,
+          requestIndex,
+          dispatchOrdinal: providerDispatchAttempts + 1,
+        });
       }
       options?.onDelegatedRequest?.();
       delegatedRequests += 1;

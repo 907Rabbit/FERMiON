@@ -38,7 +38,43 @@ export type V1JAdapterDifferentialRequestMetrics = {
   totalMessageContentBytes: number;
   toolCount: number;
   toolSchemaJsonBytes: number;
+  requestSha256: string;
   canonicalRequestSha256: string;
+  messagesCanonicalSha256: string;
+  toolsCanonicalSha256: string;
+  messages: V1JAdapterDifferentialMessageFingerprint[];
+  providerOptions: V1JAdapterDifferentialOptionFingerprint[];
+};
+
+export type V1JAdapterDifferentialMessageFingerprint = {
+  index: number;
+  role: string;
+  contentSha256: string;
+  contentBytes: number;
+};
+
+export type V1JAdapterDifferentialOptionFingerprint = {
+  name: string;
+  valueType: string;
+  valueSha256: string;
+  safeValue?: string | number | boolean;
+};
+
+export type V1JAdapterDifferentialRequestComparison = {
+  rawRequestSha256: string;
+  adapterRequestSha256: string;
+  rawCanonicalRequestSha256: string;
+  adapterCanonicalRequestSha256: string;
+  requestMatch: boolean;
+  canonicalMatch: boolean;
+  differingPaths: string[];
+};
+
+export type V1JAdapterDifferentialDispatchContext = {
+  preparedRuntimeReadyAtMs?: number;
+  schemaPreflightCompletedAtMs: number;
+  modelDiscoveryStatus: string;
+  requestTimeoutMs: number;
 };
 
 export const V1J_ADAPTER_DIFFERENTIAL_MAX_RAW_REQUESTS = 1;
@@ -162,8 +198,8 @@ export function installV1JAdapterDifferentialToolGuard(input: {
       hookName: "before_tool_call",
       registrationId: "v1j-adapter-differential-guard",
       priority: Number.MAX_SAFE_INTEGER,
-      handler: (event) => {
-        const allowed = allowExactRead(event.toolName, event.params);
+      handler: (event: unknown) => {
+        const allowed = isRecord(event) && allowExactRead(event.toolName, event.params);
         if (allowed) {
           readDispatchCount += 1;
           input.journal?.record("adapter-tool-execution-guard", {
@@ -274,15 +310,83 @@ export function assertV1JAdapterDifferentialRequestBudget(input: {
 export function assertV1JAdapterDifferentialRequestMatch(
   rawRequest: Record<string, unknown>,
   adapterRequest: Record<string, unknown>,
-): { rawRequestSha256: string; adapterRequestSha256: string } {
-  const rawRequestSha256 =
-    summarizeV1JAdapterDifferentialRequest(rawRequest).canonicalRequestSha256;
-  const adapterRequestSha256 =
-    summarizeV1JAdapterDifferentialRequest(adapterRequest).canonicalRequestSha256;
-  if (rawRequestSha256 !== adapterRequestSha256) {
-    throw new Error("v1J raw transport and adapter request bodies differ");
+): V1JAdapterDifferentialRequestComparison {
+  const comparison = compareV1JAdapterDifferentialRequests(rawRequest, adapterRequest);
+  if (!comparison.canonicalMatch) {
+    throw new Error(
+      `v1J raw transport and adapter request bodies differ at: ${comparison.differingPaths.join(",")}`,
+    );
   }
-  return { rawRequestSha256, adapterRequestSha256 };
+  return comparison;
+}
+
+export function compareV1JAdapterDifferentialRequests(
+  rawRequest: Record<string, unknown>,
+  adapterRequest: Record<string, unknown>,
+  adapterRawBody?: string,
+): V1JAdapterDifferentialRequestComparison {
+  const raw = summarizeV1JAdapterDifferentialRequest(rawRequest);
+  const adapter = summarizeV1JAdapterDifferentialRequest(adapterRequest, adapterRawBody);
+  const differingPaths: string[] = [];
+  collectDifferingJsonPaths(rawRequest, adapterRequest, "", differingPaths);
+  return {
+    rawRequestSha256: raw.requestSha256,
+    adapterRequestSha256: adapter.requestSha256,
+    rawCanonicalRequestSha256: raw.canonicalRequestSha256,
+    adapterCanonicalRequestSha256: adapter.canonicalRequestSha256,
+    requestMatch: raw.requestSha256 === adapter.requestSha256,
+    canonicalMatch: raw.canonicalRequestSha256 === adapter.canonicalRequestSha256,
+    differingPaths,
+  };
+}
+
+export function recordV1JAdapterDifferentialRequestFingerprint(input: {
+  journal: V1JAdapterDifferentialJournal;
+  event: string;
+  body: Record<string, unknown>;
+  rawBody?: string;
+  requestIndex?: number;
+  dispatchOrdinal?: number;
+  dispatched?: boolean;
+}): V1JAdapterDifferentialRequestMetrics {
+  const summary = summarizeV1JAdapterDifferentialRequest(input.body, input.rawBody);
+  input.journal.record(input.event, {
+    requestIndex: input.requestIndex,
+    dispatchOrdinal: input.dispatchOrdinal,
+    dispatched: input.dispatched,
+    requestJsonBytes: summary.requestJsonBytes,
+    messageCount: summary.messageCount,
+    totalMessageContentBytes: summary.totalMessageContentBytes,
+    toolCount: summary.toolCount,
+    toolSchemaJsonBytes: summary.toolSchemaJsonBytes,
+    requestSha256: summary.requestSha256,
+    canonicalRequestSha256: summary.canonicalRequestSha256,
+    messagesCanonicalSha256: summary.messagesCanonicalSha256,
+    toolsCanonicalSha256: summary.toolsCanonicalSha256,
+  });
+  for (const message of summary.messages) {
+    input.journal.record("request-message-fingerprint", {
+      requestIndex: input.requestIndex,
+      dispatchOrdinal: input.dispatchOrdinal,
+      messageIndex: message.index,
+      messageRole: message.role,
+      messageContentSha256: message.contentSha256,
+      messageContentBytes: message.contentBytes,
+    });
+  }
+  for (const option of summary.providerOptions) {
+    input.journal.record("request-option-fingerprint", {
+      requestIndex: input.requestIndex,
+      dispatchOrdinal: input.dispatchOrdinal,
+      optionName: option.name,
+      optionValueType: option.valueType,
+      optionValueSha256: option.valueSha256,
+      ...(typeof option.safeValue === "string" ? { optionValueString: option.safeValue } : {}),
+      ...(typeof option.safeValue === "number" ? { optionValueNumber: option.safeValue } : {}),
+      ...(typeof option.safeValue === "boolean" ? { optionValueBoolean: option.safeValue } : {}),
+    });
+  }
+  return summary;
 }
 
 const SAFE_DETAIL_KEYS = new Set([
@@ -309,8 +413,33 @@ const SAFE_DETAIL_KEYS = new Set([
   "toolCount",
   "toolSchemaJsonBytes",
   "canonicalRequestSha256",
+  "requestSha256",
+  "messagesCanonicalSha256",
+  "toolsCanonicalSha256",
   "rawRequestSha256",
   "adapterRequestSha256",
+  "rawCanonicalRequestSha256",
+  "adapterCanonicalRequestSha256",
+  "requestMatch",
+  "canonicalMatch",
+  "differingPath",
+  "messageIndex",
+  "messageRole",
+  "messageContentSha256",
+  "messageContentBytes",
+  "optionName",
+  "optionValueType",
+  "optionValueSha256",
+  "optionValueString",
+  "optionValueNumber",
+  "optionValueBoolean",
+  "dispatchOrdinal",
+  "dispatchStartedAt",
+  "timeSincePreparedRuntimeReadyMs",
+  "timeSinceSchemaPreflightCompleteMs",
+  "modelDiscoveryStatus",
+  "requestTimeoutMs",
+  "dispatched",
   "errorClass",
   "errorCode",
   "timeoutState",
@@ -396,11 +525,52 @@ export function assertV1JAdapterDifferentialPreflight(input: {
 
 export function summarizeV1JAdapterDifferentialRequest(
   body: Record<string, unknown>,
+  rawBody = JSON.stringify(body),
 ): V1JAdapterDifferentialRequestMetrics {
   const messages = Array.isArray(body.messages) ? body.messages : [];
   const tools = Array.isArray(body.tools) ? body.tools : [];
+  const messageFingerprints = messages.map((message, index) => {
+    const record =
+      message && typeof message === "object" ? (message as Record<string, unknown>) : {};
+    const content = record.content;
+    const serializedContent =
+      typeof content === "string" ? content : canonicalJson(content === undefined ? null : content);
+    return {
+      index,
+      role: typeof record.role === "string" ? record.role : "unknown",
+      contentSha256: createHash("sha256").update(serializedContent, "utf8").digest("hex"),
+      contentBytes: Buffer.byteLength(serializedContent, "utf8"),
+    };
+  });
+  const providerOptions = Object.entries(body)
+    .filter(
+      ([key]) =>
+        key !== "messages" &&
+        key !== "tools" &&
+        !/(?:authorization|api.?key|secret|password|credential|access[_-]?token|refresh[_-]?token|^token$)/i.test(
+          key,
+        ),
+    )
+    .toSorted(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+    .map(([name, value]) => {
+      const option: V1JAdapterDifferentialOptionFingerprint = {
+        name,
+        valueType: value === null ? "null" : Array.isArray(value) ? "array" : typeof value,
+        valueSha256: createHash("sha256").update(canonicalJson(value), "utf8").digest("hex"),
+      };
+      if (
+        (typeof value === "string" && name === "model") ||
+        (typeof value === "number" && ["max_tokens", "temperature", "top_p"].includes(name)) ||
+        (typeof value === "boolean" && name === "stream")
+      ) {
+        option.safeValue = value;
+      }
+      return option;
+    });
+  const canonicalMessages = canonicalJson(messages);
+  const canonicalTools = canonicalJson(tools);
   return {
-    requestJsonBytes: Buffer.byteLength(JSON.stringify(body), "utf8"),
+    requestJsonBytes: Buffer.byteLength(rawBody, "utf8"),
     messageCount: messages.length,
     totalMessageContentBytes: messages.reduce((total, message) => {
       if (!message || typeof message !== "object" || !("content" in message)) {
@@ -414,8 +584,58 @@ export function summarizeV1JAdapterDifferentialRequest(
     }, 0),
     toolCount: tools.length,
     toolSchemaJsonBytes: Buffer.byteLength(JSON.stringify(tools), "utf8"),
+    requestSha256: createHash("sha256").update(rawBody, "utf8").digest("hex"),
     canonicalRequestSha256: createHash("sha256").update(canonicalJson(body), "utf8").digest("hex"),
+    messagesCanonicalSha256: createHash("sha256").update(canonicalMessages, "utf8").digest("hex"),
+    toolsCanonicalSha256: createHash("sha256").update(canonicalTools, "utf8").digest("hex"),
+    messages: messageFingerprints,
+    providerOptions,
   };
+}
+
+function collectDifferingJsonPaths(
+  left: unknown,
+  right: unknown,
+  prefix: string,
+  output: string[],
+): void {
+  if (Object.is(left, right)) {
+    return;
+  }
+  if (Array.isArray(left) && Array.isArray(right)) {
+    const length = Math.max(left.length, right.length);
+    for (let index = 0; index < length; index += 1) {
+      const jsonPath = prefix ? `${prefix}.${index}` : String(index);
+      if (index >= left.length || index >= right.length) {
+        output.push(jsonPath);
+      } else {
+        collectDifferingJsonPaths(left[index], right[index], jsonPath, output);
+      }
+    }
+    return;
+  }
+  if (
+    left !== null &&
+    right !== null &&
+    typeof left === "object" &&
+    typeof right === "object" &&
+    !Array.isArray(left) &&
+    !Array.isArray(right)
+  ) {
+    const leftRecord = left as Record<string, unknown>;
+    const rightRecord = right as Record<string, unknown>;
+    const keys = [...new Set([...Object.keys(leftRecord), ...Object.keys(rightRecord)])].toSorted();
+    for (const key of keys) {
+      const jsonPath = prefix ? `${prefix}.${key}` : key;
+      if (!Object.hasOwn(leftRecord, key) || !Object.hasOwn(rightRecord, key)) {
+        output.push(jsonPath);
+      } else {
+        collectDifferingJsonPaths(leftRecord[key], rightRecord[key], jsonPath, output);
+      }
+    }
+    return;
+  }
+  output.push(prefix || "root");
 }
 
 export async function runV1JAdapterDifferentialRawTransport(input: {
@@ -424,6 +644,7 @@ export async function runV1JAdapterDifferentialRawTransport(input: {
   requestBody: Record<string, unknown>;
   fetchImpl: V1JProviderControlFetch;
   journal: V1JAdapterDifferentialJournal;
+  dispatchContext?: V1JAdapterDifferentialDispatchContext;
   timeoutMs?: number;
   heartbeatMs?: number;
 }): Promise<V1JProviderControlResult> {
@@ -434,8 +655,12 @@ export async function runV1JAdapterDifferentialRawTransport(input: {
   ) {
     throw new Error("v1J adapter differential requires the captured streaming 15-tool request");
   }
-  const metrics = summarizeV1JAdapterDifferentialRequest(input.requestBody);
-  input.journal.record("raw-transport-request-ready", metrics);
+  recordV1JAdapterDifferentialRequestFingerprint({
+    journal: input.journal,
+    event: "raw-transport-request-ready",
+    body: input.requestBody,
+    dispatched: false,
+  });
   let dispatches = 0;
   const results = await runV1JProviderTransportControls({
     endpoint: input.endpoint,
@@ -446,6 +671,31 @@ export async function runV1JAdapterDifferentialRawTransport(input: {
       dispatches += 1;
       if (dispatches > V1J_ADAPTER_DIFFERENTIAL_MAX_RAW_REQUESTS) {
         throw new Error("v1J adapter differential raw transport exceeded its one-request limit");
+      }
+      const dispatchStartedAt = Date.now();
+      input.journal.record("raw-request-dispatch-start", {
+        dispatchOrdinal: dispatches,
+        dispatchStartedAt: new Date(dispatchStartedAt).toISOString(),
+        timeSincePreparedRuntimeReadyMs:
+          input.dispatchContext?.preparedRuntimeReadyAtMs === undefined
+            ? undefined
+            : Math.max(0, dispatchStartedAt - input.dispatchContext.preparedRuntimeReadyAtMs),
+        timeSinceSchemaPreflightCompleteMs: Math.max(
+          0,
+          dispatchStartedAt -
+            (input.dispatchContext?.schemaPreflightCompletedAtMs ?? dispatchStartedAt),
+        ),
+        modelDiscoveryStatus: input.dispatchContext?.modelDiscoveryStatus ?? "unrecorded",
+        requestTimeoutMs: input.dispatchContext?.requestTimeoutMs ?? input.timeoutMs ?? 120_000,
+      });
+      const requestBody = init?.body;
+      const rawBody = typeof requestBody === "string" ? requestBody : undefined;
+      if (rawBody !== undefined) {
+        input.journal.record("raw-request-wire-fingerprint", {
+          dispatchOrdinal: dispatches,
+          requestSha256: createHash("sha256").update(rawBody, "utf8").digest("hex"),
+          requestJsonBytes: Buffer.byteLength(rawBody, "utf8"),
+        });
       }
       return input.fetchImpl(request, init);
     },

@@ -40,7 +40,10 @@ import { applySystemPromptToSession } from "../system-prompt.js";
 import { prepareEmbeddedAttemptClientTools } from "./attempt-client-tools.js";
 import type { AttemptContextEngine } from "./attempt-context-engine-helpers.js";
 import { resolveAttemptTranscriptPolicy } from "./attempt-history.js";
-import { normalizeMessagesForLlmBoundary } from "./attempt-llm-boundary.js";
+import {
+  normalizeMessagesForLlmBoundary,
+  type UserContentNormalizationDiagnostic,
+} from "./attempt-llm-boundary.js";
 import {
   replayTrailingEntriesForOrphanRepair,
   resolveOrphanRepairPlan,
@@ -364,6 +367,7 @@ export function prepareEmbeddedAttemptSessionBoundary(input: {
           sourceStage: string;
           inputMessages?: readonly unknown[];
         },
+        normalizationDiagnostics?: UserContentNormalizationDiagnostic[],
       ) =>
         trace?.({
           stage,
@@ -372,8 +376,18 @@ export function prepareEmbeddedAttemptSessionBoundary(input: {
           systemPromptFingerprint,
           ...(materializationFactors ? { materializationFactors } : {}),
           ...(transition ? { transition } : {}),
+          ...(normalizationDiagnostics ? { normalizationDiagnostics } : {}),
         });
-      const boundaryOptions = buildBoundaryOptions();
+      const normalizationDiagnostics: UserContentNormalizationDiagnostic[] = [];
+      const boundaryOptions = {
+        ...buildBoundaryOptions(),
+        ...(trace
+          ? {
+              onUserContentNormalization: (diagnostic: UserContentNormalizationDiagnostic) =>
+                normalizationDiagnostics.push(diagnostic),
+            }
+          : {}),
+      };
       const boundaryFactors = {
         boundaryTimestampEnabled: includeBoundaryTimestamp,
         boundaryTimezoneConfigured: Boolean(boundaryTimezone),
@@ -420,6 +434,7 @@ export function prepareEmbeddedAttemptSessionBoundary(input: {
           runtimeContextCarrierCount: countRuntimeContextCarriers(normalized),
         },
         transition,
+        normalizationDiagnostics,
       );
       // Wire-only relocation keeps the request append-only through the active
       // user turn without changing position-sensitive precheck normalization.

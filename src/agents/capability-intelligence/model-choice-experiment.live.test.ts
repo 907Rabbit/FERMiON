@@ -71,6 +71,7 @@ import {
 } from "../../../test/helpers/agents/model-choice-adapter-differential.js";
 import { recordV1JPromptAwaitDiagnostic } from "../../../test/helpers/agents/model-choice-prompt-await-diagnostic.js";
 import {
+  buildV1JNormalizationCauseAttribution,
   diffV1JPromptMaterializationBoundaries,
   diffV1JPromptMaterializationTransition,
   fingerprintV1JSystemPromptParagraphs,
@@ -417,6 +418,12 @@ function summarizePromptMessageTrace(
     ...(event.systemPromptFingerprint
       ? { systemPromptFingerprint: event.systemPromptFingerprint }
       : {}),
+    ...(event.systemPromptComponents
+      ? { systemPromptComponents: event.systemPromptComponents }
+      : {}),
+    ...(event.normalizationDiagnostics
+      ? { normalizationDiagnostics: event.normalizationDiagnostics }
+      : {}),
     ...(event.materializationFactors
       ? { materializationFactors: event.materializationFactors }
       : {}),
@@ -471,6 +478,25 @@ function diffPromptMaterializationSnapshots(
     previousSystem?.utf8Bytes !== currentSystem?.utf8Bytes
   ) {
     differences.push("$.systemPrompt");
+  }
+  const previousComponents = previous.systemPromptComponents ?? [];
+  const currentComponents = current.systemPromptComponents ?? [];
+  const previousByName = new Map(
+    previousComponents.map((component) => [component.sectionName, component]),
+  );
+  const currentByName = new Map(
+    currentComponents.map((component) => [component.sectionName, component]),
+  );
+  for (const sectionName of new Set([...previousByName.keys(), ...currentByName.keys()])) {
+    const before = previousByName.get(sectionName);
+    const after = currentByName.get(sectionName);
+    if (
+      before?.present !== after?.present ||
+      before?.sha256 !== after?.sha256 ||
+      before?.utf8Bytes !== after?.utf8Bytes
+    ) {
+      differences.push(`$.systemPromptComponents.${sectionName}`);
+    }
   }
   for (const [key, previousValue] of Object.entries(previous.materializationFactors ?? {})) {
     if (
@@ -8465,6 +8491,15 @@ async function runOne(input: {
         callbackIndex === undefined ? event : { ...event, callbackIndex },
         identifyPromptObject,
       );
+      const normalizationCauseAttribution = event.normalizationDiagnostics?.map((operation) =>
+        buildV1JNormalizationCauseAttribution({
+          inputMessages: event.transition?.inputMessages as
+            | readonly { role?: unknown; content?: unknown }[]
+            | undefined,
+          outputMessages: event.messages as readonly { role?: unknown; content?: unknown }[],
+          operation,
+        }),
+      );
       if (journal && V1J_PROMPT_MATERIALIZATION_STAGES.has(event.stage)) {
         const previousTrace = previousMaterializationBoundary?.trace;
         const differingPaths = previousTrace
@@ -8529,6 +8564,8 @@ async function runOne(input: {
           source: summary.source,
           messageArrayIdentity: summary.messageArrayIdentity,
           systemPromptFingerprint: summary.systemPromptFingerprint ?? null,
+          systemPromptComponents: summary.systemPromptComponents ?? null,
+          normalizationCauseAttribution: normalizationCauseAttribution ?? null,
           materializationFactors: summary.materializationFactors ?? null,
           messageCount: summary.messageCount,
           contentDeltaPairing: {

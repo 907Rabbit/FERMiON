@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  buildV1JNormalizationCauseAttribution,
   diffV1JPromptMaterializationBoundaries,
   diffV1JPromptMaterializationTransition,
   type V1JPromptMaterializationBoundary,
@@ -21,6 +22,51 @@ function boundary(
 }
 
 describe("V1J prompt materialization content deltas", () => {
+  it("attributes array-to-string normalization without confusing representation bytes for text edits", () => {
+    const privateText = "x".repeat(147);
+    const result = buildV1JNormalizationCauseAttribution({
+      inputMessages: [{ role: "user", content: [{ type: "text", text: privateText }] }],
+      outputMessages: [{ role: "user", content: privateText }],
+      operation: {
+        messageIndex: 0,
+        normalizerBranch: "single-text-block-array-to-string",
+        normalizerPath:
+          "normalizeMessagesForLlmBoundary/stripHistoricalInboundMetadataFromUserMessages/canonicalizeTextOnlyUserContent",
+        wrapperOperations: {
+          mediaFallbackInjected: false,
+          inboundMetadataRemoved: false,
+          timestampEnvelopePreserved: false,
+          timestampPrefixAdded: false,
+          suffixWrapperAdded: false,
+        },
+        replacementOrCloningPath: true,
+      },
+    });
+
+    expect(result).toMatchObject({
+      pairingStatus: "PAIRED",
+      input: {
+        representationType: "array",
+        contentKind: "content-parts",
+        partCount: 1,
+        parts: [{ type: "text", utf8Bytes: 147 }],
+        textFingerprint: { utf8Bytes: 147 },
+      },
+      output: {
+        representationType: "string",
+        contentKind: "string",
+        partCount: null,
+        textFingerprint: { utf8Bytes: 147 },
+      },
+      normalizerBranch: "single-text-block-array-to-string",
+      joinOrFlattenOperation: "single-text-part-collapse",
+      semanticTextDelta: { classification: "unchanged" },
+    });
+    expect(result.input.aggregate.utf8Bytes).toBeGreaterThan(147);
+    expect(result.output.aggregate.utf8Bytes).toBe(147);
+    expect(JSON.stringify(result)).not.toContain(privateText);
+  });
+
   it("classifies bytes from the exact input and output attached to one transition", () => {
     const beforeText = "x".repeat(155);
     const afterText = `${beforeText}!`;

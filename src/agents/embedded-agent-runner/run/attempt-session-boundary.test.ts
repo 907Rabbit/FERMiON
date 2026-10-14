@@ -5,6 +5,7 @@ import type { guardSessionManager } from "../../session-tool-result-guard-wrappe
 import type { AgentSession } from "../../sessions/index.js";
 import {
   fingerprintPromptText,
+  fingerprintPromptComponents,
   traceProviderAdapterInput,
   traceProviderPayloadStages,
 } from "./attempt-prompt-materialization-trace.js";
@@ -62,6 +63,8 @@ describe("prepareEmbeddedAttemptSessionBoundary", () => {
               stage: event.stage,
               source: event.source,
               systemPromptFingerprint: event.systemPromptFingerprint,
+              systemPromptComponents: event.systemPromptComponents,
+              normalizationDiagnostics: event.normalizationDiagnostics,
               materializationFactors: event.materializationFactors,
               ...(event.transition
                 ? {
@@ -132,6 +135,25 @@ describe("prepareEmbeddedAttemptSessionBoundary", () => {
       { role: "user", content: [{ type: "text", text: privateUser }] },
     ]);
     expect(traceEvents[0]?.systemPromptFingerprint).toEqual(fingerprintPromptText(privateSystem));
+    const normalizationDiagnostic = (
+      traceEvents.find((event) => event.stage === "agent-llm-boundary-normalized")
+        ?.normalizationDiagnostics as Array<Record<string, unknown>>
+    )?.[0];
+    expect(normalizationDiagnostic).toMatchObject({
+      messageIndex: 0,
+      normalizerBranch: "single-text-block-array-to-string",
+      normalizerPath:
+        "normalizeMessagesForLlmBoundary/stripHistoricalInboundMetadataFromUserMessages/canonicalizeTextOnlyUserContent",
+      wrapperOperations: {
+        mediaFallbackInjected: false,
+        inboundMetadataRemoved: false,
+        timestampEnvelopePreserved: false,
+        timestampPrefixAdded: true,
+        suffixWrapperAdded: false,
+      },
+      replacementOrCloningPath: true,
+    });
+    expect(JSON.stringify(normalizationDiagnostic)).not.toContain(privateUser);
     expect(traceEvents[0]?.materializationFactors).toMatchObject({
       boundaryTimestampEnabled: true,
       boundaryTimezoneConfigured: true,
@@ -159,6 +181,21 @@ describe("prepareEmbeddedAttemptSessionBoundary", () => {
     );
     expect(JSON.stringify(traceEvents)).not.toContain(privateSystem);
     expect(JSON.stringify(traceEvents)).not.toContain(privateUser);
+  });
+
+  it("fingerprints system prompt paragraphs by ordinal without retaining prompt text", () => {
+    const before = "Private section one\n\nPrivate section two";
+    const after = "Private section one\n\nPrivate section changed";
+    const beforeComponents = fingerprintPromptComponents(before);
+    const afterComponents = fingerprintPromptComponents(after);
+
+    expect(beforeComponents.map((component) => component.sectionName)).toEqual([
+      "paragraph-0",
+      "paragraph-1",
+    ]);
+    expect(beforeComponents[0]).toEqual(afterComponents[0]);
+    expect(beforeComponents[1]).not.toEqual(afterComponents[1]);
+    expect(JSON.stringify({ beforeComponents, afterComponents })).not.toContain("Private");
   });
 
   it("resets restored state and preserves exact prompt bytes for raw model probes", async () => {
@@ -733,6 +770,7 @@ describe("provider prompt materialization trace", () => {
       safeRows.push({
         stage: event.stage,
         systemPromptFingerprint: event.systemPromptFingerprint,
+        systemPromptComponents: event.systemPromptComponents,
         messages: event.messages.map((message) => {
           const row = message as { role?: unknown; content?: unknown };
           const content = typeof row.content === "string" ? row.content : "";
@@ -769,6 +807,8 @@ describe("provider prompt materialization trace", () => {
       "provider-onPayload-transform-enter",
     ]);
     expect(safeRows[0]?.systemPromptFingerprint).toEqual(fingerprintPromptText(privateSystem));
+    expect(safeRows[0]?.systemPromptComponents).toEqual(fingerprintPromptComponents(privateSystem));
+    expect(safeRows[2]?.systemPromptComponents).toEqual(fingerprintPromptComponents(privateSystem));
     expect(JSON.stringify(safeRows)).not.toContain(privateSystem);
     expect(JSON.stringify(safeRows)).not.toContain(privateUser);
   });

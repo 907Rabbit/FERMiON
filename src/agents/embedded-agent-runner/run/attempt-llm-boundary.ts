@@ -29,7 +29,42 @@ type LlmBoundaryOptions = {
   projectPersistedSenderContext?: boolean;
   userTranscriptContexts?: readonly UserTranscriptContext[];
   currentUserTimestampOverride?: CurrentUserTimestampMatch;
+  onUserContentNormalization?: (diagnostic: UserContentNormalizationDiagnostic) => void;
 };
+
+export type UserContentNormalizationDiagnostic = {
+  messageIndex: number;
+  normalizerBranch: string;
+  normalizerPath: string;
+  wrapperOperations: {
+    mediaFallbackInjected: boolean;
+    inboundMetadataRemoved: boolean;
+    timestampEnvelopePreserved: boolean;
+    timestampPrefixAdded: boolean;
+    suffixWrapperAdded: boolean;
+  };
+  replacementOrCloningPath: boolean;
+};
+
+type UserContentNormalizationOperations = UserContentNormalizationDiagnostic["wrapperOperations"];
+function reportUserContentNormalization(
+  options: LlmBoundaryOptions | undefined,
+  messageIndex: number,
+  normalizerBranch: string,
+  operations: UserContentNormalizationOperations,
+  replacementOrCloningPath: boolean,
+): void {
+  options?.onUserContentNormalization?.({
+    messageIndex,
+    normalizerBranch,
+    normalizerPath:
+      normalizerBranch === "single-text-block-array-to-string"
+        ? "normalizeMessagesForLlmBoundary/stripHistoricalInboundMetadataFromUserMessages/canonicalizeTextOnlyUserContent"
+        : "normalizeMessagesForLlmBoundary/stripHistoricalInboundMetadataFromUserMessages",
+    wrapperOperations: operations,
+    replacementOrCloningPath,
+  });
+}
 
 /**
  * Matches a leading `[... YYYY-MM-DD HH:MM ...]` timestamp envelope — either
@@ -482,6 +517,13 @@ function stripHistoricalInboundMetadataFromUserMessages(
     const messageTimestamp = useCurrentUserTimestampOverride
       ? override.timestamp
       : runtimeTimestamp;
+    const operations: UserContentNormalizationOperations = {
+      mediaFallbackInjected: false,
+      inboundMetadataRemoved: false,
+      timestampEnvelopePreserved: false,
+      timestampPrefixAdded: false,
+      suffixWrapperAdded: false,
+    };
 
     // Historical turns strip inbound metadata blocks (Conversation info, Sender
     // info, etc.); the active turn keeps its metadata for the current request.
@@ -496,25 +538,39 @@ function stripHistoricalInboundMetadataFromUserMessages(
     // present in both forms) and avoids double-stamping.
     const transformText = (raw: string): string => {
       const sourceText = injectMediaText && !raw.trim() ? mediaOnlyText : raw;
+      operations.mediaFallbackInjected ||= sourceText !== raw;
       const { body, envelope } = splitLeadingTimestampEnvelope(sourceText);
       if (envelope || sourceText.includes(BOUNDARY_CRON_TIME_MARKER)) {
+        operations.timestampEnvelopePreserved = true;
         if (isActive) {
           return sourceText;
         }
         // Strip metadata from the body but re-attach the original envelope.
-        return `${envelope}${stripInboundMetadata(body)}`;
+        const strippedBody = stripInboundMetadata(body);
+        operations.inboundMetadataRemoved ||= strippedBody !== body;
+        return `${envelope}${strippedBody}`;
       }
       const stripped = isActive ? sourceText : stripInboundMetadata(sourceText);
-      return stampUserTextWithMessageTimestamp(
+      operations.inboundMetadataRemoved ||= stripped !== sourceText;
+      const stamped = stampUserTextWithMessageTimestamp(
         stripped,
         messageTimestamp,
         options?.timezone,
         options?.includeTimestamp,
       );
+      operations.timestampPrefixAdded ||= stamped !== stripped;
+      return stamped;
     };
 
     if (typeof content === "string") {
       const next = transformText(content);
+      reportUserContentNormalization(
+        options,
+        index,
+        "string-content-transform",
+        operations,
+        content !== next,
+      );
       if (next === content) {
         return message;
       }
@@ -523,6 +579,13 @@ function stripHistoricalInboundMetadataFromUserMessages(
     }
 
     if (!Array.isArray(content)) {
+      reportUserContentNormalization(
+        options,
+        index,
+        "unsupported-content-preserved",
+        operations,
+        false,
+      );
       return message;
     }
 
@@ -533,8 +596,16 @@ function stripHistoricalInboundMetadataFromUserMessages(
     if (typeof canonical === "string") {
       // The array→string collapse alone is a content change, so this message
       // is always rewritten (text additionally stripped/stamped via transformText).
+      const next = transformText(canonical);
+      reportUserContentNormalization(
+        options,
+        index,
+        "single-text-block-array-to-string",
+        operations,
+        true,
+      );
       changed = true;
-      return { ...message, content: transformText(canonical) } as AgentMessage;
+      return { ...message, content: next } as AgentMessage;
     }
 
     // Multi-block / non-text content (attachment turns): the FIRST text block is
@@ -558,6 +629,7 @@ function stripHistoricalInboundMetadataFromUserMessages(
         processedFirstText = true;
       } else {
         nextText = isActive ? textBlock.text : stripInboundMetadata(textBlock.text);
+        operations.inboundMetadataRemoved ||= nextText !== textBlock.text;
       }
       if (nextText === textBlock.text) {
         return block;
@@ -569,6 +641,13 @@ function stripHistoricalInboundMetadataFromUserMessages(
       nextContent.unshift({ type: "text", text: transformText("") });
       contentChanged = true;
     }
+    reportUserContentNormalization(
+      options,
+      index,
+      "multi-part-content-preserved",
+      operations,
+      contentChanged,
+    );
     if (!contentChanged) {
       return message;
     }

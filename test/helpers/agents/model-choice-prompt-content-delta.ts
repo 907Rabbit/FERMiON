@@ -102,6 +102,20 @@ export type V1JPromptSectionFingerprint = {
   utf8Bytes: number | null;
 };
 
+type V1JNormalizationOperationTrace = {
+  messageIndex: number;
+  normalizerBranch: string;
+  normalizerPath: string;
+  wrapperOperations: {
+    mediaFallbackInjected: boolean;
+    inboundMetadataRemoved: boolean;
+    timestampEnvelopePreserved: boolean;
+    timestampPrefixAdded: boolean;
+    suffixWrapperAdded: boolean;
+  };
+  replacementOrCloningPath: boolean;
+};
+
 function sha256(bytes: Uint8Array): string {
   return createHash("sha256").update(bytes).digest("hex");
 }
@@ -211,6 +225,122 @@ export function summarizeV1JPromptContentDelta(
   };
 }
 
+function fingerprintNormalizationContent(content: unknown) {
+  const kind =
+    typeof content === "string" ? "string" : Array.isArray(content) ? "content-parts" : "other";
+  const parts = Array.isArray(content)
+    ? content.map((part) => {
+        const row = part && typeof part === "object" ? (part as Record<string, unknown>) : {};
+        let serialized: string;
+        try {
+          serialized = typeof row.text === "string" ? row.text : (JSON.stringify(part) ?? "");
+        } catch {
+          serialized = "";
+        }
+        return {
+          type: typeof row.type === "string" ? row.type : null,
+          sha256: sha256(Buffer.from(serialized, "utf8")),
+          utf8Bytes: Buffer.byteLength(serialized, "utf8"),
+        };
+      })
+    : [];
+  let aggregate: string | null = null;
+  if (typeof content === "string") {
+    aggregate = content;
+  } else if (Array.isArray(content)) {
+    try {
+      aggregate = JSON.stringify(content) ?? null;
+    } catch {
+      aggregate = null;
+    }
+  }
+  const text =
+    typeof content === "string"
+      ? content
+      : Array.isArray(content) &&
+          content.length === 1 &&
+          content[0] &&
+          typeof content[0] === "object" &&
+          (content[0] as { type?: unknown }).type === "text" &&
+          typeof (content[0] as { text?: unknown }).text === "string"
+        ? (content[0] as { text: string }).text
+        : undefined;
+  return {
+    representationType: Array.isArray(content) ? "array" : typeof content,
+    contentKind: kind,
+    partCount: Array.isArray(content) ? content.length : null,
+    parts,
+    aggregate: {
+      sha256: aggregate === null ? null : sha256(Buffer.from(aggregate, "utf8")),
+      utf8Bytes: aggregate === null ? null : Buffer.byteLength(aggregate, "utf8"),
+    },
+    ...(text === undefined
+      ? {}
+      : {
+          textFingerprint: {
+            sha256: sha256(Buffer.from(text, "utf8")),
+            utf8Bytes: Buffer.byteLength(text, "utf8"),
+          },
+        }),
+  };
+}
+
+function normalizationSemanticText(content: unknown): string | undefined {
+  if (typeof content === "string") {
+    return content;
+  }
+  if (
+    Array.isArray(content) &&
+    content.length === 1 &&
+    content[0] &&
+    typeof content[0] === "object" &&
+    (content[0] as { type?: unknown }).type === "text" &&
+    typeof (content[0] as { text?: unknown }).text === "string"
+  ) {
+    return (content[0] as { text: string }).text;
+  }
+  return undefined;
+}
+
+/** Attributes one normalizer event using its exact in-event input/output snapshots. */
+export function buildV1JNormalizationCauseAttribution(params: {
+  inputMessages?: readonly { role?: unknown; content?: unknown }[];
+  outputMessages: readonly { role?: unknown; content?: unknown }[];
+  operation: V1JNormalizationOperationTrace;
+}) {
+  const before = params.inputMessages?.[params.operation.messageIndex];
+  const after = params.outputMessages[params.operation.messageIndex];
+  if (!before || !after || before.role !== "user" || after.role !== "user") {
+    return {
+      messageIndex: params.operation.messageIndex,
+      pairingStatus: "DELTA_PAIRING_UNAVAILABLE" as const,
+    };
+  }
+  const input = fingerprintNormalizationContent(before.content);
+  const output = fingerprintNormalizationContent(after.content);
+  const inputText = normalizationSemanticText(before.content);
+  const outputText = normalizationSemanticText(after.content);
+  const flattened = params.operation.normalizerBranch === "single-text-block-array-to-string";
+  return {
+    messageIndex: params.operation.messageIndex,
+    pairingStatus: "PAIRED" as const,
+    input,
+    output,
+    normalizerBranch: params.operation.normalizerBranch,
+    normalizerPath: params.operation.normalizerPath,
+    joinOrFlattenOperation: flattened ? "single-text-part-collapse" : "none",
+    joinSeparator: null,
+    trimApplied: false,
+    unicodeNormalizationApplied: false,
+    serializationOrStringificationApplied: false,
+    wrapperOperations: params.operation.wrapperOperations,
+    replacementOrCloningPath: params.operation.replacementOrCloningPath,
+    ...(typeof inputText === "string" && typeof outputText === "string"
+      ? { semanticTextDelta: summarizeV1JPromptContentDelta(inputText, outputText) }
+      : {}),
+  };
+}
+
 function roleOrdinals(messages: V1JPromptMaterializationBoundary["messages"]) {
   const counts = new Map<string, number>();
   return messages.map((message) => {
@@ -253,12 +383,11 @@ function diffV1JPromptMessageContents(
   afterMessages: V1JPromptMaterializationBoundary["messages"] | undefined,
   transitionInstanceId?: string | number,
 ): V1JPromptMaterializationDeltaSummary {
-  const unavailableReason = !beforeMessages
-    ? "transition-input-unavailable"
-    : !afterMessages
-      ? "transition-output-unavailable"
-      : undefined;
-  if (unavailableReason) {
+  if (beforeMessages === undefined || afterMessages === undefined) {
+    const unavailableReason =
+      beforeMessages === undefined
+        ? "transition-input-unavailable"
+        : "transition-output-unavailable";
     const availableMessages = beforeMessages ?? afterMessages ?? [];
     const isBefore = beforeMessages !== undefined;
     return {
@@ -416,21 +545,35 @@ export function diffV1JPromptMaterializationBoundaries(
   previous: V1JPromptMaterializationBoundary | undefined,
   current: V1JPromptMaterializationBoundary,
 ): V1JPromptMaterializationDeltaSummary {
-  const sourceBoundary = previous?.stage ?? null;
   const destinationBoundary = current.stage;
-  const sourceIndex = previous
-    ? V1J_PROMPT_MATERIALIZATION_BOUNDARY_ORDER.indexOf(previous.stage)
-    : -1;
+  if (!previous) {
+    return {
+      pairingStatus: "DELTA_PAIRING_UNAVAILABLE",
+      sourceBoundary: null,
+      destinationBoundary,
+      pairingReason: "no-adjacent-boundary-predecessor",
+      deltas: roleOrdinals(current.messages).map(({ message, ordinalWithinRole }) => ({
+        sourceBoundary: null,
+        destinationBoundary,
+        role: message.role,
+        ordinalWithinRole,
+        beforeIndex: null,
+        afterIndex: message.index,
+        pairingStatus: "DELTA_PAIRING_UNAVAILABLE",
+        pairingReason: "no-adjacent-boundary-predecessor",
+      })),
+    };
+  }
+  const sourceBoundary = previous.stage;
+  const sourceIndex = V1J_PROMPT_MATERIALIZATION_BOUNDARY_ORDER.indexOf(previous.stage);
   const destinationIndex = V1J_PROMPT_MATERIALIZATION_BOUNDARY_ORDER.indexOf(current.stage);
-  const unavailableReason = !previous
-    ? "no-adjacent-boundary-predecessor"
-    : !sameMaterializationIdentity(previous.identity, current.identity)
-      ? "materialization-identity-mismatch"
-      : destinationIndex !== sourceIndex + 1
-        ? "predecessor-is-not-adjacent-boundary"
-        : undefined;
+  const unavailableReason = !sameMaterializationIdentity(previous.identity, current.identity)
+    ? "materialization-identity-mismatch"
+    : destinationIndex !== sourceIndex + 1
+      ? "predecessor-is-not-adjacent-boundary"
+      : undefined;
 
-  if (!previous || unavailableReason) {
+  if (unavailableReason) {
     return {
       pairingStatus: "DELTA_PAIRING_UNAVAILABLE",
       sourceBoundary,

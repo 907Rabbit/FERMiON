@@ -76,6 +76,7 @@ import type { TrustedSubagentCompletionHandoff } from "../../subagents/announce/
 import type { SilentReplyPromptMode, PromptMode } from "../../system-prompt.types.js";
 import type { EmbeddedAgentExecutionPhase } from "../execution-phase.js";
 import type { BlockReplyFlushContext } from "../types.js";
+import type { UserContentNormalizationDiagnostic } from "./attempt-llm-boundary.js";
 import type { AuthProfileFailurePolicy } from "./auth-profile-failure-policy.types.js";
 export type { ClientToolDefinition } from "../../command/shared-types.js";
 
@@ -170,6 +171,13 @@ export type EmbeddedCapabilityIntelligenceExperimentHooks = {
     };
     source: string;
     systemPromptFingerprint?: { sha256: string; utf8Bytes: number };
+    systemPromptComponents?: Array<{
+      sectionName: string;
+      present: boolean;
+      sha256: string | null;
+      utf8Bytes: number | null;
+    }>;
+    normalizationDiagnostics?: UserContentNormalizationDiagnostic[];
     materializationFactors?: Record<string, string | number | boolean | null>;
     conversationHistorySource?: string;
     promptAssemblySource?: string;

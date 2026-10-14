@@ -41,6 +41,7 @@ import {
   type V1JObservation,
   type V1JProtocol,
 } from "../../../test/helpers/agents/model-choice-action-initiation.js";
+import { recordV1JPromptAwaitDiagnostic } from "../../../test/helpers/agents/model-choice-prompt-await-diagnostic.js";
 import { getBenchmarkRealToolMapping } from "./benchmark-real-tool-mapping.js";
 import { TOOL_RANKING_HELD_OUT_CASES } from "./tool-ranking-benchmark-cases.js";
 
@@ -234,6 +235,20 @@ function preflightRequestObservation(
 }
 
 describe("v1J action-initiation protocol and offline harness", () => {
+  it("records prompt-await lifecycle facts without persisting message or response content", () => {
+    let recorded: unknown;
+    recordV1JPromptAwaitDiagnostic(
+      { record: (_event, details) => (recorded = details) },
+      "settled",
+      {
+        elapsedMs: 120_000,
+        prompt: "private prompt",
+      },
+    );
+    expect(recorded).toEqual({ elapsedMs: 120_000 });
+    expect(JSON.stringify(recorded)).not.toContain("private");
+  });
+
   it("loads the exact accepted preregistration bytes and rejects any byte drift", () => {
     expect(V1J_PREREGISTRATION_SHA256).toBe(
       "72f0d7c2c98038a09b767216a7a78c668b29971b8797a80c4f30a9d9c8af4172",

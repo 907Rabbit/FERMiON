@@ -69,6 +69,7 @@ import {
   V1J_ADAPTER_DIFFERENTIAL_PREFIX,
   V1J_ADAPTER_DIFFERENTIAL_RUN_FLAG,
 } from "../../../test/helpers/agents/model-choice-adapter-differential.js";
+import { recordV1JPromptAwaitDiagnostic } from "../../../test/helpers/agents/model-choice-prompt-await-diagnostic.js";
 import {
   V1J_PROVIDER_CONTROL_MODEL_CONFIG_SHA256,
   V1J_PROVIDER_CONTROL_SCHEMA_BASELINE,
@@ -3621,6 +3622,25 @@ async function captureV1JPreflightSurface(
     );
   const workspaceDir = fs.mkdtempSync(path.join(os.tmpdir(), `v1j-preflight-${arm}-`));
   const preflightStopController = new AbortController();
+  if (preflightDiagnostics) {
+    recordV1JPromptAwaitDiagnostic(preflightDiagnostics, "abort-signal-created", {
+      sourceStage: "captureV1JPreflightSurface preflightStopController",
+    });
+    preflightStopController.signal.addEventListener(
+      "abort",
+      () => {
+        recordV1JPromptAwaitDiagnostic(preflightDiagnostics, "abort-signal-fired", {
+          sourceStage: "captureV1JPreflightSurface preflightStopController",
+          abortSignalAborted: true,
+          abortReasonClass:
+            preflightStopController.signal.reason instanceof Error
+              ? preflightStopController.signal.reason.name
+              : null,
+        });
+      },
+      { once: true },
+    );
+  }
   const authorizedTools: V1JAuthorizedToolSchema[] = [];
   const requests: CapturedModelRequest[] = [];
   const requestObservations: V1JPreflightRequestObservation[] = [];
@@ -7570,17 +7590,52 @@ async function runOne(input: {
   const runId =
     input.runIdOverride ??
     `v1i-${input.surfaceMode.toLowerCase()}-${input.benchmarkCase.id}-${input.arm}-${input.replicate}`;
+  const preflightDiagnostics = input.requestCapture?.preflightDiagnostics;
+  const configuredAttemptTimeoutMs = input.timeoutMs ?? 120_000;
+  const timeoutConfigurationSource =
+    input.timeoutMs === undefined ? "runOne-default" : "runOne-input";
+  let timeoutFired = false;
+  let abortRequested = false;
+  let abortObserved = false;
+  let providerSelectionCompleted = false;
+  let providerCallPrepareObserved = false;
+  let preDispatchCallbackInvoked = false;
+  let assistantFinalReason: string | null = null;
+  let assistantContentSha256: string | null = null;
+  let assistantContentBytes: number | null = null;
+  let assistantToolCallCount = 0;
+  const preDispatchCallbackExpected = input.requestCapture?.stopAfterProviderBoundCapture === true;
+  const preDispatchCallbackRegistered =
+    typeof input.requestCapture?.onProviderRequestBeforeDispatch === "function";
+  const recordPromptAwait = (event: string, details: Record<string, unknown> = {}) =>
+    recordV1JPromptAwaitDiagnostic(preflightDiagnostics, event, {
+      runOneAttemptId: runId,
+      embeddedRunId,
+      sessionIdSha256,
+      promptSubmissionIndex: promptSubmissionTraceIndex,
+      modelLoopIterationIndex: currentProviderPayloadTraceIndex,
+      ...details,
+    });
   const diagnostics = createExperimentDiagnostics();
   const recordProviderCaptureStage = (
     event: string,
     details?: Record<string, unknown>,
     elapsedMs?: number,
-  ) =>
+  ) => {
+    if (event === "provider-bound-callback-enter") {
+      preDispatchCallbackInvoked = true;
+      recordPromptAwait("pre-dispatch-callback-invoked", {
+        sourceStage: event,
+        preDispatchCallbackExpected,
+        preDispatchCallbackRegistered,
+      });
+    }
     input.requestCapture?.onProviderCaptureStage?.({
       event,
       ...(details ? { details } : {}),
       ...(elapsedMs === undefined ? {} : { elapsedMs: Math.max(0, Math.round(elapsedMs)) }),
     });
+  };
   const promptMessageIdentities = new WeakMap<object, number>();
   let nextPromptMessageIdentity = 1;
   const identifyPromptObject = (value: object) => {
@@ -7607,9 +7662,40 @@ async function runOne(input: {
     | undefined;
   const preCaptureObserverTraces: V1JPreCaptureObserverTrace[] = [];
   const preCaptureTranscriptGrowth: V1JPreCaptureTranscriptGrowth[] = [];
+  if (preflightDiagnostics) {
+    recordPromptAwait("provider-selection-start", {
+      provider: runProvider,
+      model: runModel,
+      providerSelectionSource: "runOne invocation configuration",
+    });
+    recordPromptAwait("attempt-timeout-configured", {
+      configuredAttemptTimeoutMs,
+      timeoutConfigurationSource,
+    });
+    recordPromptAwait("pre-dispatch-callback-expected", {
+      preDispatchCallbackExpected,
+      sourceStage: "stopAfterProviderBoundCapture configuration",
+    });
+    recordPromptAwait("pre-dispatch-callback-registered", {
+      preDispatchCallbackRegistered,
+      sourceStage: "onProviderRequestBeforeDispatch configuration",
+    });
+  }
   const originalPromptMessageTrace = diagnostics.hooks.onPromptMessageTrace;
   diagnostics.hooks.onPromptMessageTrace = (event) => {
     originalPromptMessageTrace?.(event);
+    if (event.stage === "provider-onPayload-transform-enter") {
+      providerCallPrepareObserved = true;
+      recordPromptAwait("provider-call-prepare", {
+        sourceStage: event.stage,
+        providerCallStatus: "provider-payload-transform-entered",
+      });
+    } else if (event.stage === "provider-onPayload-transform-complete") {
+      recordPromptAwait("provider-call-payload-prepared", {
+        sourceStage: event.stage,
+        providerCallStatus: "provider-payload-transform-completed",
+      });
+    }
     if (event.stage === "provider-onPayload-transform-start") {
       recordProviderCaptureStage("provider-payload-transform-start", {
         callbackIndex: event.callbackIndex ?? null,
@@ -7791,8 +7877,41 @@ async function runOne(input: {
   let authorizedToolSchemas: readonly V1JAuthorizedToolSchema[] = [];
   const rawExecutionRecords: CorrelationExecution[] = [];
   const diagnosticsCheckpoint = diagnostics.hooks.onCheckpoint;
+  const diagnosticsPreparationError = diagnostics.hooks.onRequestPreparationError;
+  diagnostics.hooks.onRequestPreparationError = (event) => {
+    recordPromptAwait("request-preparation-error", {
+      sourceStage: event.stage,
+      assistantErrorClass: event.error instanceof Error ? event.error.name : "NonErrorThrown",
+    });
+    diagnosticsPreparationError?.(event);
+  };
   diagnostics.hooks.onCheckpoint = (checkpoint) => {
     diagnosticsCheckpoint?.(checkpoint);
+    if (checkpoint.stage === "provider-adapter-entered") {
+      providerSelectionCompleted = true;
+      recordPromptAwait("provider-selection-complete", {
+        provider: runProvider,
+        model: runModel,
+        providerSelectionSource: checkpoint.stage,
+        sourceStage: checkpoint.stage,
+      });
+    } else if (checkpoint.stage === "model-loop-entered") {
+      recordPromptAwait("model-loop-entered", {
+        sourceStage: checkpoint.stage,
+      });
+      recordPromptAwait("model-loop-iteration-start", {
+        sourceStage: checkpoint.stage,
+      });
+    } else if (checkpoint.stage === "model-loop-completed") {
+      recordPromptAwait("model-loop-iteration-end", {
+        sourceStage: checkpoint.stage,
+        elapsedMs: diagnostics.checkpoints.at(-1)?.elapsedMs,
+      });
+      recordPromptAwait("prompt-call-returned", {
+        sourceStage: checkpoint.stage,
+        promptCallOutcome: "returned",
+      });
+    }
     const recordedCheckpoint = diagnostics.checkpoints.at(-1);
     input.attemptCheckpointJournal?.record(
       checkpoint.stage,
@@ -7826,6 +7945,32 @@ async function runOne(input: {
           ? "model-loop-await-end"
           : undefined;
     if (awaitStage) {
+      recordPromptAwait(
+        event.stage === "active-session-prompt-entered"
+          ? "prompt-call-start"
+          : "prompt-call-settled",
+        {
+          elapsedMs: event.elapsedMs,
+          settlementKind: "prompt wrapper finally",
+          promptCallOutcome: timeoutFired
+            ? "attempt-timeout-fired"
+            : abortObserved
+              ? "abort-observed"
+              : "settled-outcome-unavailable",
+          sourceStage: event.stage,
+          configuredAttemptTimeoutMs,
+          timeoutFired,
+          abortRequested,
+          abortObserved,
+          abortSignalAborted: input.abortSignal?.aborted === true,
+          providerRequestHookInvocations:
+            preflightDiagnostics?.counters().providerRequestHookInvocations ?? 0,
+          requestObserverInvocations:
+            preflightDiagnostics?.counters().requestObserverInvocations ?? 0,
+          fetchWrapperInvocations: preflightDiagnostics?.counters().fetchWrapperInvocations ?? 0,
+          providerDispatchAttempts: preflightDiagnostics?.counters().providerDispatchAttempts ?? 0,
+        },
+      );
       input.requestCapture?.preflightDiagnostics?.record(awaitStage, {
         runOneAttemptId: runId,
         embeddedRunId,
@@ -7918,20 +8063,36 @@ async function runOne(input: {
     input.onPostResponseCounter?.(counter);
   };
   diagnostics.hooks.onTimeoutArmed = () => {
+    recordPromptAwait("attempt-timeout-armed", {
+      configuredAttemptTimeoutMs,
+    });
     input.attemptCheckpointJournal?.record("timeout-armed");
     input.requestCapture?.lifecycleJournal?.record("timeout-armed", { timeoutState: "armed" });
   };
   diagnostics.hooks.onTimeoutFired = () => {
+    timeoutFired = true;
+    recordPromptAwait("attempt-timeout-fired", {
+      configuredAttemptTimeoutMs,
+      timeoutSource: "embedded-attempt-run-budget",
+    });
     input.attemptCheckpointJournal?.record("timeout-fired");
     input.requestCapture?.lifecycleJournal?.record("timeout-fired", {
       timeoutState: "timed-out",
     });
   };
   diagnostics.hooks.onAbortRequested = () => {
+    abortRequested = true;
+    recordPromptAwait("abort-requested", {
+      timeoutSource: timeoutFired ? "embedded-attempt-run-budget" : "unknown-abort-owner",
+    });
     input.attemptCheckpointJournal?.record("abort-requested");
     input.requestCapture?.lifecycleJournal?.record("abort-requested", { abortState: true });
   };
   diagnostics.hooks.onAbortObserved = () => {
+    abortObserved = true;
+    recordPromptAwait("abort-observed", {
+      timeoutSource: timeoutFired ? "embedded-attempt-run-budget" : "unknown-abort-owner",
+    });
     input.attemptCheckpointJournal?.record("abort-observed");
     input.requestCapture?.lifecycleJournal?.record("abort-observed", { abortState: true });
   };
@@ -7942,7 +8103,16 @@ async function runOne(input: {
       .slice(0, 8)
       .map((tool) => (typeof tool === "string" ? tool : tool.function.name)),
   });
-  const capture = captureModelPayloads(diagnostics.hooks, input.requestCapture);
+  const capture = captureModelPayloads(
+    diagnostics.hooks,
+    input.requestCapture
+      ? {
+          ...input.requestCapture,
+          onProviderCaptureStage: (event) =>
+            recordProviderCaptureStage(event.event, event.details, event.elapsedMs),
+        }
+      : undefined,
+  );
   let schemaSinkInvocationIndex = 0;
   const originalAiTransportHost = getAiTransportHost();
   configureAiTransportHost({
@@ -7957,11 +8127,11 @@ async function runOne(input: {
   diagnostics.hooks.onProviderRequest = async ({ payload, model }) => {
     const callbackIndex = ++requestObserverInvocationIndex;
     const callbackStartedAt = performance.now();
-    const preflightDiagnostics = input.requestCapture?.preflightDiagnostics;
+    const callbackJournal = input.requestCapture?.preflightDiagnostics;
     const nestedObserverReentry = activeRequestObserverCount > 0;
     activeRequestObserverCount += 1;
     if (callbackIndex === 2) {
-      preflightDiagnostics?.record("observer-enter-2", {
+      callbackJournal?.record("observer-enter-2", {
         runOneAttemptId: runId,
         embeddedRunId,
         sessionIdSha256,
@@ -7969,11 +8139,11 @@ async function runOne(input: {
         modelLoopIterationIndex: currentProviderPayloadTraceIndex,
       });
     }
-    preflightDiagnostics?.increment(
+    callbackJournal?.increment(
       "providerRequestHookInvocations",
-      `arm-${preflightDiagnostics.arm.toLowerCase()}-provider-request-hook-enter`,
+      `arm-${callbackJournal.arm.toLowerCase()}-provider-request-hook-enter`,
       {
-        invocationIndex: preflightDiagnostics.counters().providerRequestHookInvocations + 1,
+        invocationIndex: callbackJournal.counters().providerRequestHookInvocations + 1,
         providerRequestPhase: "request-hook-enter",
         callSite: "runOne.diagnostics.hooks.onProviderRequest",
       },
@@ -7984,6 +8154,13 @@ async function runOne(input: {
         : {};
     const request = { body, url: "provider-adapter" };
     const requestMessages = Array.isArray(body.messages) ? body.messages : [];
+    recordPromptAwait("request-observer-enter", {
+      messageCount: requestMessages.length,
+      providerRequestHookInvocations:
+        callbackJournal?.counters().providerRequestHookInvocations ?? 0,
+      requestObserverInvocations: callbackIndex,
+      sourceStage: "runOne.diagnostics.hooks.onProviderRequest",
+    });
     recordProviderCaptureStage("request-observer-enter", {
       messageCount: requestMessages.length,
       toolCount: Array.isArray(body.tools) ? body.tools.length : 0,
@@ -8018,21 +8195,18 @@ async function runOne(input: {
       nestedObserverReentry,
     };
     preCaptureObserverTraces.push(observerTrace);
-    preflightDiagnostics?.record(
-      `arm-${preflightDiagnostics.arm.toLowerCase()}-prompt-message-trace`,
-      {
-        ...callbackEntry,
-        ...observerTrace,
-        tracePhase: "request-observer-entry-snapshot",
-        payloadTransformInvocation: currentProviderPayloadTraceIndex,
-        payloadTransformInputMessageCount: callbackEntry.messageCount,
-        transcriptLengthBefore: previousTranscriptTrace?.messages.length ?? null,
-        transcriptLengthAfter: previousTranscriptTrace?.messages.length ?? null,
-      },
-    );
+    callbackJournal?.record(`arm-${callbackJournal.arm.toLowerCase()}-prompt-message-trace`, {
+      ...callbackEntry,
+      ...observerTrace,
+      tracePhase: "request-observer-entry-snapshot",
+      payloadTransformInvocation: currentProviderPayloadTraceIndex,
+      payloadTransformInputMessageCount: callbackEntry.messageCount,
+      transcriptLengthBefore: previousTranscriptTrace?.messages.length ?? null,
+      transcriptLengthAfter: previousTranscriptTrace?.messages.length ?? null,
+    });
     input.requestCapture?.liveness?.record("provider-tool-projection-complete");
     if (input.requestCapture?.schemaCaptureName) {
-      preflightDiagnostics?.increment(
+      callbackJournal?.increment(
         "schemaCaptureStarts",
         `arm-${input.arm.toLowerCase()}-schema-capture-start`,
         {
@@ -8068,7 +8242,7 @@ async function runOne(input: {
           input.requestCapture?.liveness?.record(checkpoint, metadata),
       });
       input.requestCapture.liveness?.record("schema-sink-complete", preSink.sinkMetadata);
-      preflightDiagnostics?.increment(
+      callbackJournal?.increment(
         "schemaCaptureCompletes",
         `arm-${input.arm.toLowerCase()}-schema-capture-complete`,
         {
@@ -8078,9 +8252,9 @@ async function runOne(input: {
       );
     }
     capture.recordProviderRequest(request);
-    preflightDiagnostics?.increment(
+    callbackJournal?.increment(
       "requestObserverInvocations",
-      `arm-${preflightDiagnostics.arm.toLowerCase()}-request-observer-enter`,
+      `arm-${callbackJournal.arm.toLowerCase()}-request-observer-enter`,
       {
         invocationIndex: capture.requests.length,
         providerRequestPhase: "request-observer-enter",
@@ -8088,13 +8262,10 @@ async function runOne(input: {
       },
     );
     input.requestCapture?.onRequestCaptured?.(request);
-    preflightDiagnostics?.record(
-      `arm-${preflightDiagnostics.arm.toLowerCase()}-request-observer-exit`,
-      {
-        callSite: "runOne.diagnostics.hooks.onProviderRequest",
-        invocationIndex: capture.requests.length,
-      },
-    );
+    callbackJournal?.record(`arm-${callbackJournal.arm.toLowerCase()}-request-observer-exit`, {
+      callSite: "runOne.diagnostics.hooks.onProviderRequest",
+      invocationIndex: capture.requests.length,
+    });
     const toolNames = toolNamesFromBody(body);
     diagnostics.hooks.onCheckpoint?.({
       stage: "provider-request-constructed",
@@ -8152,26 +8323,23 @@ async function runOne(input: {
         },
         identifyPromptObject,
       );
-      preflightDiagnostics?.record(
-        `arm-${preflightDiagnostics.arm.toLowerCase()}-prompt-message-trace`,
-        {
-          ...callbackExit,
+      callbackJournal?.record(`arm-${callbackJournal.arm.toLowerCase()}-prompt-message-trace`, {
+        ...callbackExit,
+        callbackEntry,
+        ...observerTrace,
+        tracePhase: "request-observer-exit-snapshot",
+        payloadTransformInvocation: currentProviderPayloadTraceIndex,
+        payloadTransformOutputMessageCount: callbackExit.messageCount,
+        transcriptLengthBefore: previousTranscriptTrace?.messages.length ?? null,
+        transcriptLengthAfter: previousTranscriptTrace?.messages.length ?? null,
+        arrayOrMessageStateChangedDuringObserver: !samePromptMessageState(
           callbackEntry,
-          ...observerTrace,
-          tracePhase: "request-observer-exit-snapshot",
-          payloadTransformInvocation: currentProviderPayloadTraceIndex,
-          payloadTransformOutputMessageCount: callbackExit.messageCount,
-          transcriptLengthBefore: previousTranscriptTrace?.messages.length ?? null,
-          transcriptLengthAfter: previousTranscriptTrace?.messages.length ?? null,
-          arrayOrMessageStateChangedDuringObserver: !samePromptMessageState(
-            callbackEntry,
-            callbackExit,
-          ),
-        },
-      );
+          callbackExit,
+        ),
+      });
       activeRequestObserverCount = Math.max(0, activeRequestObserverCount - 1);
-      preflightDiagnostics?.record(
-        `arm-${preflightDiagnostics.arm.toLowerCase()}-pre-capture-reentry-classification`,
+      callbackJournal?.record(
+        `arm-${callbackJournal.arm.toLowerCase()}-pre-capture-reentry-classification`,
         {
           classification: classifyV1JPreCaptureReentry({
             observers: preCaptureObserverTraces,
@@ -8194,11 +8362,11 @@ async function runOne(input: {
           sessionIdSha256,
         },
       );
-      preflightDiagnostics?.record(
-        `arm-${preflightDiagnostics.arm.toLowerCase()}-provider-request-hook-exit`,
+      callbackJournal?.record(
+        `arm-${callbackJournal.arm.toLowerCase()}-provider-request-hook-exit`,
         { callSite: "runOne.diagnostics.hooks.onProviderRequest" },
       );
-      preflightDiagnostics?.record(`observer-return-${callbackIndex}`, {
+      callbackJournal?.record(`observer-return-${callbackIndex}`, {
         runOneAttemptId: runId,
         embeddedRunId,
         sessionIdSha256,
@@ -8209,11 +8377,17 @@ async function runOne(input: {
         outcome: observerOutcome,
         elapsedMs: Math.max(0, Math.round(performance.now() - callbackStartedAt)),
       });
+      recordPromptAwait("request-observer-return", {
+        elapsedMs: Math.max(0, Math.round(performance.now() - callbackStartedAt)),
+        messageCount: callbackExit.messageCount,
+        requestObserverInvocations: callbackIndex,
+        sourceStage: "runOne.diagnostics.hooks.onProviderRequest finally",
+      });
     }
     if (input.requestCapture?.stopAfterCapture) {
-      preflightDiagnostics?.increment(
+      callbackJournal?.increment(
         "preflightStopSignalRaised",
-        `arm-${preflightDiagnostics?.arm.toLowerCase() ?? input.arm.toLowerCase()}-stop-before-dispatch-signal`,
+        `arm-${callbackJournal?.arm.toLowerCase() ?? input.arm.toLowerCase()}-stop-before-dispatch-signal`,
         {
           invocationIndex: capture.requests.length,
           providerRequestPhase: "stop-before-dispatch",
@@ -8267,12 +8441,16 @@ async function runOne(input: {
   const restoreAssistantMessageObserver = installAssistantMessageObserver(
     diagnostics.hooks,
     (message, modelTurnIndex) => {
-      const preflightDiagnostics = input.requestCapture?.preflightDiagnostics;
+      const assistantJournal = input.requestCapture?.preflightDiagnostics;
       const normalizedToolCallCount = message.content.filter(
         (block) => block.type === "toolCall",
       ).length;
       const assistantSummary = summarizeV1JTraceContent(message.content);
-      preflightDiagnostics?.record("assistant-turn-created", {
+      assistantFinalReason = message.stopReason;
+      assistantContentSha256 = assistantSummary.contentSha256;
+      assistantContentBytes = assistantSummary.contentBytes;
+      assistantToolCallCount = normalizedToolCallCount;
+      assistantJournal?.record("assistant-turn-created", {
         runOneAttemptId: runId,
         embeddedRunId,
         sessionIdSha256,
@@ -8283,10 +8461,22 @@ async function runOne(input: {
         role: message.role,
         ...assistantSummary,
         toolCallCount: normalizedToolCallCount,
+        stopReason: message.stopReason,
+        errorClass: message.errorType ?? null,
+        errorCode: message.errorCode ?? null,
+      });
+      recordPromptAwait("assistant-turn-created", {
+        assistantContentSha256: assistantSummary.contentSha256,
+        assistantContentBytes: assistantSummary.contentBytes,
+        assistantToolCallCount: normalizedToolCallCount,
+        assistantFinalReason: message.stopReason,
+        assistantErrorClass: message.errorType ?? null,
+        assistantErrorCode: message.errorCode ?? null,
+        sourceStage: "normalized-assistant-message-observer-enter",
       });
       if (normalizedToolCallCount > 0) {
         const toolCalls = message.content.filter((block) => block.type === "toolCall");
-        preflightDiagnostics?.record("tool-call-produced", {
+        assistantJournal?.record("tool-call-produced", {
           runOneAttemptId: runId,
           embeddedRunId,
           sessionIdSha256,
@@ -8344,7 +8534,7 @@ async function runOne(input: {
       try {
         input.requestCapture?.onAssistantMessage?.(message, modelTurnIndex);
       } finally {
-        preflightDiagnostics?.record("assistant-turn-finalized", {
+        assistantJournal?.record("assistant-turn-finalized", {
           runOneAttemptId: runId,
           embeddedRunId,
           sessionIdSha256,
@@ -8354,6 +8544,18 @@ async function runOne(input: {
           sourceStage: "request-capture-assistant-message-callback-complete",
           ...assistantSummary,
           toolCallCount: normalizedToolCallCount,
+          stopReason: message.stopReason,
+          errorClass: message.errorType ?? null,
+          errorCode: message.errorCode ?? null,
+        });
+        recordPromptAwait("assistant-turn-finalized", {
+          assistantContentSha256: assistantSummary.contentSha256,
+          assistantContentBytes: assistantSummary.contentBytes,
+          assistantToolCallCount: normalizedToolCallCount,
+          assistantFinalReason: message.stopReason,
+          assistantErrorClass: message.errorType ?? null,
+          assistantErrorCode: message.errorCode ?? null,
+          sourceStage: "request-capture-assistant-message-callback-complete",
         });
       }
     },
@@ -8696,6 +8898,58 @@ async function runOne(input: {
     observedFailure,
   });
   const endTime = new Date().toISOString();
+  if (preflightDiagnostics) {
+    const counters = preflightDiagnostics.counters();
+    const providerCallStatus = providerCallPrepareObserved
+      ? "provider-payload-transform-observed"
+      : "provider-call-not-observed";
+    const providerCallSkipReason = providerCallPrepareObserved
+      ? null
+      : "No provider-payload callback was observed; skip reason is not exposed by the current runner hook.";
+    if (!providerCallPrepareObserved) {
+      recordPromptAwait("provider-call-skipped-or-unobserved", {
+        providerCallSkipReason,
+        providerCallStatus,
+        providerSelectionSource: providerSelectionCompleted
+          ? "provider-adapter-entered checkpoint"
+          : "provider adapter checkpoint not observed",
+      });
+    }
+    recordPromptAwait("provider-call-observation-summary", {
+      provider: runProvider,
+      model: runModel,
+      providerCallStatus,
+      providerCallSkipReason,
+      providerSelectionSource: providerSelectionCompleted
+        ? "provider-adapter-entered checkpoint"
+        : "provider adapter checkpoint not observed",
+      preDispatchCallbackExpected,
+      preDispatchCallbackRegistered,
+      preDispatchCallbackInvoked,
+      providerRequestHookInvocations: counters.providerRequestHookInvocations,
+      requestObserverInvocations: counters.requestObserverInvocations,
+      fetchWrapperInvocations: counters.fetchWrapperInvocations,
+      providerDispatchAttempts: counters.providerDispatchAttempts,
+      timeoutSource: timeoutFired
+        ? "embedded-attempt-run-budget"
+        : input.abortSignal?.aborted
+          ? "external-abort-signal"
+          : "not-observed",
+      timeoutFired,
+      abortRequested,
+      abortObserved,
+      abortSignalAborted: input.abortSignal?.aborted === true,
+      abortReasonClass:
+        input.abortSignal?.aborted && input.abortSignal.reason instanceof Error
+          ? input.abortSignal.reason.name
+          : null,
+      configuredAttemptTimeoutMs,
+      assistantContentSha256,
+      assistantContentBytes,
+      assistantToolCallCount,
+      assistantFinalReason,
+    });
+  }
   return {
     surfaceMode: input.surfaceMode,
     schemaVersion: V1I_SCHEMA_VERSION,
@@ -9415,6 +9669,14 @@ describe("v1I offline request preparation", () => {
     const workspaceDir = fs.mkdtempSync(
       path.join(os.tmpdir(), "openclaw-v1i-live-config-offline-"),
     );
+    const promptTraceJournal = createV1JPreflightDiagnosticJournal({
+      repoRoot: workspaceDir,
+      harnessCommit: "9".repeat(40),
+      arm: "A",
+      caseId: "offline-prompt-await",
+      preflightId: "prompt-await",
+      pid: process.pid,
+    });
     const captured: CapturedModelRequest[] = [];
     const abortController = new AbortController();
     let delegatedRequests = 0;
@@ -9438,6 +9700,7 @@ describe("v1I offline request preparation", () => {
         abortSignal: abortController.signal,
         requestCapture: {
           stopAfterCapture: true,
+          preflightDiagnostics: promptTraceJournal,
           onRequestCaptured: (request) => {
             captured.push(request);
             abortController.abort(new V1IProviderRequestCapturedError());
@@ -9466,7 +9729,23 @@ describe("v1I offline request preparation", () => {
       expect(checkpoint("prompt-phase-entered")?.toolCount).toBe(31);
       expect(checkpoint("provider-request-constructed")?.toolCount).toBe(31);
       expect(delegatedRequests).toBe(0);
+      const promptTrace = fs
+        .readFileSync(promptTraceJournal.filePath, "utf8")
+        .trim()
+        .split(/\r?\n/u)
+        .map((line) => JSON.parse(line) as { event: string });
+      expect(promptTrace.map((event) => event.event)).toEqual(
+        expect.arrayContaining([
+          "provider-selection-start",
+          "model-loop-iteration-start",
+          "prompt-call-start",
+          "prompt-call-settled",
+          "provider-call-observation-summary",
+        ]),
+      );
+      expect(JSON.stringify(promptTrace)).not.toContain("Read the config file");
     } finally {
+      promptTraceJournal.close();
       abortController.abort(new Error("offline v1I provider boundary complete"));
       try {
         fs.rmSync(workspaceDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });

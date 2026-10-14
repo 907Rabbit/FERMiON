@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import {
@@ -10,14 +10,32 @@ import {
   type V1JProviderControlFetch,
   type V1JProviderControlResult,
 } from "./model-choice-provider-isolation.js";
+export type { V1JProviderControlEvent } from "./model-choice-provider-isolation.js";
 
 export const V1J_RAW_REPEATABILITY_RUN_FLAG = "OPENCLAW_V1J_RAW_REPEATABILITY";
 export const V1J_RAW_REPEATABILITY_AUTHORIZED_FLAG = "OPENCLAW_V1J_RAW_REPEATABILITY_AUTHORIZED";
 export const V1J_RAW_REPEATABILITY_COMMIT_FLAG = "OPENCLAW_V1J_RAW_REPEATABILITY_COMMIT";
+export const V1J_RAW_REPEATABILITY_CAPTURE_COMMIT_FLAG =
+  "OPENCLAW_V1J_RAW_REPEATABILITY_CAPTURE_COMMIT";
 export const V1J_RAW_REPEATABILITY_PARENT =
   "artifacts/capability-intelligence/v1j-action-initiation";
 export const V1J_RAW_REPEATABILITY_PREFIX = "raw-repeatability-";
 export const V1J_RAW_REPEATABILITY_REQUEST_COUNT = 3;
+export const V1J_PROVIDER_BOUND_BODY_PARENT =
+  "artifacts/capability-intelligence/v1j-action-initiation/provider-bound-request";
+export const V1J_PROVIDER_BOUND_REQUEST_CANONICAL_SHA256 =
+  "66ea318a79db06b91146e433ed7765f9b4edc14a0d73d744db57aa80b500fd7a";
+
+export type V1JProviderBoundBodyMetadata = {
+  bodyBytes: number;
+  rawBodySha256: string;
+  canonicalRequestSha256: string;
+  messageCount: number;
+  toolCount: number;
+  captureCommit: string;
+  provider: string;
+  model: string;
+};
 
 export type V1JRawRepeatabilityCapture = {
   endpoint: string;
@@ -44,6 +62,112 @@ export type V1JRawRepeatabilityJournal = {
   artifactRoot: string;
   record: (event: V1JProviderControlEvent) => void;
 };
+
+export function writeV1JProviderBoundBodyArtifact(input: {
+  repoRoot: string;
+  captureCommit: string;
+  provider: string;
+  model: string;
+  rawBody: string;
+  expectedCanonicalRequestSha256: string;
+}): { artifactRoot: string; metadata: V1JProviderBoundBodyMetadata } {
+  const metadata = summarizeProviderBoundBody(input);
+  const repoRoot = fs.realpathSync(input.repoRoot);
+  const parent = path.resolve(repoRoot, V1J_PROVIDER_BOUND_BODY_PARENT);
+  assertNoSymlinkComponents(repoRoot, parent);
+  fs.mkdirSync(parent, { recursive: true });
+  if (fs.realpathSync(parent) !== parent || !parent.startsWith(`${repoRoot}${path.sep}`)) {
+    throw new Error("v1J provider-bound body artifact parent escapes the repository");
+  }
+
+  const artifactRoot = path.join(parent, input.captureCommit);
+  const stagingRoot = path.join(parent, `.capture-${input.captureCommit}-${randomUUID()}.tmp`);
+  const bodyBytes = Buffer.from(input.rawBody, "utf8");
+  const stagedBodyPath = path.join(stagingRoot, "request-body.bin");
+  const stagedMetadataPath = path.join(stagingRoot, "request-body-metadata.json");
+  fs.mkdirSync(stagingRoot, { recursive: false });
+  try {
+    writeExclusiveDurably(stagedBodyPath, bodyBytes);
+    writeExclusiveDurably(
+      stagedMetadataPath,
+      Buffer.from(`${JSON.stringify(metadata, null, 2)}\n`, "utf8"),
+    );
+    // Publish the pair together: readers never see a body without its matching metadata.
+    fs.renameSync(stagingRoot, artifactRoot);
+    return { artifactRoot, metadata };
+  } finally {
+    if (fs.existsSync(stagingRoot)) {
+      fs.rmSync(stagingRoot, { recursive: true, force: true });
+    }
+  }
+}
+
+export function readV1JProviderBoundBodyArtifact(input: {
+  repoRoot: string;
+  captureCommit: string;
+  endpoint: string;
+  expectedCanonicalRequestSha256: string;
+}): {
+  artifactRoot: string;
+  capture: V1JRawRepeatabilityCapture;
+  metadata: V1JProviderBoundBodyMetadata;
+} {
+  assertCommitSha(input.captureCommit);
+  const repoRoot = fs.realpathSync(input.repoRoot);
+  const parent = path.resolve(repoRoot, V1J_PROVIDER_BOUND_BODY_PARENT);
+  const artifactRoot = path.join(parent, input.captureCommit);
+  if (
+    fs.realpathSync(parent) !== parent ||
+    !parent.startsWith(`${repoRoot}${path.sep}`) ||
+    fs.realpathSync(artifactRoot) !== artifactRoot
+  ) {
+    throw new Error("v1J provider-bound body artifact path is missing or aliased");
+  }
+
+  const bodyPath = path.join(artifactRoot, "request-body.bin");
+  const metadataPath = path.join(artifactRoot, "request-body-metadata.json");
+  if (fs.realpathSync(bodyPath) !== bodyPath || fs.realpathSync(metadataPath) !== metadataPath) {
+    throw new Error("v1J provider-bound body artifact files are missing or aliased");
+  }
+  const bodyBytes = fs.readFileSync(bodyPath);
+  const persistedMetadata = JSON.parse(fs.readFileSync(metadataPath, "utf8")) as unknown;
+  if (!isProviderBoundBodyMetadata(persistedMetadata)) {
+    throw new Error("v1J provider-bound body metadata is invalid");
+  }
+  const rawBodySha256 = sha256(bodyBytes);
+  if (
+    bodyBytes.byteLength !== persistedMetadata.bodyBytes ||
+    rawBodySha256 !== persistedMetadata.rawBodySha256 ||
+    persistedMetadata.captureCommit !== input.captureCommit
+  ) {
+    throw new Error("v1J provider-bound body raw-byte integrity check failed");
+  }
+  const rawBody = new TextDecoder("utf-8", { fatal: true }).decode(bodyBytes);
+  const body = parseProviderBoundBody(rawBody);
+  const canonicalRequestSha256 = sha256(canonicalJson(body));
+  if (
+    canonicalRequestSha256 !== input.expectedCanonicalRequestSha256 ||
+    canonicalRequestSha256 !== persistedMetadata.canonicalRequestSha256 ||
+    body.model !== persistedMetadata.model ||
+    persistedMetadata.provider !== "lmstudio" ||
+    persistedMetadata.model !== "qwen/qwen3.5-9b" ||
+    !Array.isArray(body.messages) ||
+    body.messages.length !== persistedMetadata.messageCount ||
+    !Array.isArray(body.tools) ||
+    body.tools.length !== persistedMetadata.toolCount
+  ) {
+    throw new Error("v1J provider-bound body canonical integrity check failed");
+  }
+  return {
+    artifactRoot,
+    capture: {
+      endpoint: input.endpoint,
+      rawBody,
+      requestObject: body,
+    },
+    metadata: persistedMetadata,
+  };
+}
 
 export async function runV1JPreflightWithHeartbeat<T>(input: {
   operation: () => Promise<T>;
@@ -80,6 +204,7 @@ export async function runV1JPreflightWithHeartbeat<T>(input: {
 export function assertV1JRawRepeatabilityPreflight(input: {
   env: Record<string, string | undefined>;
   head: string;
+  captureCommit: string;
   trackedTreeClean: boolean;
   activeFilteringEnabled: boolean;
   modelId: string;
@@ -98,11 +223,13 @@ export function assertV1JRawRepeatabilityPreflight(input: {
     V1J_RAW_REPEATABILITY_RUN_FLAG,
     V1J_RAW_REPEATABILITY_AUTHORIZED_FLAG,
     V1J_RAW_REPEATABILITY_COMMIT_FLAG,
+    V1J_RAW_REPEATABILITY_CAPTURE_COMMIT_FLAG,
   ]);
   if (
     input.env[V1J_RAW_REPEATABILITY_RUN_FLAG] !== "1" ||
     input.env[V1J_RAW_REPEATABILITY_AUTHORIZED_FLAG] !== "1" ||
-    input.env[V1J_RAW_REPEATABILITY_COMMIT_FLAG] !== input.head
+    input.env[V1J_RAW_REPEATABILITY_COMMIT_FLAG] !== input.head ||
+    input.env[V1J_RAW_REPEATABILITY_CAPTURE_COMMIT_FLAG] !== input.captureCommit
   ) {
     throw new Error("v1J raw repeatability requires exact commit-bound authorization flags");
   }
@@ -118,6 +245,7 @@ export function assertV1JRawRepeatabilityPreflight(input: {
   if (!/^[0-9a-f]{40}$/.test(input.head) || !input.trackedTreeClean) {
     throw new Error("v1J raw repeatability requires a clean committed harness HEAD");
   }
+  assertCommitSha(input.captureCommit);
   if (input.activeFilteringEnabled !== false) {
     throw new Error("v1J raw repeatability requires active filtering to remain disabled");
   }
@@ -228,6 +356,7 @@ export function summarizeV1JRawRepeatabilityRequest(
 export function createV1JRawRepeatabilityJournal(input: {
   repoRoot: string;
   harnessCommit: string;
+  captureCommit: string;
   modelId: string;
   provider: string;
   contextLength: number;
@@ -239,6 +368,7 @@ export function createV1JRawRepeatabilityJournal(input: {
   if (!/^[0-9a-f]{40}$/.test(input.harnessCommit)) {
     throw new Error("v1J raw repeatability requires the actual full harness SHA");
   }
+  assertCommitSha(input.captureCommit);
   const parent = path.resolve(input.repoRoot, V1J_RAW_REPEATABILITY_PARENT);
   const formalRoot = path.join(parent, "real-exact-run1");
   const smokeRoot = path.join(parent, `smoke-${input.harnessCommit}`);
@@ -258,6 +388,7 @@ export function createV1JRawRepeatabilityJournal(input: {
   const manifest = {
     artifactKind: "v1J-raw-provider-repeatability",
     harnessCommit: input.harnessCommit,
+    captureCommit: input.captureCommit,
     modelId: input.modelId,
     provider: input.provider,
     contextLength: input.contextLength,
@@ -268,7 +399,7 @@ export function createV1JRawRepeatabilityJournal(input: {
     requestCount: V1J_RAW_REPEATABILITY_REQUEST_COUNT,
     sequential: true,
     retries: 0,
-    embeddedRunnerPreflightCount: 1,
+    embeddedRunnerPreflightCount: 0,
     preflightProviderDispatches: 0,
     preflightToolExecutions: 0,
     rawTransportAdapterOrModelLoopDispatches: 0,
@@ -293,6 +424,7 @@ export async function runV1JRawRepeatabilityTransport(input: {
   endpoint: string;
   authorization: string;
   capture: V1JRawRepeatabilityCapture;
+  expectedCanonicalRequestSha256?: string;
   fetchImpl: V1JProviderControlFetch;
   timeoutMs?: number;
   heartbeatMs?: number;
@@ -300,6 +432,12 @@ export async function runV1JRawRepeatabilityTransport(input: {
   record: (event: V1JProviderControlEvent) => void;
 }): Promise<V1JProviderControlResult[]> {
   const summary = summarizeV1JRawRepeatabilityRequest(input.capture);
+  if (
+    input.expectedCanonicalRequestSha256 !== undefined &&
+    summary.requestCanonicalSha256 !== input.expectedCanonicalRequestSha256
+  ) {
+    throw new Error("v1J raw repeatability request does not match the pinned canonical hash");
+  }
   const serializedRequestBody = input.capture.rawBody;
   const requestObject = JSON.parse(serializedRequestBody) as Record<string, unknown>;
   const modes = ["repeat-1", "repeat-2", "repeat-3"] as const;
@@ -374,6 +512,31 @@ export async function runV1JRawRepeatabilityTransport(input: {
   return results;
 }
 
+export async function runV1JRawRepeatabilityFromArtifact(input: {
+  repoRoot: string;
+  captureCommit: string;
+  endpoint: string;
+  authorization: string;
+  expectedCanonicalRequestSha256: string;
+  fetchImpl: V1JProviderControlFetch;
+  timeoutMs?: number;
+  heartbeatMs?: number;
+  heartbeat?: (event: V1JProviderControlEvent) => void;
+  record: (event: V1JProviderControlEvent) => void;
+}): Promise<V1JProviderControlResult[]> {
+  const { capture, metadata } = readV1JProviderBoundBodyArtifact(input);
+  input.record({
+    event: "repeatability-body-verified",
+    details: {
+      bodyBytes: metadata.bodyBytes,
+      rawBodySha256: metadata.rawBodySha256,
+      canonicalRequestSha256: metadata.canonicalRequestSha256,
+      captureCommit: metadata.captureCommit,
+    },
+  });
+  return runV1JRawRepeatabilityTransport({ ...input, capture });
+}
+
 function createProviderControlJournalAtRoot(input: {
   repoRoot: string;
   root: string;
@@ -431,6 +594,139 @@ function canonicalJson(value: unknown): string {
   return JSON.stringify(value) ?? "null";
 }
 
-function sha256(value: string): string {
-  return createHash("sha256").update(value, "utf8").digest("hex");
+function sha256(value: string | Buffer): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function summarizeProviderBoundBody(input: {
+  captureCommit: string;
+  provider: string;
+  model: string;
+  rawBody: string;
+  expectedCanonicalRequestSha256: string;
+}): V1JProviderBoundBodyMetadata {
+  assertCommitSha(input.captureCommit);
+  if (input.provider !== "lmstudio" || input.model !== "qwen/qwen3.5-9b") {
+    throw new Error("v1J provider-bound body provider or model drifted");
+  }
+  const body = parseProviderBoundBody(input.rawBody);
+  if (
+    body.model !== input.model ||
+    body.stream !== true ||
+    !Array.isArray(body.messages) ||
+    !Array.isArray(body.tools) ||
+    body.tools.length !== V1J_PROVIDER_CONTROL_SCHEMA_BASELINE.providerToolCount
+  ) {
+    throw new Error("v1J provider-bound body does not match the frozen request surface");
+  }
+  const bodyBytes = Buffer.from(input.rawBody, "utf8");
+  const canonicalRequestSha256 = sha256(canonicalJson(body));
+  if (canonicalRequestSha256 !== input.expectedCanonicalRequestSha256) {
+    throw new Error("v1J provider-bound body canonical request hash mismatch");
+  }
+  return {
+    bodyBytes: bodyBytes.byteLength,
+    rawBodySha256: sha256(bodyBytes),
+    canonicalRequestSha256,
+    messageCount: body.messages.length,
+    toolCount: body.tools.length,
+    captureCommit: input.captureCommit,
+    provider: input.provider,
+    model: input.model,
+  };
+}
+
+function parseProviderBoundBody(rawBody: string): Record<string, unknown> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(rawBody);
+  } catch (error) {
+    throw new Error("v1J provider-bound body is not valid JSON", { cause: error });
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("v1J provider-bound body is not a JSON object");
+  }
+  return parsed as Record<string, unknown>;
+}
+
+function isProviderBoundBodyMetadata(value: unknown): value is V1JProviderBoundBodyMetadata {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const metadata = value as Record<string, unknown>;
+  return (
+    Object.keys(metadata).toSorted().join(",") ===
+      [
+        "bodyBytes",
+        "rawBodySha256",
+        "canonicalRequestSha256",
+        "messageCount",
+        "toolCount",
+        "captureCommit",
+        "provider",
+        "model",
+      ]
+        .toSorted()
+        .join(",") &&
+    typeof metadata.bodyBytes === "number" &&
+    Number.isSafeInteger(metadata.bodyBytes) &&
+    typeof metadata.rawBodySha256 === "string" &&
+    /^[0-9a-f]{64}$/.test(metadata.rawBodySha256) &&
+    typeof metadata.canonicalRequestSha256 === "string" &&
+    /^[0-9a-f]{64}$/.test(metadata.canonicalRequestSha256) &&
+    typeof metadata.messageCount === "number" &&
+    Number.isSafeInteger(metadata.messageCount) &&
+    typeof metadata.toolCount === "number" &&
+    Number.isSafeInteger(metadata.toolCount) &&
+    typeof metadata.captureCommit === "string" &&
+    typeof metadata.provider === "string" &&
+    typeof metadata.model === "string"
+  );
+}
+
+function assertCommitSha(commit: string): void {
+  if (!/^[0-9a-f]{40}$/.test(commit)) {
+    throw new Error("v1J provider-bound body requires a full lowercase commit SHA");
+  }
+}
+
+function writeExclusiveDurably(filePath: string, contents: Buffer): void {
+  const tempPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(tempPath, "wx");
+    fs.writeFileSync(fd, contents);
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    fd = undefined;
+    fs.linkSync(tempPath, filePath);
+  } finally {
+    if (fd !== undefined) {
+      fs.closeSync(fd);
+    }
+    if (fs.existsSync(tempPath)) {
+      fs.unlinkSync(tempPath);
+    }
+  }
+}
+
+function assertNoSymlinkComponents(repoRoot: string, target: string): void {
+  const relative = path.relative(repoRoot, target);
+  if (relative.startsWith(`..${path.sep}`) || relative === ".." || path.isAbsolute(relative)) {
+    throw new Error("v1J provider-bound body artifact parent escapes the repository");
+  }
+  let current = repoRoot;
+  for (const segment of relative.split(path.sep).filter(Boolean)) {
+    current = path.join(current, segment);
+    try {
+      if (fs.lstatSync(current).isSymbolicLink()) {
+        throw new Error("v1J provider-bound body artifact parent contains a symbolic link");
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        throw error;
+      }
+      break;
+    }
+  }
 }

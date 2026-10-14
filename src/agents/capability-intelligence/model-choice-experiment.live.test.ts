@@ -85,13 +85,17 @@ import {
   createV1JRawRepeatabilityJournal,
   runV1JPreflightWithHeartbeat,
   runV1JRawRepeatabilityTransport,
+  readV1JProviderBoundBodyArtifact,
   summarizeV1JRawRepeatabilityRequest,
+  writeV1JProviderBoundBodyArtifact,
+  V1J_PROVIDER_BOUND_REQUEST_CANONICAL_SHA256,
+  V1J_PROVIDER_BOUND_BODY_PARENT,
   V1J_RAW_REPEATABILITY_AUTHORIZED_FLAG,
+  V1J_RAW_REPEATABILITY_CAPTURE_COMMIT_FLAG,
   V1J_RAW_REPEATABILITY_COMMIT_FLAG,
   V1J_RAW_REPEATABILITY_PARENT,
   V1J_RAW_REPEATABILITY_PREFIX,
   V1J_RAW_REPEATABILITY_RUN_FLAG,
-  type V1JRawRepeatabilityCapture,
   type V1JProviderControlEvent,
 } from "../../../test/helpers/agents/model-choice-provider-repeatability.js";
 import {
@@ -200,6 +204,7 @@ const V1J_RAW_REPEATABILITY_FLAGS = [
   V1J_RAW_REPEATABILITY_RUN_FLAG,
   V1J_RAW_REPEATABILITY_AUTHORIZED_FLAG,
   V1J_RAW_REPEATABILITY_COMMIT_FLAG,
+  V1J_RAW_REPEATABILITY_CAPTURE_COMMIT_FLAG,
 ];
 const anyV1JRawRepeatabilityFlag = V1J_RAW_REPEATABILITY_FLAGS.some(
   (name) => process.env[name] !== undefined,
@@ -2823,8 +2828,10 @@ describeV1JProviderCapturePreflight("v1J provider-bound capture preflight only",
       const modelConfigHash = hashV1ICanonical(modelConfigIdentity());
       const formalRoot = path.resolve(repoRoot, V1J_FORMAL_ARTIFACT_RELATIVE_PATH);
       const normalSmokeRoot = resolveV1JSmokeRoot(repoRoot, head);
+      const bodyArtifactRoot = path.resolve(repoRoot, V1J_PROVIDER_BOUND_BODY_PARENT, head);
       const formalStateExists = fs.existsSync(formalRoot);
       const normalSmokeStateExists = fs.existsSync(normalSmokeRoot);
+      const bodyArtifactExists = fs.existsSync(bodyArtifactRoot);
       const measuredSchemaMatches =
         protocol.schemaBaseline.authorizedToolCount ===
           V1J_PROVIDER_CONTROL_SCHEMA_BASELINE.authorizedToolCount &&
@@ -2849,7 +2856,8 @@ describeV1JProviderCapturePreflight("v1J provider-bound capture preflight only",
         ACTIVE_FILTERING_ENABLED !== false ||
         !measuredSchemaMatches ||
         formalStateExists ||
-        normalSmokeStateExists
+        normalSmokeStateExists ||
+        bodyArtifactExists
       ) {
         throw new Error("v1J provider capture preflight frozen gates failed");
       }
@@ -2871,6 +2879,8 @@ describeV1JProviderCapturePreflight("v1J provider-bound capture preflight only",
       let preflightStage = "lmstudio-discovery";
       let providerBoundCaptureCount = 0;
       let requestSummary: ReturnType<typeof summarizeV1JRawRepeatabilityRequest> | undefined;
+      let capturedRawBody: string | undefined;
+      let bodyArtifact: ReturnType<typeof writeV1JProviderBoundBodyArtifact> | undefined;
       const providerCaptureStages: string[] = [];
       const callbackStageStartedAt = new Map<string, string>();
       const recordCaptureStage = (event: V1JProviderControlEvent) => {
@@ -3003,6 +3013,7 @@ describeV1JProviderCapturePreflight("v1J provider-bound capture preflight only",
                   { endpoint: request.url, rawBody, requestObject: request.body },
                   recordCaptureStage,
                 );
+                capturedRawBody = rawBody;
                 recordCallbackJournalEvent("capture-record-build-complete", {
                   awaited: false,
                   stageName: "capture-record-build",
@@ -3053,6 +3064,33 @@ describeV1JProviderCapturePreflight("v1J provider-bound capture preflight only",
         if (fs.existsSync(formalRoot) || fs.existsSync(normalSmokeRoot)) {
           throw new Error("v1J provider capture preflight observed formal or smoke state");
         }
+        if (!capturedRawBody || !requestSummary) {
+          throw new Error("v1J provider-bound body was not available after preflight completion");
+        }
+        bodyArtifact = writeV1JProviderBoundBodyArtifact({
+          repoRoot,
+          captureCommit: head,
+          provider: protocol.model.provider,
+          model: protocol.model.id,
+          rawBody: capturedRawBody,
+          expectedCanonicalRequestSha256: V1J_PROVIDER_BOUND_REQUEST_CANONICAL_SHA256,
+        });
+        if (
+          bodyArtifact.metadata.bodyBytes !== requestSummary.requestJsonBytes ||
+          bodyArtifact.metadata.canonicalRequestSha256 !== requestSummary.requestCanonicalSha256
+        ) {
+          throw new Error("v1J provider-bound body export metadata differs from captured request");
+        }
+        journal.record("provider-bound-body-export-complete", {
+          captureCommit: bodyArtifact.metadata.captureCommit,
+          bodyBytes: bodyArtifact.metadata.bodyBytes,
+          rawBodySha256: bodyArtifact.metadata.rawBodySha256,
+          canonicalRequestSha256: bodyArtifact.metadata.canonicalRequestSha256,
+          messageCount: bodyArtifact.metadata.messageCount,
+          toolCount: bodyArtifact.metadata.toolCount,
+          provider: bodyArtifact.metadata.provider,
+          model: bodyArtifact.metadata.model,
+        });
         journal.record("provider-capture-preflight-complete", {
           ...counters,
           authorizedToolCount: surface.authorizedToolCount,
@@ -3061,6 +3099,8 @@ describeV1JProviderCapturePreflight("v1J provider-bound capture preflight only",
           toolCount: requestSummary.toolCount,
           requestJsonBytes: requestSummary.requestJsonBytes,
           canonicalRequestSha256: requestSummary.requestCanonicalSha256,
+          rawBodySha256: bodyArtifact.metadata.rawBodySha256,
+          bodyArtifactRoot: bodyArtifact.artifactRoot,
           providerDispatches: 0,
           rawRequestsSent: 0,
           toolExecutions: 0,
@@ -3081,6 +3121,8 @@ describeV1JProviderCapturePreflight("v1J provider-bound capture preflight only",
             toolCount: requestSummary.toolCount,
             requestJsonBytes: requestSummary.requestJsonBytes,
             canonicalRequestSha256: requestSummary.requestCanonicalSha256,
+            rawBodySha256: bodyArtifact.metadata.rawBodySha256,
+            bodyArtifactRoot: bodyArtifact.artifactRoot,
             providerDispatches: 0,
             rawRequestsSent: 0,
             toolExecutions: 0,
@@ -3117,7 +3159,7 @@ describeV1JProviderCapturePreflight("v1J provider-bound capture preflight only",
 
 describeV1JRawRepeatability("v1J raw-only provider repeatability", () => {
   it(
-    "captures one exact provider request without dispatch, then sends it three times over raw transport",
+    "verifies a saved provider-bound body, then sends it three times over raw transport",
     { timeout: 900_000 },
     async () => {
       if (
@@ -3142,6 +3184,10 @@ describeV1JRawRepeatability("v1J raw-only provider repeatability", () => {
       const protocol = readV1JPreregistration();
       const head = assertV1JCommittedHarness(protocol);
       const repoRoot = process.cwd();
+      const captureCommit = process.env[V1J_RAW_REPEATABILITY_CAPTURE_COMMIT_FLAG] ?? "";
+      execFileSync("git", ["merge-base", "--is-ancestor", captureCommit, head], {
+        stdio: "ignore",
+      });
       const protocolPath = path.resolve(repoRoot, V1J_PREREGISTRATION_PATH);
       const protocolBytes = fs.readFileSync(protocolPath);
       const protocolSha256 = createHash("sha256").update(protocolBytes).digest("hex");
@@ -3162,6 +3208,7 @@ describeV1JRawRepeatability("v1J raw-only provider repeatability", () => {
       assertV1JRawRepeatabilityPreflight({
         env: process.env,
         head,
+        captureCommit,
         trackedTreeClean: true,
         activeFilteringEnabled: ACTIVE_FILTERING_ENABLED,
         modelId: MODEL_ID,
@@ -3184,9 +3231,26 @@ describeV1JRawRepeatability("v1J raw-only provider repeatability", () => {
       }
 
       const modelConfigHash = hashV1ICanonical(modelConfigIdentity());
+      const capturedRequest = readV1JProviderBoundBodyArtifact({
+        repoRoot,
+        captureCommit,
+        endpoint: `${LM_STUDIO_BASE_URL}/chat/completions`,
+        expectedCanonicalRequestSha256: V1J_PROVIDER_BOUND_REQUEST_CANONICAL_SHA256,
+      });
+      const requestSummary = summarizeV1JRawRepeatabilityRequest(capturedRequest.capture);
+      if (
+        capturedRequest.metadata.provider !== protocol.model.provider ||
+        capturedRequest.metadata.model !== protocol.model.id ||
+        capturedRequest.metadata.bodyBytes !== requestSummary.requestJsonBytes ||
+        capturedRequest.metadata.rawBodySha256 !== requestSummary.requestSha256 ||
+        requestSummary.requestCanonicalSha256 !== V1J_PROVIDER_BOUND_REQUEST_CANONICAL_SHA256
+      ) {
+        throw new Error("v1J captured provider-bound request does not match its frozen identity");
+      }
       const journal = createV1JRawRepeatabilityJournal({
         repoRoot,
         harnessCommit: head,
+        captureCommit,
         modelId: protocol.model.id,
         provider: protocol.model.provider,
         contextLength: protocol.model.contextLength,
@@ -3198,150 +3262,36 @@ describeV1JRawRepeatability("v1J raw-only provider repeatability", () => {
         event: "preregistration-loaded",
         details: { preregistrationSha256: protocolSha256 },
       });
+      journal.record({
+        event: "repeatability-body-verified",
+        details: {
+          captureCommit,
+          bodyBytes: capturedRequest.metadata.bodyBytes,
+          rawBodySha256: capturedRequest.metadata.rawBodySha256,
+          canonicalRequestSha256: capturedRequest.metadata.canonicalRequestSha256,
+        },
+      });
       journal.record({ event: "repeatability-journal-created" });
-
-      journal.record({ event: "lmstudio-discovery-start" });
-      await runV1JPreflightWithHeartbeat({
-        operation: () => assertLiveModelAvailable(),
-        stage: () => "lmstudio-discovery",
-        record: journal.record,
-        heartbeat: ({ stage, elapsedMs }) => {
-          process.stdout.write(`v1J preflight waiting stage=${stage} elapsedMs=${elapsedMs}\n`);
-        },
-      });
-      journal.record({ event: "lmstudio-discovery-complete" });
-      const cell = buildV1JSmokeSchedule(protocol).find(
-        (candidate) => candidate.cellId === "smoke-tool-required:A:1",
-      );
-      if (!cell || cell.arm !== "A" || cell.stratum !== "TOOL_REQUIRED") {
-        throw new Error("v1J raw repeatability request-construction case changed");
+      if (ACTIVE_FILTERING_ENABLED !== false || formalStateExists || normalSmokeStateExists) {
+        throw new Error("v1J raw repeatability isolation changed before transport");
       }
-      let preflightRequestCount = 0;
-      let capture: V1JRawRepeatabilityCapture | undefined;
-      let preflightStage = "prepared-runtime-acquisition";
-      let preparedRuntimeRecorded = false;
-      const recordCaptureStage = (event: V1JProviderControlEvent) => {
-        preflightStage = event.event;
-        journal.record(event);
-      };
-      journal.record({ event: "prepared-runtime-start" });
-      const surface = await runV1JPreflightWithHeartbeat({
-        operation: () =>
-          captureV1JPreflightSurface(protocol, "A", head, undefined, {
-            benchmarkCase: v1jSmokeBenchmark(cell),
-            prepareWorkspace: (workspaceDir) =>
-              fs.writeFileSync(path.join(workspaceDir, "smoke-reference.txt"), "smoke-token-47\n", {
-                encoding: "utf8",
-                flag: "wx",
-              }),
-            onCheckpoint: (checkpoint) => {
-              if (!preparedRuntimeRecorded && checkpoint.stage === "client-preparation-completed") {
-                preparedRuntimeRecorded = true;
-                journal.record({ event: "prepared-runtime-complete" });
-                preflightStage = "provider-bound-capture";
-                journal.record({ event: "provider-bound-capture-start" });
-              }
-            },
-            onProviderCaptureStage: recordCaptureStage,
-            onProviderBoundRequest: ({ request, rawBody, requestIndex, dispatchOrdinal }) => {
-              preflightRequestCount += 1;
-              if (preflightRequestCount !== 1 || requestIndex !== 1 || dispatchOrdinal !== 1) {
-                throw new Error(
-                  "v1J raw repeatability preflight exceeded its single-request bound",
-                );
-              }
-              const candidate: V1JRawRepeatabilityCapture = {
-                endpoint: request.url,
-                rawBody,
-                requestObject: request.body,
-              };
-              const summary = summarizeV1JRawRepeatabilityRequest(candidate, recordCaptureStage);
-              recordCaptureStage({ event: "capture-record-build-start" });
-              const captureBuildStartedAt = performance.now();
-              try {
-                capture = {
-                  ...candidate,
-                  requestObject: structuredClone(request.body),
-                };
-              } catch (error) {
-                recordCaptureStage({
-                  event: "capture-record-build-failed",
-                  details: { errorName: error instanceof Error ? error.name : "NonErrorThrown" },
-                  elapsedMs: Math.max(0, Math.round(performance.now() - captureBuildStartedAt)),
-                });
-                throw error;
-              }
-              recordCaptureStage({
-                event: "capture-record-build-complete",
-                details: {
-                  requestJsonBytes: summary.requestJsonBytes,
-                  canonicalRequestSha256: summary.requestCanonicalSha256,
-                  messageCount: summary.messageCount,
-                  toolCount: summary.toolCount,
-                },
-                elapsedMs: Math.max(0, Math.round(performance.now() - captureBuildStartedAt)),
-              });
-            },
-            onPreflightStopCaught: () => {
-              recordCaptureStage({ event: "preflight-stop-signal-caught" });
-            },
-          }),
-        stage: () => preflightStage,
-        record: journal.record,
-        heartbeat: ({ stage, elapsedMs }) => {
-          process.stdout.write(`v1J preflight waiting stage=${stage} elapsedMs=${elapsedMs}\n`);
-        },
-      });
-      if (!capture || preflightRequestCount !== 1 || ACTIVE_FILTERING_ENABLED !== false) {
-        throw new Error("v1J raw repeatability failed its no-dispatch request capture");
-      }
-      const requestSummary = summarizeV1JRawRepeatabilityRequest(capture);
-      const providerBoundTools = Array.isArray(capture.requestObject.tools)
-        ? capture.requestObject.tools
-        : [];
-      const providerBoundSurface = fingerprintV1JToolSurface({
-        authorizedTools: [],
-        providerTools: providerBoundTools,
-      });
-      if (
-        surface.authorizedToolCount !== protocol.schemaBaseline.authorizedToolCount ||
-        surface.providerToolCount !== protocol.schemaBaseline.providerToolCount ||
-        surface.authorizedToolNameSha256 !== protocol.schemaBaseline.authorizedToolNameSha256 ||
-        surface.providerToolNameSha256 !== protocol.schemaBaseline.providerToolNameSha256 ||
-        surface.authorizedToolSchemaSha256 !== protocol.schemaBaseline.authorizedToolSchemaSha256 ||
-        surface.providerToolSchemaSha256 !== protocol.schemaBaseline.providerToolSchemaSha256 ||
-        surface.authorizedToolNames.join("\n") !==
-          [...protocol.schemaBaseline.expectedRuntimeNames].toSorted().join("\n") ||
-        providerBoundSurface.providerToolCount !== protocol.schemaBaseline.providerToolCount ||
-        providerBoundSurface.providerToolNameSha256 !==
-          protocol.schemaBaseline.providerToolNameSha256 ||
-        providerBoundSurface.providerToolSchemaSha256 !==
-          protocol.schemaBaseline.providerToolSchemaSha256 ||
-        canonicalV1JToolNames(providerBoundTools).join("\n") !==
-          [...protocol.schemaBaseline.expectedRuntimeNames].toSorted().join("\n") ||
-        v1jSystemMessageText(capture.requestObject).includes(v1jInstructionForArm(protocol, "C"))
-      ) {
-        throw new Error(
-          "v1J raw repeatability provider-bound request drifted from the frozen baseline",
-        );
-      }
-
       journal.record({ event: "preflight-complete" });
       journal.record({
-        event: "provider-bound-preflight-complete",
+        event: "captured-body-preflight-complete",
         details: {
-          preflightCount: 1,
+          preflightCount: 0,
           providerDispatches: 0,
           toolExecutions: 0,
-          schemaValidation: "passed",
+          capturedRequestSha256: requestSummary.requestSha256,
           requestSha256: requestSummary.requestSha256,
           requestCanonicalSha256: requestSummary.requestCanonicalSha256,
         },
       });
       const results = await runV1JRawRepeatabilityTransport({
-        endpoint: capture.endpoint,
+        endpoint: `${LM_STUDIO_BASE_URL}/chat/completions`,
         authorization: `Bearer ${process.env.LM_API_TOKEN ?? "lmstudio"}`,
-        capture,
+        capture: capturedRequest.capture,
+        expectedCanonicalRequestSha256: V1J_PROVIDER_BOUND_REQUEST_CANONICAL_SHA256,
         fetchImpl: fetch,
         record: journal.record,
         heartbeat: (event) => {
@@ -3360,8 +3310,9 @@ describeV1JRawRepeatability("v1J raw-only provider repeatability", () => {
           harnessCommit: head,
           modelId: protocol.model.id,
           modelConfigHash: hashV1ICanonical(modelConfigIdentity()),
+          captureCommit,
           requestSummary,
-          preflightEmbeddedRunnerCount: 1,
+          preflightEmbeddedRunnerCount: 0,
           preflightProviderDispatches: 0,
           rawRequestCount: results.length,
           rawRequestSha256: results.map((result) => result.requestSha256),
@@ -4945,13 +4896,13 @@ describe("v1J schema-capture dispatch guard", () => {
       expect(events.includes("arm-c-schema-validated")).toBe(acceptedCanonicalSurface);
       expect(events.includes("arm-c-preflight-complete")).toBe(acceptedCanonicalSurface);
       expect(events).toContain("arm-c-preflight-observations-equivalent");
-      expect(events).toContain("arm-c-stop-before-dispatch-signal");
+      expect(events).toContain("preflight-stop-signal-raised");
       expect(events).toContain("arm-c-preflight-stop-signal-caught");
       expect(events).toContain("observer-return-1");
       expect(events).toContain("model-loop-await-start");
       expect(events).toContain("model-loop-await-end");
       expect(events.indexOf("observer-return-1")).toBeLessThan(
-        events.indexOf("arm-c-stop-before-dispatch-signal"),
+        events.indexOf("preflight-stop-signal-raised"),
       );
       expect(events.indexOf("model-loop-await-start")).toBeLessThan(
         events.indexOf("observer-return-1"),
@@ -5076,7 +5027,7 @@ describe("v1J schema-capture dispatch guard", () => {
       expect(settledAgentStates.map((row) => row.messageCount)).toEqual([1]);
       expect(
         messageTraceRows.some((row) => row.stage === "provider-onPayload-transform-complete"),
-      ).toBe(false);
+      ).toBe(true);
       const firstObserverMessages = observerEntries[0]!.messages as Array<Record<string, unknown>>;
       expect(firstObserverMessages.map((message) => Object.keys(message).toSorted())).toEqual(
         firstObserverMessages.map(() =>
@@ -5137,6 +5088,7 @@ describe("v1J schema-capture dispatch guard", () => {
       stream: true,
     });
     const events: V1JProviderControlEvent[] = [];
+    let exportedBodyPath: string | undefined;
     let providerDispatches = 0;
     let rawRequests = 0;
     journal.record("provider-bound-capture-start");
@@ -5171,6 +5123,17 @@ describe("v1J schema-capture dispatch guard", () => {
           toolCount: 15,
           requestJsonBytes: Buffer.byteLength(requestBody),
         });
+        const exported = writeV1JProviderBoundBodyArtifact({
+          repoRoot,
+          captureCommit: commit,
+          provider: "lmstudio",
+          model: MODEL_ID,
+          rawBody,
+          expectedCanonicalRequestSha256: summary.requestCanonicalSha256,
+        });
+        exportedBodyPath = path.join(exported.artifactRoot, "request-body.bin");
+        expect(exported.metadata.rawBodySha256).toBe(summary.requestSha256);
+        expect(exported.metadata.canonicalRequestSha256).toBe(summary.requestCanonicalSha256);
         events.push({ event: "capture-record-build-complete" });
         journal.record("capture-record-build-complete", summary);
       },
@@ -5193,6 +5156,8 @@ describe("v1J schema-capture dispatch guard", () => {
       journal.increment("preflightCompleted", "preflight-complete");
 
       expect(capture.requests).toHaveLength(1);
+      expect(exportedBodyPath).toBeDefined();
+      expect(fs.readFileSync(exportedBodyPath!, "utf8")).toBe(requestBody);
       expect(capture.providerDispatchAttempts).toBe(0);
       expect(capture.delegatedRequests).toBe(0);
       expect(providerDispatches).toBe(0);
@@ -5238,6 +5203,7 @@ describe("v1J schema-capture dispatch guard", () => {
       });
       const journalText = fs.readFileSync(journal.filePath, "utf8");
       expect(journalText).not.toContain(privateText);
+      expect(journalText).not.toContain(requestBody);
       expect(journalText).toContain("requestJsonBytes");
       expect(fs.existsSync(path.resolve(repoRoot, V1J_FORMAL_ARTIFACT_RELATIVE_PATH))).toBe(false);
       expect(fs.existsSync(resolveV1JSmokeRoot(repoRoot, commit))).toBe(false);

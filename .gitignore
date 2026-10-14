@@ -129,6 +129,7 @@ USER.md
 
 # local QA evidence mirrors; CI publishes canonical Mantis files as Actions artifacts
 /mantis/
+/artifacts/capability-intelligence/v1j-action-initiation/provider-bound-request/
 
 # Keep repository skills visible to Git-aware syncs; local-only skill ignores
 # belong in .git/info/exclude.

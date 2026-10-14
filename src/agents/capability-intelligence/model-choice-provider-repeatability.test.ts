@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -11,10 +12,14 @@ import {
 import {
   assertV1JRawRepeatabilityPreflight,
   createV1JRawRepeatabilityJournal,
+  readV1JProviderBoundBodyArtifact,
+  runV1JRawRepeatabilityFromArtifact,
   runV1JPreflightWithHeartbeat,
   runV1JRawRepeatabilityTransport,
   summarizeV1JRawRepeatabilityRequest,
+  writeV1JProviderBoundBodyArtifact,
   V1J_RAW_REPEATABILITY_AUTHORIZED_FLAG,
+  V1J_RAW_REPEATABILITY_CAPTURE_COMMIT_FLAG,
   V1J_RAW_REPEATABILITY_COMMIT_FLAG,
   V1J_RAW_REPEATABILITY_PARENT,
   V1J_RAW_REPEATABILITY_PREFIX,
@@ -24,10 +29,12 @@ import {
 } from "../../../test/helpers/agents/model-choice-provider-repeatability.js";
 
 const commit = "b".repeat(40);
+const captureCommit = "c".repeat(40);
 const authorization = {
   [V1J_RAW_REPEATABILITY_RUN_FLAG]: "1",
   [V1J_RAW_REPEATABILITY_AUTHORIZED_FLAG]: "1",
   [V1J_RAW_REPEATABILITY_COMMIT_FLAG]: commit,
+  [V1J_RAW_REPEATABILITY_CAPTURE_COMMIT_FLAG]: captureCommit,
 };
 
 function makeCapture(): V1JRawRepeatabilityCapture {
@@ -55,6 +62,20 @@ function makeCapture(): V1JRawRepeatabilityCapture {
   };
 }
 
+function exportProviderBoundBody(repoRoot: string, sourceCommit = captureCommit) {
+  const capture = makeCapture();
+  const summary = summarizeV1JRawRepeatabilityRequest(capture);
+  const exported = writeV1JProviderBoundBodyArtifact({
+    repoRoot,
+    captureCommit: sourceCommit,
+    provider: "lmstudio",
+    model: "qwen/qwen3.5-9b",
+    rawBody: capture.rawBody,
+    expectedCanonicalRequestSha256: summary.requestCanonicalSha256,
+  });
+  return { capture, summary, exported, sourceCommit };
+}
+
 function responseWithMarker(marker: string, onComplete?: () => void): Response {
   let emitted = false;
   return new Response(
@@ -77,6 +98,7 @@ function preflightInput() {
   return {
     env: { ...authorization },
     head: commit,
+    captureCommit,
     trackedTreeClean: true,
     activeFilteringEnabled: false,
     modelId: "qwen/qwen3.5-9b",
@@ -114,6 +136,157 @@ describe("v1J raw-only provider repeatability", () => {
     expect(() =>
       assertV1JRawRepeatabilityPreflight({ ...preflightInput(), trackedTreeClean: false }),
     ).toThrow(/clean committed/);
+    expect(() =>
+      assertV1JRawRepeatabilityPreflight({
+        ...preflightInput(),
+        captureCommit: "d".repeat(40),
+      }),
+    ).toThrow(/commit-bound authorization/);
+  });
+
+  it("exports exact provider bytes once with separate hashes and metadata-only stdout/journal shape", () => {
+    const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), "v1j-provider-body-export-"));
+    const stdoutWrite = vi.spyOn(process.stdout, "write");
+    try {
+      const { capture, summary, exported } = exportProviderBoundBody(repoRoot);
+      const bodyPath = path.join(exported.artifactRoot, "request-body.bin");
+      const metadataPath = path.join(exported.artifactRoot, "request-body-metadata.json");
+      const bodyBytes = fs.readFileSync(bodyPath);
+      const metadataText = fs.readFileSync(metadataPath, "utf8");
+      expect(bodyBytes.equals(Buffer.from(capture.rawBody, "utf8"))).toBe(true);
+      expect(exported.metadata).toEqual({
+        bodyBytes: Buffer.byteLength(capture.rawBody, "utf8"),
+        rawBodySha256: createHash("sha256").update(bodyBytes).digest("hex"),
+        canonicalRequestSha256: summary.requestCanonicalSha256,
+        messageCount: 2,
+        toolCount: 15,
+        captureCommit,
+        provider: "lmstudio",
+        model: "qwen/qwen3.5-9b",
+      });
+      expect(exported.metadata.rawBodySha256).not.toBe(exported.metadata.canonicalRequestSha256);
+      expect(metadataText).not.toContain("PRIVATE_PROMPT_SYSTEM");
+      expect(metadataText).not.toContain("PRIVATE_PROMPT_USER");
+      expect(stdoutWrite).not.toHaveBeenCalled();
+      expect(fs.readdirSync(exported.artifactRoot).toSorted()).toEqual([
+        "request-body-metadata.json",
+        "request-body.bin",
+      ]);
+      expect(() => exportProviderBoundBody(repoRoot)).toThrow();
+      expect(fs.readFileSync(bodyPath)).toEqual(bodyBytes);
+      expect(fs.readdirSync(path.dirname(exported.artifactRoot))).toEqual([captureCommit]);
+    } finally {
+      stdoutWrite.mockRestore();
+      fs.rmSync(repoRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("validates both digests and the frozen canonical hash before returning an artifact body", () => {
+    const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), "v1j-provider-body-verify-"));
+    try {
+      const { capture, summary, exported } = exportProviderBoundBody(repoRoot);
+      const loaded = readV1JProviderBoundBodyArtifact({
+        repoRoot,
+        captureCommit,
+        endpoint: capture.endpoint,
+        expectedCanonicalRequestSha256: summary.requestCanonicalSha256,
+      });
+      expect(loaded.capture.rawBody).toBe(capture.rawBody);
+      expect(loaded.metadata.rawBodySha256).toBe(summary.requestSha256);
+      expect(loaded.metadata.canonicalRequestSha256).toBe(summary.requestCanonicalSha256);
+      expect(() =>
+        readV1JProviderBoundBodyArtifact({
+          repoRoot,
+          captureCommit,
+          endpoint: capture.endpoint,
+          expectedCanonicalRequestSha256: "0".repeat(64),
+        }),
+      ).toThrow(/canonical integrity/);
+      fs.writeFileSync(path.join(exported.artifactRoot, "request-body.bin"), "corrupt");
+      expect(() =>
+        readV1JProviderBoundBodyArtifact({
+          repoRoot,
+          captureCommit,
+          endpoint: capture.endpoint,
+          expectedCanonicalRequestSha256: summary.requestCanonicalSha256,
+        }),
+      ).toThrow(/raw-byte integrity/);
+    } finally {
+      fs.rmSync(repoRoot, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["missing body", "corrupt body", "canonical hash mismatch"])(
+    "%s blocks every raw send",
+    async (failure) => {
+      const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), "v1j-provider-body-no-send-"));
+      const capture = makeCapture();
+      const summary = summarizeV1JRawRepeatabilityRequest(capture);
+      let sends = 0;
+      try {
+        if (failure !== "missing body") {
+          const { exported } = exportProviderBoundBody(repoRoot);
+          if (failure === "corrupt body") {
+            fs.writeFileSync(path.join(exported.artifactRoot, "request-body.bin"), "broken");
+          }
+        }
+        await expect(
+          runV1JRawRepeatabilityFromArtifact({
+            repoRoot,
+            captureCommit,
+            endpoint: capture.endpoint,
+            authorization: "Bearer PRIVATE_CREDENTIAL",
+            expectedCanonicalRequestSha256:
+              failure === "canonical hash mismatch"
+                ? "0".repeat(64)
+                : summary.requestCanonicalSha256,
+            fetchImpl: async () => {
+              sends += 1;
+              return new Response(null, { status: 200 });
+            },
+            record: () => undefined,
+          }),
+        ).rejects.toThrow();
+        expect(sends).toBe(0);
+      } finally {
+        fs.rmSync(repoRoot, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it("runs the later raw-only path directly from saved bytes with an immutable three-send cap", async () => {
+    const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), "v1j-provider-body-raw-only-"));
+    const { capture, summary } = exportProviderBoundBody(repoRoot);
+    const bodies: string[] = [];
+    const events: { event: string }[] = [];
+    const stdoutWrite = vi.spyOn(process.stdout, "write");
+    try {
+      const results = await runV1JRawRepeatabilityFromArtifact({
+        repoRoot,
+        captureCommit,
+        endpoint: capture.endpoint,
+        authorization: "Bearer PRIVATE_CREDENTIAL",
+        expectedCanonicalRequestSha256: summary.requestCanonicalSha256,
+        fetchImpl: async (_input, init) => {
+          bodies.push(String(init?.body));
+          return responseWithMarker("PRIVATE_RESPONSE_BODY");
+        },
+        record: (event) => events.push({ event: event.event }),
+      });
+      expect(results).toHaveLength(V1J_RAW_REPEATABILITY_REQUEST_COUNT);
+      expect(bodies).toEqual(Array(V1J_RAW_REPEATABILITY_REQUEST_COUNT).fill(capture.rawBody));
+      expect(events.filter((event) => event.event === "repeatability-dispatch-start")).toHaveLength(
+        V1J_RAW_REPEATABILITY_REQUEST_COUNT,
+      );
+      expect(events.at(-1)?.event).toBe("repeatability-complete");
+      expect(JSON.stringify(events)).not.toContain("PRIVATE_PROMPT");
+      expect(JSON.stringify(events)).not.toContain("PRIVATE_RESPONSE_BODY");
+      expect(JSON.stringify(events)).not.toContain("PRIVATE_CREDENTIAL");
+      expect(stdoutWrite).not.toHaveBeenCalled();
+    } finally {
+      stdoutWrite.mockRestore();
+      fs.rmSync(repoRoot, { recursive: true, force: true });
+    }
   });
 
   it("sends exactly three sequential copies of the captured body and executes no adapter/tools", async () => {
@@ -211,6 +384,7 @@ describe("v1J raw-only provider repeatability", () => {
       const journal = createV1JRawRepeatabilityJournal({
         repoRoot,
         harnessCommit: commit,
+        captureCommit,
         modelId: "qwen/qwen3.5-9b",
         provider: "lmstudio",
         contextLength: 262_144,
@@ -255,6 +429,7 @@ describe("v1J raw-only provider repeatability", () => {
         createV1JRawRepeatabilityJournal({
           repoRoot,
           harnessCommit: commit,
+          captureCommit,
           modelId: "qwen/qwen3.5-9b",
           provider: "lmstudio",
           contextLength: 262_144,
@@ -279,6 +454,7 @@ describe("v1J raw-only provider repeatability", () => {
         createV1JRawRepeatabilityJournal({
           repoRoot,
           harnessCommit: commit,
+          captureCommit,
           modelId: "qwen/qwen3.5-9b",
           provider: "lmstudio",
           contextLength: 262_144,
@@ -319,6 +495,7 @@ describe("v1J raw-only provider repeatability", () => {
       const journal = createV1JRawRepeatabilityJournal({
         repoRoot,
         harnessCommit: commit,
+        captureCommit,
         modelId: "qwen/qwen3.5-9b",
         provider: "lmstudio",
         contextLength: 262_144,

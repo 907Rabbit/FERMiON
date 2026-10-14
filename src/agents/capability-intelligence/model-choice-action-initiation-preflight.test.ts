@@ -74,6 +74,10 @@ describe("v1J repeated Arm C preflight observations", () => {
 
   it("fails closed on schema, model/config, dispatch, or missing-observation drift", () => {
     expect(
+      evaluatePreflight([observation, { ...observation, requestBodySha256: "8".repeat(64) }])
+        .passed,
+    ).toBe(false);
+    expect(
       evaluatePreflight([
         observation,
         observation,

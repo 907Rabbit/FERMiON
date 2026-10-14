@@ -407,6 +407,21 @@ function summarizePromptMessageTrace(
   };
 }
 
+function summarizeV1JTraceContent(content: unknown): {
+  contentSha256: string | null;
+  contentBytes: number | null;
+} {
+  try {
+    const canonicalContent = canonicalizeV1IValue(content);
+    return {
+      contentSha256: sha256V1J(canonicalContent),
+      contentBytes: Buffer.byteLength(canonicalContent, "utf8"),
+    };
+  } catch {
+    return { contentSha256: null, contentBytes: null };
+  }
+}
+
 function samePromptMessageState(
   left: ReturnType<typeof summarizePromptMessageTrace>,
   right: ReturnType<typeof summarizePromptMessageTrace>,
@@ -442,14 +457,87 @@ type V1JPreCaptureObserverTrace = {
 };
 
 type V1JPreCaptureTranscriptGrowth = {
+  runOneAttemptId: string;
+  embeddedRunId: string | null;
+  sessionIdSha256: string | null;
   promptSubmissionIndex: number;
   modelLoopIterationIndex: number;
   precedingModelTurnIndex: number | null;
   transcriptArrayReused: boolean;
   transcriptLengthBefore: number;
   transcriptLengthAfter: number;
-  appendedMessages: Array<{ index: number; role: string | null; contentSha256: string }>;
+  mutationType: "messages-appended" | "transcript-prefix-changed";
+  sourceStage: string;
+  source: string;
+  appendedMessages: Array<{
+    index: number;
+    role: string | null;
+    appendedRole: string | null;
+    contentSha256: string;
+    contentBytes: number;
+    mutationType:
+      | "user-message-appended"
+      | "assistant-message-appended"
+      | "tool-result-appended"
+      | "other-message-appended";
+  }>;
 };
+
+function captureV1JTranscriptGrowth(input: {
+  previous: ReturnType<typeof summarizePromptMessageTrace>;
+  current: ReturnType<typeof summarizePromptMessageTrace>;
+  runOneAttemptId: string;
+  embeddedRunId: string | null;
+  sessionIdSha256: string | null;
+  promptSubmissionIndex: number;
+  modelLoopIterationIndex: number;
+  precedingModelTurnIndex: number | null;
+}): V1JPreCaptureTranscriptGrowth | undefined {
+  const prefixMatches = input.previous.messages.every((previous, index) => {
+    const current = input.current.messages[index];
+    return (
+      current?.role === previous.role &&
+      current.contentSha256 === previous.contentSha256 &&
+      current.contentBytes === previous.contentBytes
+    );
+  });
+  const appendedMessages = prefixMatches
+    ? input.current.messages.slice(input.previous.messages.length)
+    : [];
+  if (prefixMatches && appendedMessages.length === 0) {
+    return undefined;
+  }
+  return {
+    runOneAttemptId: input.runOneAttemptId,
+    embeddedRunId: input.embeddedRunId,
+    sessionIdSha256: input.sessionIdSha256,
+    promptSubmissionIndex: input.promptSubmissionIndex,
+    modelLoopIterationIndex: input.modelLoopIterationIndex,
+    precedingModelTurnIndex: input.precedingModelTurnIndex,
+    transcriptArrayReused:
+      input.previous.messageArrayIdentity === input.current.messageArrayIdentity,
+    transcriptLengthBefore: input.previous.messageCount,
+    transcriptLengthAfter: input.current.messageCount,
+    mutationType: prefixMatches ? "messages-appended" : "transcript-prefix-changed",
+    sourceStage: input.current.stage,
+    source: input.current.source,
+    appendedMessages: appendedMessages.map((message, index) => ({
+      index: input.previous.messages.length + index,
+      role: message.role,
+      appendedRole: message.role,
+      contentSha256: message.contentSha256,
+      contentBytes: message.contentBytes,
+      mutationType:
+        message.role === "user"
+          ? "user-message-appended"
+          : message.role === "assistant"
+            ? "assistant-message-appended"
+            : message.role === "toolResult"
+              ? "tool-result-appended"
+              : "other-message-appended",
+    })),
+  };
+}
 
 type V1JPreCaptureReentryClass =
   | "single-observation"
@@ -2474,15 +2562,35 @@ describe("v1J pre-capture re-entry trace", () => {
       ],
       transcriptGrowth: [
         {
+          runOneAttemptId: "attempt-a",
+          embeddedRunId: "embedded-a",
+          sessionIdSha256: "a".repeat(64),
           promptSubmissionIndex: 1,
           modelLoopIterationIndex: 1,
           precedingModelTurnIndex: 0,
           transcriptArrayReused: true,
           transcriptLengthBefore: 1,
           transcriptLengthAfter: 3,
+          mutationType: "messages-appended",
+          sourceStage: "model-prompt-transform-enter",
+          source: "AgentSession.agent.transformContext input",
           appendedMessages: [
-            { index: 1, role: "assistant", contentSha256: "b".repeat(64) },
-            { index: 2, role: "toolResult", contentSha256: "c".repeat(64) },
+            {
+              index: 1,
+              role: "assistant",
+              appendedRole: "assistant",
+              contentSha256: "b".repeat(64),
+              contentBytes: 14,
+              mutationType: "assistant-message-appended",
+            },
+            {
+              index: 2,
+              role: "toolResult",
+              appendedRole: "toolResult",
+              contentSha256: "c".repeat(64),
+              contentBytes: 15,
+              mutationType: "tool-result-appended",
+            },
           ],
         },
       ],
@@ -2548,6 +2656,119 @@ describe("v1J pre-capture re-entry trace", () => {
       },
     ]);
     expect(JSON.stringify(summary)).not.toContain(privateText);
+  });
+
+  it("journals same-run transcript growth with appended roles and hashes only", () => {
+    const privateUserText = "private user prompt";
+    const privateAssistantText = "private assistant response";
+    const privateToolText = "private tool result";
+    const messages: Array<Record<string, unknown>> = [{ role: "user", content: privateUserText }];
+    const identities = new WeakMap<object, number>();
+    let nextIdentity = 1;
+    const identity = (value: object) => {
+      const current = identities.get(value) ?? nextIdentity++;
+      identities.set(value, current);
+      return current;
+    };
+    const previous = summarizePromptMessageTrace(
+      {
+        stage: "model-prompt-transform-enter",
+        messages,
+        source: "AgentSession.agent.transformContext input",
+      } as PromptMessageTraceEvent,
+      identity,
+    );
+    messages.push(
+      { role: "assistant", content: privateAssistantText },
+      { role: "toolResult", content: privateToolText },
+    );
+    const current = summarizePromptMessageTrace(
+      {
+        stage: "model-prompt-transform-enter",
+        messages,
+        source: "AgentSession.agent.transformContext input",
+      } as PromptMessageTraceEvent,
+      identity,
+    );
+    const growth = captureV1JTranscriptGrowth({
+      previous,
+      current,
+      runOneAttemptId: "attempt-a",
+      embeddedRunId: "embedded-a",
+      sessionIdSha256: "a".repeat(64),
+      promptSubmissionIndex: 1,
+      modelLoopIterationIndex: 1,
+      precedingModelTurnIndex: 0,
+    });
+
+    expect(growth).toMatchObject({
+      runOneAttemptId: "attempt-a",
+      embeddedRunId: "embedded-a",
+      promptSubmissionIndex: 1,
+      modelLoopIterationIndex: 1,
+      transcriptArrayReused: true,
+      transcriptLengthBefore: 1,
+      transcriptLengthAfter: 3,
+      mutationType: "messages-appended",
+      sourceStage: "model-prompt-transform-enter",
+      source: "AgentSession.agent.transformContext input",
+      appendedMessages: [
+        {
+          index: 1,
+          role: "assistant",
+          appendedRole: "assistant",
+          contentSha256: sha256V1J(canonicalizeV1IValue(privateAssistantText)),
+          contentBytes: Buffer.byteLength(privateAssistantText, "utf8"),
+          mutationType: "assistant-message-appended",
+        },
+        {
+          index: 2,
+          role: "toolResult",
+          appendedRole: "toolResult",
+          contentSha256: sha256V1J(canonicalizeV1IValue(privateToolText)),
+          contentBytes: Buffer.byteLength(privateToolText, "utf8"),
+          mutationType: "tool-result-appended",
+        },
+      ],
+    });
+    expect(JSON.stringify(growth)).not.toContain(privateUserText);
+    expect(JSON.stringify(growth)).not.toContain(privateAssistantText);
+    expect(JSON.stringify(growth)).not.toContain(privateToolText);
+
+    const classification = classifyV1JPreCaptureReentry({
+      observers: [
+        observer(),
+        observer({
+          invocationIndex: 2,
+          modelLoopIterationIndex: 2,
+          messageArrayIdentity: 20,
+          messageCount: 4,
+        }),
+      ],
+      transcriptGrowth: growth ? [growth] : [],
+    });
+    expect(classification).toBe("new-model-loop-iteration-with-transcript-growth");
+  });
+
+  it("keeps the request-equivalence gate closed for a 2-to-4 message re-entry", () => {
+    const twoMessages = { messages: [{ role: "system" }, { role: "user" }] };
+    const fourMessages = {
+      messages: [{ role: "system" }, { role: "user" }, { role: "assistant" }, { role: "tool" }],
+    };
+    const summary = summarizeV1JPreflightObservations([
+      testV1JPreflightObservation(),
+      testV1JPreflightObservation({ requestBodySha256: "9".repeat(64) }),
+    ]);
+
+    expect(differingV1JRequestBodyPaths([twoMessages, fourMessages])).toEqual([
+      ".messages[2]",
+      ".messages[3]",
+    ]);
+    expect(summary).toMatchObject({
+      rawCallbackCount: 2,
+      uniqueCanonicalObservations: 2,
+      allCapturedObservationsEquivalent: false,
+    });
   });
 });
 
@@ -4695,9 +4916,32 @@ describe("v1J schema-capture dispatch guard", () => {
       expect(events).toContain("arm-c-preflight-observations-equivalent");
       expect(events).toContain("arm-c-stop-before-dispatch-signal");
       expect(events).toContain("arm-c-preflight-stop-signal-caught");
+      expect(events).toContain("observer-return-1");
+      expect(events).toContain("model-loop-await-start");
+      expect(events).toContain("model-loop-await-end");
+      expect(events.indexOf("observer-return-1")).toBeLessThan(
+        events.indexOf("arm-c-stop-before-dispatch-signal"),
+      );
+      expect(events.indexOf("model-loop-await-start")).toBeLessThan(
+        events.indexOf("observer-return-1"),
+      );
+      expect(rows.find((row) => row.event === "model-loop-await-end")).toMatchObject({
+        awaited: true,
+        awaitTargetClass: "AgentSession.prompt",
+        elapsedMs: expect.any(Number),
+      });
+      expect(rows.find((row) => row.event === "observer-return-1")).toMatchObject({
+        invocationIndex: 1,
+        outcome: "completed",
+        runOneAttemptId: expect.any(String),
+        embeddedRunId: expect.any(String),
+      });
       expect(events.some((event) => event.startsWith("arm-a-"))).toBe(false);
       expect(events.some((event) => event.includes("smoke-schedule"))).toBe(false);
       expect(events.some((event) => event.includes("tool-execution-started"))).toBe(false);
+      expect(events).not.toContain("tool-call-produced");
+      expect(events).not.toContain("tool-result-produced");
+      expect(events).not.toContain("tool-result-appended");
       expect(events.some((event) => event.includes("raw-transport"))).toBe(false);
       const observationRows = rows.filter(
         (row) => row.event === "arm-c-request-observation-captured",
@@ -7410,6 +7654,31 @@ async function runOne(input: {
           messageCount: event.messages.length,
           source: event.source,
         });
+        if (currentProviderPayloadTraceIndex > 1) {
+          journal.record("retry-reentry-start", {
+            runOneAttemptId: runId,
+            embeddedRunId,
+            sessionIdSha256,
+            promptSubmissionIndex: promptSubmissionTraceIndex,
+            modelLoopIterationIndex: currentProviderPayloadTraceIndex,
+            reentryKind: "next-provider-request-in-model-loop",
+            retryDetected: null,
+            retryReason: "not-established-by-this-trace",
+            messageCount: event.messages.length,
+            sourceStage: event.stage,
+            source: event.source,
+          });
+          journal.record("next-request-build-start", {
+            runOneAttemptId: runId,
+            embeddedRunId,
+            sessionIdSha256,
+            promptSubmissionIndex: promptSubmissionTraceIndex,
+            modelLoopIterationIndex: currentProviderPayloadTraceIndex,
+            messageCount: event.messages.length,
+            sourceStage: event.stage,
+            source: event.source,
+          });
+        }
       }
       const callbackIndex =
         event.stage === "provider-onPayload-transform-enter" ||
@@ -7457,40 +7726,28 @@ async function runOne(input: {
 
       if (isTranscriptSnapshot) {
         if (previousTranscriptTrace) {
-          const prefixMatches = previousTranscriptTrace.messages.every((previous, index) => {
-            const current = summary.messages[index];
-            return (
-              current?.role === previous.role &&
-              current.contentSha256 === previous.contentSha256 &&
-              current.contentBytes === previous.contentBytes
-            );
-          });
-          const appendedMessages = prefixMatches
-            ? summary.messages.slice(previousTranscriptTrace.messages.length)
-            : [];
-          if (!prefixMatches || appendedMessages.length > 0) {
-            const growth: V1JPreCaptureTranscriptGrowth = {
-              promptSubmissionIndex: promptSubmissionTraceIndex,
-              modelLoopIterationIndex: currentProviderPayloadTraceIndex,
-              precedingModelTurnIndex,
-              transcriptArrayReused:
-                previousTranscriptTrace.messageArrayIdentity === summary.messageArrayIdentity,
-              transcriptLengthBefore: previousTranscriptTrace.messages.length,
-              transcriptLengthAfter: summary.messageCount,
-              appendedMessages: appendedMessages.map((message, index) => ({
-                index: previousTranscriptTrace!.messages.length + index,
-                role: message.role,
-                contentSha256: message.contentSha256,
-              })),
-            };
-            preCaptureTranscriptGrowth.push(growth);
-            journal.record(`arm-${journal.arm.toLowerCase()}-transcript-growth-observed`, {
-              ...growth,
-              sourceStage: event.stage,
+          const growth = captureV1JTranscriptGrowth({
+            previous: {
+              stage: event.stage,
               source: event.source,
-            });
+              messageArrayIdentity: previousTranscriptTrace.messageArrayIdentity,
+              messageCount: previousTranscriptTrace.messages.length,
+              messages: previousTranscriptTrace.messages,
+            },
+            current: summary,
+            runOneAttemptId: runId,
+            embeddedRunId,
+            sessionIdSha256,
+            promptSubmissionIndex: promptSubmissionTraceIndex,
+            modelLoopIterationIndex: currentProviderPayloadTraceIndex,
+            precedingModelTurnIndex,
+          });
+          if (growth) {
+            preCaptureTranscriptGrowth.push(growth);
+            journal.record(`arm-${journal.arm.toLowerCase()}-transcript-growth-observed`, growth);
+            journal.record("transcript-mutation-observed", growth);
             for (const message of growth.appendedMessages) {
-              const appendCheckpoint =
+              const legacyAppendEvent =
                 message.role === "user"
                   ? "user-message-append-observed"
                   : message.role === "assistant"
@@ -7498,14 +7755,20 @@ async function runOne(input: {
                     : message.role === "toolResult"
                       ? "tool-result-append-observed"
                       : undefined;
-              if (appendCheckpoint) {
-                journal.record(`arm-${journal.arm.toLowerCase()}-${appendCheckpoint}`, {
+              if (legacyAppendEvent) {
+                journal.record(`arm-${journal.arm.toLowerCase()}-${legacyAppendEvent}`, {
                   ...growth,
                   message,
-                  sourceStage: event.stage,
-                  source: event.source,
                 });
               }
+              journal.record(message.mutationType, {
+                ...growth,
+                mutationType: message.mutationType,
+                appendedRole: message.appendedRole,
+                appendedContentSha256: message.contentSha256,
+                appendedContentBytes: message.contentBytes,
+                message,
+              });
             }
           }
         }
@@ -7543,13 +7806,6 @@ async function runOne(input: {
     }
   };
   if (input.modelLoopDiagnostics) {
-    diagnostics.hooks.onModelLoopSubstage = (event) => {
-      input.attemptCheckpointJournal?.record(`model-loop:${event.stage}`, {
-        elapsedMs: event.elapsedMs,
-        lastSuccessfulCheckpoint: event.stage,
-      });
-      input.modelLoopDiagnostics?.onSubstage(event);
-    };
     diagnostics.hooks.onModelLoopHeartbeat = (heartbeat) => {
       input.attemptCheckpointJournal?.record("model-loop-heartbeat", {
         elapsedMs: heartbeat.elapsedMs,
@@ -7561,6 +7817,36 @@ async function runOne(input: {
       input.modelLoopDiagnostics?.onHeartbeat(heartbeat);
     };
   }
+  const originalModelLoopSubstage = diagnostics.hooks.onModelLoopSubstage;
+  diagnostics.hooks.onModelLoopSubstage = (event) => {
+    const awaitStage =
+      event.stage === "active-session-prompt-entered"
+        ? "model-loop-await-start"
+        : event.stage === "active-session-prompt-completed"
+          ? "model-loop-await-end"
+          : undefined;
+    if (awaitStage) {
+      input.requestCapture?.preflightDiagnostics?.record(awaitStage, {
+        runOneAttemptId: runId,
+        embeddedRunId,
+        sessionIdSha256,
+        promptSubmissionIndex: promptSubmissionTraceIndex,
+        modelLoopIterationIndex: currentProviderPayloadTraceIndex,
+        activeSessionPromptStage: event.stage,
+        elapsedMs: event.elapsedMs,
+        awaited: true,
+        awaitTargetClass: "AgentSession.prompt",
+      });
+    }
+    if (input.modelLoopDiagnostics) {
+      input.attemptCheckpointJournal?.record(`model-loop:${event.stage}`, {
+        elapsedMs: event.elapsedMs,
+        lastSuccessfulCheckpoint: event.stage,
+      });
+      input.modelLoopDiagnostics.onSubstage(event);
+    }
+    originalModelLoopSubstage?.(event);
+  };
   const diagnosticsHeartbeat = diagnostics.hooks.onPreparedRuntimeAcquisitionHeartbeat;
   diagnostics.hooks.onPreparedRuntimeAcquisitionHeartbeat = (heartbeat) => {
     input.attemptCheckpointJournal?.record("prepared-runtime-acquisition-heartbeat", {
@@ -7670,9 +7956,19 @@ async function runOne(input: {
   let requestObserverInvocationIndex = 0;
   diagnostics.hooks.onProviderRequest = async ({ payload, model }) => {
     const callbackIndex = ++requestObserverInvocationIndex;
+    const callbackStartedAt = performance.now();
     const preflightDiagnostics = input.requestCapture?.preflightDiagnostics;
     const nestedObserverReentry = activeRequestObserverCount > 0;
     activeRequestObserverCount += 1;
+    if (callbackIndex === 2) {
+      preflightDiagnostics?.record("observer-enter-2", {
+        runOneAttemptId: runId,
+        embeddedRunId,
+        sessionIdSha256,
+        promptSubmissionIndex: promptSubmissionTraceIndex,
+        modelLoopIterationIndex: currentProviderPayloadTraceIndex,
+      });
+    }
     preflightDiagnostics?.increment(
       "providerRequestHookInvocations",
       `arm-${preflightDiagnostics.arm.toLowerCase()}-provider-request-hook-enter`,
@@ -7808,6 +8104,7 @@ async function runOne(input: {
     const observerStartedAt = performance.now();
     const observerEnteredAt = new Date().toISOString();
     const observerAwaitTargetClass = diagnosticsProviderRequest?.constructor.name ?? null;
+    let observerOutcome: "completed" | "failed" = "completed";
     recordProviderCaptureStage("request-observer-await-start", {
       callbackIndex,
       messageCount: requestMessages.length,
@@ -7830,6 +8127,7 @@ async function runOne(input: {
         performance.now() - observerStartedAt,
       );
     } catch (error) {
+      observerOutcome = "failed";
       recordProviderCaptureStage(
         "request-observer-await-failed",
         {
@@ -7881,6 +8179,16 @@ async function runOne(input: {
           }),
           observerCount: preCaptureObserverTraces.length,
           nestedObserverReentry,
+          retryDetected: null,
+          reentryDetected: preCaptureObserverTraces.length > 1,
+          sameRunReentry:
+            preCaptureObserverTraces.length > 1 &&
+            preCaptureObserverTraces.every(
+              (observer) =>
+                observer.runOneAttemptId === runId &&
+                observer.embeddedRunId === embeddedRunId &&
+                observer.sessionIdSha256 === sessionIdSha256,
+            ),
           runOneAttemptId: runId,
           embeddedRunId,
           sessionIdSha256,
@@ -7890,6 +8198,17 @@ async function runOne(input: {
         `arm-${preflightDiagnostics.arm.toLowerCase()}-provider-request-hook-exit`,
         { callSite: "runOne.diagnostics.hooks.onProviderRequest" },
       );
+      preflightDiagnostics?.record(`observer-return-${callbackIndex}`, {
+        runOneAttemptId: runId,
+        embeddedRunId,
+        sessionIdSha256,
+        invocationIndex: callbackIndex,
+        promptSubmissionIndex: promptSubmissionTraceIndex,
+        modelLoopIterationIndex: currentProviderPayloadTraceIndex,
+        messageCount: callbackExit.messageCount,
+        outcome: observerOutcome,
+        elapsedMs: Math.max(0, Math.round(performance.now() - callbackStartedAt)),
+      });
     }
     if (input.requestCapture?.stopAfterCapture) {
       preflightDiagnostics?.increment(
@@ -7948,9 +8267,37 @@ async function runOne(input: {
   const restoreAssistantMessageObserver = installAssistantMessageObserver(
     diagnostics.hooks,
     (message, modelTurnIndex) => {
+      const preflightDiagnostics = input.requestCapture?.preflightDiagnostics;
       const normalizedToolCallCount = message.content.filter(
         (block) => block.type === "toolCall",
       ).length;
+      const assistantSummary = summarizeV1JTraceContent(message.content);
+      preflightDiagnostics?.record("assistant-turn-created", {
+        runOneAttemptId: runId,
+        embeddedRunId,
+        sessionIdSha256,
+        promptSubmissionIndex: promptSubmissionTraceIndex,
+        modelLoopIterationIndex: currentProviderPayloadTraceIndex,
+        modelTurnIndex,
+        sourceStage: "normalized-assistant-message-observer-enter",
+        role: message.role,
+        ...assistantSummary,
+        toolCallCount: normalizedToolCallCount,
+      });
+      if (normalizedToolCallCount > 0) {
+        const toolCalls = message.content.filter((block) => block.type === "toolCall");
+        preflightDiagnostics?.record("tool-call-produced", {
+          runOneAttemptId: runId,
+          embeddedRunId,
+          sessionIdSha256,
+          promptSubmissionIndex: promptSubmissionTraceIndex,
+          modelLoopIterationIndex: currentProviderPayloadTraceIndex,
+          modelTurnIndex,
+          sourceStage: "normalized-assistant-message-tool-call-extraction",
+          toolCallCount: normalizedToolCallCount,
+          ...summarizeV1JTraceContent(toolCalls),
+        });
+      }
       input.requestCapture?.lifecycleJournal?.record("adapter-response-parsed", {
         requestIndex: modelTurnIndex + 1,
         toolCallCount: normalizedToolCallCount,
@@ -7994,7 +8341,21 @@ async function runOne(input: {
         });
       }
       precedingModelTurnIndex = modelTurnIndex;
-      input.requestCapture?.onAssistantMessage?.(message, modelTurnIndex);
+      try {
+        input.requestCapture?.onAssistantMessage?.(message, modelTurnIndex);
+      } finally {
+        preflightDiagnostics?.record("assistant-turn-finalized", {
+          runOneAttemptId: runId,
+          embeddedRunId,
+          sessionIdSha256,
+          promptSubmissionIndex: promptSubmissionTraceIndex,
+          modelLoopIterationIndex: currentProviderPayloadTraceIndex,
+          modelTurnIndex,
+          sourceStage: "request-capture-assistant-message-callback-complete",
+          ...assistantSummary,
+          toolCallCount: normalizedToolCallCount,
+        });
+      }
     },
   );
   const startTime = new Date().toISOString();
@@ -8114,6 +8475,16 @@ async function runOne(input: {
           },
           onAgentToolResult: (event) => {
             observedFailure ||= event.isError;
+            input.requestCapture?.preflightDiagnostics?.record("tool-result-produced", {
+              runOneAttemptId: runId,
+              embeddedRunId,
+              sessionIdSha256,
+              promptSubmissionIndex: promptSubmissionTraceIndex,
+              modelLoopIterationIndex: currentProviderPayloadTraceIndex,
+              isError: event.isError,
+              ...summarizeV1JTraceContent(event.result),
+              sourceStage: "runOne.runner.onAgentToolResult",
+            });
             diagnostics.hooks.onCheckpoint?.({
               stage: "tool-execution-finished",
               toolCount: 1,

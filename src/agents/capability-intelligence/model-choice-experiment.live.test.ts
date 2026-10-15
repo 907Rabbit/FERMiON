@@ -73,8 +73,11 @@ import {
   V1J_ADAPTER_DIFFERENTIAL_RUN_FLAG,
 } from "../../../test/helpers/agents/model-choice-adapter-differential.js";
 import {
+  classifyV1JCaptureHookLiveness,
   createV1JPreflightStageLedger,
+  V1J_PREFLIGHT_STAGE_METADATA,
   V1J_PREFLIGHT_STAGE_NAMES,
+  V1JPreflightStageTimeoutError,
   type V1JPreflightStageName,
 } from "../../../test/helpers/agents/model-choice-preflight-stage-diagnostics.js";
 import { recordV1JPromptAwaitDiagnostic } from "../../../test/helpers/agents/model-choice-prompt-await-diagnostic.js";
@@ -3103,12 +3106,14 @@ async function runV1JProviderCapturePreflight(mode: "body-export" | "materializa
   const stageLedger = createV1JPreflightStageLedger({
     record: (event, details) => journal.record(event, details),
   });
+  let lastCompletedStage: V1JPreflightStageName | null = null;
   const enterStage = (stage: V1JPreflightStageName) => {
     preflightStage = stage;
-    stageLedger.enter(stage);
+    stageLedger.enter(stage, V1J_PREFLIGHT_STAGE_METADATA[stage]);
   };
   const completeStage = (stage: V1JPreflightStageName) => {
-    stageLedger.complete(stage);
+    stageLedger.complete(stage, V1J_PREFLIGHT_STAGE_METADATA[stage]);
+    lastCompletedStage = stage;
   };
   enterStage("schema-preflight");
   let providerBoundCaptureCount = 0;
@@ -3212,8 +3217,8 @@ async function runV1JProviderCapturePreflight(mode: "body-export" | "materializa
       stage: () => preflightStage,
       record: (event) => journal.record(event.event, event.details),
       timeoutMsByStage: { "schema-discovery": 30_000 },
-      lastCompletedStage: () =>
-        stageLedger.snapshot().findLast((stage) => stage.completed)?.stage_name ?? null,
+      lastCompletedStage: () => lastCompletedStage,
+      timeoutOwner: "v1J provider-capture preflight stage timeout",
       onStageTimeout: (error) => discoveryAbortController.abort(error),
       heartbeat: ({ stage, elapsedMs }) =>
         process.stdout.write(
@@ -3222,16 +3227,25 @@ async function runV1JProviderCapturePreflight(mode: "body-export" | "materializa
     });
     journal.record("lmstudio-discovery-complete");
     completeStage("schema-discovery");
-    enterStage("prepared-runtime");
-    journal.record("prepared-runtime-start");
     const preflightStopController = new AbortController();
     const surface = await runV1JPreflightWithHeartbeat({
       operation: () =>
         captureV1JPreflightSurface(protocol, "A", head, journal, {
           preflightStopController,
           onStage: (stage, completed) => {
+            if (!completed && stage === "prompt-submission") {
+              const promptPreflight = stageLedger
+                .snapshot()
+                .find((candidate) => candidate.stage_name === "prompt-preflight");
+              if (promptPreflight?.entered && !promptPreflight.completed) {
+                completeStage("prompt-preflight");
+              }
+            }
             if (completed) {
               completeStage(stage);
+              if (stage === "capture-hook-installation") {
+                preflightStage = "prepared-runtime";
+              }
             } else {
               enterStage(stage);
             }
@@ -3243,10 +3257,19 @@ async function runV1JProviderCapturePreflight(mode: "body-export" | "materializa
               flag: "wx",
             }),
           onCheckpoint: (checkpoint) => {
-            if (checkpoint.stage === "client-preparation-completed") {
+            if (checkpoint.stage === "runtime-preparation-entered") {
+              enterStage("prepared-runtime");
+              journal.record("prepared-runtime-start", { checkpoint: checkpoint.stage });
+            }
+            if (checkpoint.stage === "runtime-preparation-completed") {
               completeStage("prepared-runtime");
-              preflightStage = "prompt-preflight";
+              preflightStage = "authorized-tool-surface";
               journal.record("prepared-runtime-complete", { checkpoint: checkpoint.stage });
+            }
+            if (checkpoint.stage === "client-preparation-completed") {
+              preflightStage = "prompt-preflight";
+              enterStage("prompt-preflight");
+              journal.record("client-preparation-complete", { checkpoint: checkpoint.stage });
               journal.record("prompt-preflight-start");
             }
           },
@@ -3469,15 +3492,14 @@ async function runV1JProviderCapturePreflight(mode: "body-export" | "materializa
         "authorized-tool-surface": 30_000,
         "prepared-runtime": 150_000,
         "schema-preflight-validation": 30_000,
-        "provider-bound-capture-hook": 60_000,
         "prompt-preflight": 60_000,
         "prompt-submission": 60_000,
         "request-observer": 30_000,
         "provider-bound-callback": 30_000,
         "provider-schema-materialization": 30_000,
       },
-      lastCompletedStage: () =>
-        stageLedger.snapshot().findLast((stage) => stage.completed)?.stage_name ?? null,
+      lastCompletedStage: () => lastCompletedStage,
+      timeoutOwner: "v1J provider-capture preflight stage timeout",
       onStageTimeout: (error) => preflightStopController.abort(error),
       heartbeat: ({ stage, elapsedMs }) =>
         process.stdout.write(
@@ -3541,6 +3563,7 @@ async function runV1JProviderCapturePreflight(mode: "body-export" | "materializa
       toolExecutions: 0,
       formalStateTouched: false,
       normalSmokeStateTouched: false,
+      captureHookLivenessClassification: classifyV1JCaptureHookLiveness(stageLedger.snapshot()),
       preflightStages: stageLedger.snapshot(),
     });
     process.stdout.write(
@@ -3570,19 +3593,30 @@ async function runV1JProviderCapturePreflight(mode: "body-export" | "materializa
         activeFilteringEnabled: false,
         formalStateTouched: false,
         normalSmokeStateTouched: false,
+        captureHookLivenessClassification: classifyV1JCaptureHookLiveness(stageLedger.snapshot()),
         artifactPath: journal.filePath,
         preflightStages: stageLedger.snapshot(),
       })}\n`,
     );
   } catch (error) {
-    const activeStage = preflightStage;
-    if (V1J_PREFLIGHT_STAGE_NAMES.includes(activeStage as V1JPreflightStageName)) {
-      stageLedger.fail(activeStage as V1JPreflightStageName, error);
+    const blockingStage =
+      error instanceof V1JPreflightStageTimeoutError ? error.stage : preflightStage;
+    if (V1J_PREFLIGHT_STAGE_NAMES.includes(blockingStage as V1JPreflightStageName)) {
+      const stage = blockingStage as V1JPreflightStageName;
+      stageLedger.fail(stage, error, V1J_PREFLIGHT_STAGE_METADATA[stage]);
     }
-    if (activeStage !== "schema-preflight") {
-      stageLedger.fail("schema-preflight", error);
+    if (blockingStage !== "schema-preflight") {
+      stageLedger.fail("schema-preflight", error, V1J_PREFLIGHT_STAGE_METADATA["schema-preflight"]);
     }
     try {
+      const preflightStages = stageLedger.snapshot();
+      const captureHookLivenessClassification = classifyV1JCaptureHookLiveness(preflightStages);
+      journal.record("capture-hook-liveness-classification", {
+        classification: captureHookLivenessClassification,
+        lastCompletedStage,
+        blockingStage,
+        stages: preflightStages,
+      });
       recordCaptureStage({
         event: "outer-catch-enter",
         details: {
@@ -3594,13 +3628,15 @@ async function runV1JProviderCapturePreflight(mode: "body-export" | "materializa
       journal.record("provider-capture-preflight-failed", {
         errorName: error instanceof Error ? error.name : "NonErrorThrown",
         lastCheckpoint: preflightStage,
-        preflightStages: stageLedger.snapshot(),
+        captureHookLivenessClassification,
+        blockingStage,
+        preflightStages,
         counters: journal.counters(),
       });
       process.stdout.write(
         `v1J preflight outcome=failed lastCompletedStage=${
-          stageLedger.snapshot().findLast((stage) => stage.completed)?.stage_name ?? "none"
-        } failureClass=${error instanceof Error ? error.name : typeof error}\n`,
+          lastCompletedStage ?? "none"
+        } blockingStage=${blockingStage ?? "unknown"} captureHookLiveness=${captureHookLivenessClassification} failureClass=${error instanceof Error ? error.name : typeof error}\n`,
       );
     } catch {
       // A failed diagnostic sink must not replace the callback's original failure.
@@ -4094,7 +4130,7 @@ async function captureV1JPreflightSurface(
         stopAfterProviderBoundCapture: true,
         ...(preflightDiagnostics ? { preflightDiagnostics } : {}),
         onProviderCaptureStage: options?.onProviderCaptureStage,
-        onPreflightStage: (stageName) => stage(stageName),
+        onPreflightStage: (stageName, completed) => stage(stageName, completed ?? false),
         onTimestampProvenance: options?.onTimestampProvenance,
         capturePromptInstruction: v1jInstructionForArm(protocol, arm),
         onAuthorizedToolsCaptured: (tools) => {
@@ -9654,7 +9690,7 @@ async function runOne(input: {
   };
   const diagnosticsProviderRequestBeforeDispatch =
     diagnostics.hooks.onProviderRequestBeforeDispatch;
-  input.requestCapture?.onPreflightStage?.("provider-bound-capture-hook");
+  input.requestCapture?.onPreflightStage?.("capture-hook-installation");
   diagnostics.hooks.onProviderRequestBeforeDispatch = async ({ payload, model }) => {
     await diagnosticsProviderRequestBeforeDispatch?.({ payload, model });
     if (input.requestCapture?.stopAfterProviderBoundCapture !== true) {
@@ -9699,7 +9735,7 @@ async function runOne(input: {
     input.requestCapture.onPreflightStage?.("preflight-stop", true);
     throw new V1IProviderRequestCapturedError();
   };
-  input.requestCapture?.onPreflightStage?.("provider-bound-capture-hook", true);
+  input.requestCapture?.onPreflightStage?.("capture-hook-installation", true);
   const diagnosticsProviderResponse = diagnostics.hooks.onProviderResponse;
   let adapterResponseIndex = 0;
   diagnostics.hooks.onProviderResponse = async ({ response, model }) => {

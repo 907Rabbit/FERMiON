@@ -4,6 +4,7 @@ import {
   type V1JPreflightCounters,
 } from "../../../test/helpers/agents/model-choice-action-initiation-smoke.js";
 import {
+  classifyV1JCaptureHookLiveness,
   createV1JPreflightStageLedger,
   V1JPreflightStageTimeoutError,
 } from "../../../test/helpers/agents/model-choice-preflight-stage-diagnostics.js";
@@ -19,8 +20,10 @@ describe("v1J preflight stage diagnostics", () => {
     ledger.enter("schema-preflight");
     ledger.complete("schema-discovery");
     ledger.complete("authorized-tool-surface");
+    ledger.enter("capture-hook-installation");
+    ledger.complete("capture-hook-installation");
+    ledger.enter("prepared-runtime");
     ledger.complete("prepared-runtime");
-    ledger.complete("provider-bound-capture-hook");
     ledger.complete("prompt-submission");
     ledger.complete("request-observer");
     ledger.complete("provider-bound-callback");
@@ -43,37 +46,113 @@ describe("v1J preflight stage diagnostics", () => {
     expect(JSON.stringify({ events, summary })).not.toMatch(/prompt text|request body|secret/iu);
   });
 
-  it("distinguishes hook, prompt, observer, and provider-callback reachability", () => {
+  it.each([
+    {
+      name: "installation was not entered",
+      install: "absent",
+      prompt: false,
+      expected: "HOOK_INSTALLATION_NOT_ENTERED",
+    },
+    {
+      name: "installation entered but did not complete",
+      install: "entered",
+      prompt: false,
+      expected: "HOOK_INSTALLATION_ENTERED_NOT_COMPLETED",
+    },
+    {
+      name: "hook installed but prompt was not submitted",
+      install: "complete",
+      prompt: false,
+      expected: "HOOK_INSTALLED_PROMPT_NOT_SUBMITTED",
+    },
+    {
+      name: "prompt submitted but capture was not reached",
+      install: "complete",
+      prompt: true,
+      expected: "PROMPT_SUBMITTED_CAPTURE_NOT_REACHED",
+    },
+  ] as const)("classifies $name", ({ install, prompt, expected }) => {
     const ledger = createV1JPreflightStageLedger({ record: () => undefined, now: () => 1 });
-    ledger.enter("schema-preflight");
     ledger.complete("schema-discovery");
-    ledger.complete("authorized-tool-surface");
-    ledger.complete("prepared-runtime");
-    const beforeHook = ledger.snapshot();
-    expect(
-      beforeHook.find((stage) => stage.stage_name === "provider-bound-capture-hook"),
-    ).toMatchObject({
-      entered: false,
-      completed: false,
-    });
+    if (install !== "absent") {
+      ledger.enter("capture-hook-installation");
+    }
+    if (install === "complete") {
+      ledger.complete("capture-hook-installation");
+    }
+    if (prompt) {
+      ledger.enter("prompt-submission");
+    }
 
-    ledger.complete("provider-bound-capture-hook");
-    ledger.complete("prompt-submission");
-    const afterPrompt = ledger.snapshot();
-    expect(afterPrompt.find((stage) => stage.stage_name === "prompt-submission")).toMatchObject({
-      entered: true,
-      completed: true,
-    });
-    expect(afterPrompt.find((stage) => stage.stage_name === "request-observer")).toMatchObject({
-      entered: false,
-      completed: false,
-    });
+    expect(classifyV1JCaptureHookLiveness(ledger.snapshot())).toBe(expected);
+  });
+
+  it("records successful progression through hook installation, runtime, prompt, and capture", () => {
+    const ledger = createV1JPreflightStageLedger({ record: () => undefined, now: () => 1 });
+    ledger.complete("schema-discovery");
+    ledger.enter("capture-hook-installation");
+    ledger.complete("capture-hook-installation");
+    ledger.enter("prepared-runtime");
+    ledger.complete("prepared-runtime");
+    ledger.enter("prompt-preflight");
+    ledger.complete("prompt-preflight");
+    ledger.enter("prompt-submission");
+    ledger.enter("provider-bound-callback");
+
+    expect(classifyV1JCaptureHookLiveness(ledger.snapshot())).toBe("CAPTURE_REACHED");
+    expect(ledger.snapshot()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          stage_name: "capture-hook-installation",
+          entered: true,
+          completed: true,
+          await_target_class: null,
+          timeout_owner: "none; synchronous runOne hook assignment",
+        }),
+        expect.objectContaining({
+          stage_name: "prepared-runtime",
+          entered: true,
+          completed: true,
+          await_target_class: "prepared-runtime acquisition",
+          timeout_owner: "v1J provider-capture preflight stage timeout",
+        }),
+        expect.objectContaining({
+          stage_name: "prompt-submission",
+          entered: true,
+          completed: false,
+          elapsed_ms: null,
+          await_target_class: "AgentSession.prompt",
+          timeout_owner: "v1J provider-capture preflight stage timeout",
+        }),
+      ]),
+    );
+  });
+
+  it("keeps an unentered hook stage unentered when the outer stage fails first", () => {
+    const ledger = createV1JPreflightStageLedger({ record: () => undefined, now: () => 1 });
+    ledger.complete("schema-discovery");
+    ledger.fail(
+      "capture-hook-installation",
+      new V1JPreflightStageTimeoutError(
+        "capture-hook-installation",
+        30_000,
+        30_000,
+        "schema-discovery",
+        "capture preflight wrapper",
+      ),
+    );
+
     expect(
-      afterPrompt.find((stage) => stage.stage_name === "provider-bound-callback"),
+      ledger.snapshot().find((stage) => stage.stage_name === "capture-hook-installation"),
     ).toMatchObject({
       entered: false,
       completed: false,
+      elapsed_ms: 30_000,
+      await_target_class: null,
+      timeout_owner: "capture preflight wrapper",
+      failure_class: "V1JPreflightStageTimeoutError",
     });
+    expect(classifyV1JCaptureHookLiveness(ledger.snapshot())).toBe("HOOK_INSTALLATION_NOT_ENTERED");
   });
 
   it("records schema failure and the exact timeout stage/last completed stage", async () => {
@@ -111,6 +190,7 @@ describe("v1J preflight stage diagnostics", () => {
           entered: true,
           completed: false,
           failure_class: "V1JPreflightStageTimeoutError",
+          timeout_owner: "runV1JPreflightWithHeartbeat",
           last_completed_stage: "schema-preflight",
         },
       });

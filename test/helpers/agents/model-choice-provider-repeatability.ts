@@ -1,7 +1,12 @@
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { V1JPreflightStageTimeoutError } from "./model-choice-preflight-stage-diagnostics.js";
+import {
+  V1J_PREFLIGHT_STAGE_METADATA,
+  V1J_PREFLIGHT_STAGE_NAMES,
+  V1JPreflightStageTimeoutError,
+  type V1JPreflightStageName,
+} from "./model-choice-preflight-stage-diagnostics.js";
 import {
   runV1JProviderTransportControls,
   V1J_PROVIDER_CONTROL_MODEL_CONFIG_SHA256,
@@ -318,6 +323,7 @@ export async function runV1JPreflightWithHeartbeat<T>(input: {
   heartbeatMs?: number;
   now?: () => number;
   timeoutMsByStage?: Readonly<Record<string, number>>;
+  timeoutOwner?: string;
   lastCompletedStage?: () => string | null;
   onStageTimeout?: (error: V1JPreflightStageTimeoutError) => void;
 }): Promise<T> {
@@ -353,7 +359,9 @@ export async function runV1JPreflightWithHeartbeat<T>(input: {
         timeoutError = new V1JPreflightStageTimeoutError(
           currentStage,
           timeoutMs,
+          elapsedMs,
           input.lastCompletedStage?.() ?? lastCompletedStage,
+          input.timeoutOwner ?? "runV1JPreflightWithHeartbeat",
         );
         input.record({
           event: "preflight-stage-timeout",
@@ -364,6 +372,13 @@ export async function runV1JPreflightWithHeartbeat<T>(input: {
             elapsed_ms: elapsedMs,
             failure_class: timeoutError.name,
             timeout_ms: timeoutMs,
+            await_target_class: V1J_PREFLIGHT_STAGE_NAMES.includes(
+              currentStage as V1JPreflightStageName,
+            )
+              ? (V1J_PREFLIGHT_STAGE_METADATA[currentStage as V1JPreflightStageName]
+                  .awaitTargetClass ?? null)
+              : null,
+            timeout_owner: timeoutError.timeoutOwner,
             last_completed_stage: timeoutError.lastCompletedStage,
           },
         });

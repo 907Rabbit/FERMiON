@@ -92,6 +92,38 @@ describe("v1J preflight terminal diagnostics", () => {
     });
   });
 
+  it("includes provider callback reachability events in the terminal report", () => {
+    const event = {
+      stage: "request-observer-enter",
+      entered: true,
+      completed: false,
+      invocationCount: 1,
+      runId: "offline-run",
+      promptSubmissionIndex: 1,
+      modelLoopIteration: 1,
+      providerInstanceId: "provider-fingerprint",
+      hookIdentity: "hook-registration",
+      failureClass: null,
+    };
+    const report = buildV1JPreflightTerminalReport({
+      counters: createV1JPreflightCounters(),
+      lastCompletedStage: "request-observer",
+      blockingStage: "provider-transform",
+      captureHookLiveness: "PROMPT_SUBMITTED_CAPTURE_NOT_REACHED",
+      failureClass: null,
+      predicateEvaluations: null,
+      providerCallbackReachability: {
+        classification: "OBSERVER_WITHOUT_PROVIDER_TRANSFORM",
+        events: [event],
+      },
+    });
+
+    expect(report.PROVIDER_CALLBACK_REACHABILITY).toEqual({
+      classification: "OBSERVER_WITHOUT_PROVIDER_TRANSFORM",
+      events: [event],
+    });
+  });
+
   it("distinguishes an expected synthetic sentinel from an unaccounted model result", () => {
     const counters = passingPreflightCounters();
     const increment = (counter: keyof V1JPreflightCounters) => {

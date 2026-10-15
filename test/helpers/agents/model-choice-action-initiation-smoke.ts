@@ -215,6 +215,10 @@ export function buildV1JPreflightTerminalReport(input: {
   captureHookLiveness: string;
   failureClass: string | null;
   predicateEvaluations: readonly V1JPreflightPredicateEvaluation[] | null;
+  providerCallbackReachability?: {
+    classification: string;
+    events: readonly unknown[];
+  };
 }): Record<string, unknown> {
   const { counters, predicateEvaluations } = input;
   return {
@@ -241,6 +245,10 @@ export function buildV1JPreflightTerminalReport(input: {
     FIRST_FAILED_PREDICATE:
       predicateEvaluations?.find((predicate) => !predicate.pass)?.predicateName ??
       (predicateEvaluations ? "none" : "NOT_EVALUATED"),
+    PROVIDER_CALLBACK_REACHABILITY: input.providerCallbackReachability ?? {
+      classification: "NOT_REACHED",
+      events: [],
+    },
   };
 }
 

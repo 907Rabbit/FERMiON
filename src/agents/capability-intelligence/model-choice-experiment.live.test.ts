@@ -95,6 +95,11 @@ import {
   type V1JPromptMaterializationBoundary,
 } from "../../../test/helpers/agents/model-choice-prompt-content-delta.js";
 import {
+  createV1JProviderCallbackReachabilityTrace,
+  type V1JProviderCallbackReachabilityEvent,
+  type V1JProviderCallbackStage,
+} from "../../../test/helpers/agents/model-choice-provider-callback-reachability.js";
+import {
   V1J_PROVIDER_CONTROL_MODEL_CONFIG_SHA256,
   V1J_PROVIDER_CONTROL_SCHEMA_BASELINE,
 } from "../../../test/helpers/agents/model-choice-provider-isolation.js";
@@ -3018,6 +3023,7 @@ type V1JProviderPreflightTerminalState = {
   captureHookLiveness: string;
   failureClass: string | null;
   predicateEvaluations: V1JPreflightPredicateEvaluation[] | null;
+  providerCallbackReachability: ReturnType<typeof createV1JProviderCallbackReachabilityTrace>;
 };
 
 async function runV1JProviderCapturePreflight(mode: "body-export" | "materialization-trace") {
@@ -3028,6 +3034,7 @@ async function runV1JProviderCapturePreflight(mode: "body-export" | "materializa
     captureHookLiveness: "NOT_REACHED",
     failureClass: null,
     predicateEvaluations: null,
+    providerCallbackReachability: createV1JProviderCallbackReachabilityTrace(),
   };
   await runV1JPreflightWithTerminalReport({
     operation: async () => {
@@ -3047,6 +3054,12 @@ async function runV1JProviderCapturePreflight(mode: "body-export" | "materializa
         captureHookLiveness: terminalState.captureHookLiveness,
         failureClass: terminalState.failureClass,
         predicateEvaluations: terminalState.predicateEvaluations,
+        providerCallbackReachability: {
+          classification: terminalState.providerCallbackReachability.classify(
+            terminalState.journal?.counters().providerDispatchAttempts ?? 0,
+          ),
+          events: terminalState.providerCallbackReachability.snapshot(),
+        },
       }),
     emit: (report) =>
       process.stdout.write(`V1J_PREFLIGHT_TERMINAL_REPORT ${JSON.stringify(report)}\n`),
@@ -3332,6 +3345,10 @@ async function runV1JProviderCapturePreflightInternal(
             journal.record("preflight-progress", { stage });
           },
           onProviderCaptureStage: recordCaptureStage,
+          onProviderCallbackReachabilityEvent: (event) => {
+            terminalState.providerCallbackReachability.record(event);
+            journal.record("provider-callback-reachability", event);
+          },
           ...(materializationTraceOnly
             ? {
                 onTimestampProvenance: (result: V1JTimestampProvenanceResult) => {
@@ -4112,6 +4129,7 @@ async function captureV1JPreflightSurface(
     onStage?: (stage: V1JPreflightStageName, completed: boolean) => void;
     onCapturedRequest?: (request: CapturedModelRequest) => void;
     onProviderCaptureStage?: (event: V1JProviderControlEvent) => void;
+    onProviderCallbackReachabilityEvent?: (event: V1JProviderCallbackReachabilityEvent) => void;
     onPreflightStage?: (stage: V1JPreflightStageName, completed?: boolean) => void;
     onProviderBoundRequest?: (input: {
       request: CapturedModelRequest;
@@ -4189,6 +4207,7 @@ async function captureV1JPreflightSurface(
         stopAfterProviderBoundCapture: true,
         ...(preflightDiagnostics ? { preflightDiagnostics } : {}),
         onProviderCaptureStage: options?.onProviderCaptureStage,
+        onProviderCallbackReachabilityEvent: options?.onProviderCallbackReachabilityEvent,
         onPreflightStage: (stageName, completed) => stage(stageName, completed ?? false),
         onTimestampProvenance: options?.onTimestampProvenance,
         capturePromptInstruction: v1jInstructionForArm(protocol, arm),
@@ -8642,6 +8661,7 @@ async function runOne(input: {
     onAuthorizedToolsCaptured?: (tools: readonly V1JAuthorizedToolSchema[]) => void;
     onRequestCaptured?: (request: CapturedModelRequest) => void;
     onProviderCaptureStage?: (event: V1JProviderControlEvent) => void;
+    onProviderCallbackReachabilityEvent?: (event: V1JProviderCallbackReachabilityEvent) => void;
     onProviderRequestBeforeDispatch?: (input: {
       request: CapturedModelRequest;
       rawBody: string;
@@ -8760,7 +8780,9 @@ async function runOne(input: {
     });
   };
   const promptMessageIdentities = new WeakMap<object, number>();
+  const providerModelIdentities = new WeakMap<object, string>();
   let nextPromptMessageIdentity = 1;
+  let nextProviderModelIdentity = 1;
   const identifyPromptObject = (value: object) => {
     const existing = promptMessageIdentities.get(value);
     if (existing !== undefined) {
@@ -8775,6 +8797,8 @@ async function runOne(input: {
   let currentProviderPayloadTraceIndex = 0;
   let embeddedRunId: string | null = null;
   let sessionIdSha256: string | null = null;
+  let activeProviderInstanceId: string | null = null;
+  let activeCaptureHookIdentity: string | null = null;
   let precedingModelTurnIndex: number | null = null;
   let activeRequestObserverCount = 0;
   let previousTranscriptTrace:
@@ -8799,6 +8823,40 @@ async function runOne(input: {
     | undefined;
   const preCaptureObserverTraces: V1JPreCaptureObserverTrace[] = [];
   const preCaptureTranscriptGrowth: V1JPreCaptureTranscriptGrowth[] = [];
+  const recordProviderCallbackReachability = (
+    stage: V1JProviderCallbackStage,
+    fields: Partial<V1JProviderCallbackReachabilityEvent> = {},
+  ) => {
+    input.requestCapture?.onProviderCallbackReachabilityEvent?.({
+      stage,
+      entered: fields.entered ?? true,
+      completed: fields.completed ?? true,
+      invocationCount: fields.invocationCount ?? currentProviderPayloadTraceIndex,
+      runId: fields.runId ?? runId,
+      promptSubmissionIndex: fields.promptSubmissionIndex ?? promptSubmissionTraceIndex,
+      modelLoopIteration: fields.modelLoopIteration ?? currentProviderPayloadTraceIndex,
+      providerInstanceId: fields.providerInstanceId ?? activeProviderInstanceId,
+      hookIdentity: fields.hookIdentity ?? activeCaptureHookIdentity,
+      failureClass: fields.failureClass ?? null,
+    });
+  };
+  const providerInstanceFingerprint = (modelValue: unknown) => {
+    const modelRecord = asRecord(modelValue);
+    if (!modelRecord) {
+      return null;
+    }
+    const key = modelValue as object;
+    let identity = providerModelIdentities.get(key);
+    if (!identity) {
+      identity = `${nextProviderModelIdentity++}:${hashV1ICanonical({
+        provider: typeof modelRecord.provider === "string" ? modelRecord.provider : null,
+        model: typeof modelRecord.id === "string" ? modelRecord.id : null,
+      })}`;
+      providerModelIdentities.set(key, identity);
+    }
+    return identity;
+  };
+  const captureHookIdentity = `runOne:${runId}:onProviderRequestBeforeDispatch`;
   if (preflightDiagnostics) {
     recordPromptAwait("provider-selection-start", {
       provider: runProvider,
@@ -8821,6 +8879,19 @@ async function runOne(input: {
   const originalPromptMessageTrace = diagnostics.hooks.onPromptMessageTrace;
   diagnostics.hooks.onPromptMessageTrace = (event) => {
     originalPromptMessageTrace?.(event);
+    if (event.stage === "provider-onPayload-transform-start") {
+      recordProviderCallbackReachability("provider-transform-enter", {
+        entered: true,
+        completed: false,
+        invocationCount: event.callbackIndex ?? currentProviderPayloadTraceIndex,
+      });
+    } else if (event.stage === "provider-onPayload-transform-complete") {
+      recordProviderCallbackReachability("provider-transform-exit", {
+        entered: false,
+        completed: true,
+        invocationCount: event.callbackIndex ?? currentProviderPayloadTraceIndex,
+      });
+    }
     if (event.stage === "provider-message-conversion-input") {
       input.requestCapture?.onPreflightStage?.("provider-schema-materialization");
     }
@@ -9455,6 +9526,15 @@ async function runOne(input: {
   let requestObserverInvocationIndex = 0;
   diagnostics.hooks.onProviderRequest = async ({ payload, model }) => {
     const callbackIndex = ++requestObserverInvocationIndex;
+    const observerProviderFingerprint = providerInstanceFingerprint(model);
+    activeProviderInstanceId = observerProviderFingerprint;
+    recordProviderCallbackReachability("request-observer-enter", {
+      entered: true,
+      completed: false,
+      invocationCount: callbackIndex,
+      providerInstanceId: observerProviderFingerprint,
+      hookIdentity: captureHookIdentity,
+    });
     const callbackStartedAt = performance.now();
     const callbackJournal = input.requestCapture?.preflightDiagnostics;
     input.requestCapture?.onPreflightStage?.("request-observer");
@@ -9673,6 +9753,14 @@ async function runOne(input: {
         ),
       });
       activeRequestObserverCount = Math.max(0, activeRequestObserverCount - 1);
+      recordProviderCallbackReachability("request-observer-exit", {
+        entered: false,
+        completed: observerOutcome === "completed",
+        invocationCount: callbackIndex,
+        providerInstanceId: observerProviderFingerprint,
+        hookIdentity: captureHookIdentity,
+        failureClass: observerOutcome === "failed" ? "ProviderRequestObserverError" : null,
+      });
       callbackJournal?.record(
         `arm-${callbackJournal.arm.toLowerCase()}-pre-capture-reentry-classification`,
         {
@@ -9749,14 +9837,51 @@ async function runOne(input: {
   };
   const diagnosticsProviderRequestBeforeDispatch =
     diagnostics.hooks.onProviderRequestBeforeDispatch;
+  activeCaptureHookIdentity = captureHookIdentity;
+  recordProviderCallbackReachability("provider-capture-hook-resolved", {
+    entered: true,
+    completed: true,
+    invocationCount: 0,
+    providerInstanceId: null,
+    hookIdentity: captureHookIdentity,
+  });
   input.requestCapture?.onPreflightStage?.("capture-hook-installation");
   diagnostics.hooks.onProviderRequestBeforeDispatch = async ({ payload, model }) => {
-    await diagnosticsProviderRequestBeforeDispatch?.({ payload, model });
+    const captureHookInvocation = ++providerBoundCaptureInvocationIndex;
+    const callbackProviderFingerprint = providerInstanceFingerprint(model);
+    activeProviderInstanceId = callbackProviderFingerprint;
+    recordProviderCallbackReachability("provider-capture-hook-invoked", {
+      entered: true,
+      completed: false,
+      invocationCount: captureHookInvocation,
+      providerInstanceId: callbackProviderFingerprint,
+      hookIdentity: captureHookIdentity,
+    });
+    try {
+      await diagnosticsProviderRequestBeforeDispatch?.({ payload, model });
+    } catch (error) {
+      recordProviderCallbackReachability("provider-capture-hook-return", {
+        entered: false,
+        completed: false,
+        invocationCount: captureHookInvocation,
+        providerInstanceId: callbackProviderFingerprint,
+        hookIdentity: captureHookIdentity,
+        failureClass: error instanceof Error ? error.name : typeof error,
+      });
+      throw error;
+    }
+    recordProviderCallbackReachability("provider-capture-hook-return", {
+      entered: false,
+      completed: true,
+      invocationCount: captureHookInvocation,
+      providerInstanceId: callbackProviderFingerprint,
+      hookIdentity: captureHookIdentity,
+    });
     if (input.requestCapture?.stopAfterProviderBoundCapture !== true) {
       return;
     }
 
-    const callbackIndex = ++providerBoundCaptureInvocationIndex;
+    const callbackIndex = captureHookInvocation;
     const journal = input.requestCapture.preflightDiagnostics;
     const rawBody = JSON.stringify(payload);
     if (typeof rawBody !== "string" || !payload || typeof payload !== "object") {
@@ -9792,7 +9917,19 @@ async function runOne(input: {
       providerInvocationCount,
     });
     input.requestCapture.onPreflightStage?.("preflight-stop", true);
-    throw new V1IProviderRequestCapturedError();
+    const captureStopSentinel = new V1IProviderRequestCapturedError();
+    recordProviderCallbackReachability("capture-stop-sentinel-created", {
+      invocationCount: callbackIndex,
+      providerInstanceId: activeProviderInstanceId,
+      hookIdentity: activeCaptureHookIdentity,
+    });
+    recordProviderCallbackReachability("capture-stop-sentinel-thrown", {
+      invocationCount: callbackIndex,
+      providerInstanceId: activeProviderInstanceId,
+      hookIdentity: activeCaptureHookIdentity,
+      failureClass: captureStopSentinel.name,
+    });
+    throw captureStopSentinel;
   };
   input.requestCapture?.onPreflightStage?.("capture-hook-installation", true);
   const diagnosticsProviderResponse = diagnostics.hooks.onProviderResponse;
@@ -9897,6 +10034,14 @@ async function runOne(input: {
         providerCallbackSeen: adapterResponseIndex > 0,
         providerDispatchSeen: providerInvocationCount > 0,
       });
+      if (resultKind === "synthetic-abort-result") {
+        recordProviderCallbackReachability("createFailureMessage-observed", {
+          invocationCount: modelTurnIndex + 1,
+          providerInstanceId: activeProviderInstanceId,
+          hookIdentity: activeCaptureHookIdentity,
+          failureClass: "SyntheticAbortResult",
+        });
+      }
       const resultEventIndex = ++modelResultEventIndex;
       if (assistantJournal) {
         recordV1JModelResultProvenance({

@@ -11,6 +11,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   assertV1JFormalStateEmpty,
   assertV1JPreflightPairComplete,
+  assertV1JPreflightCaptureOnly,
   assertV1JSmokeProvenance,
   buildV1JSmokeSchedule,
   createV1JArmCOnlyPreflightDiagnosticJournal,
@@ -69,6 +70,11 @@ import {
   V1J_ADAPTER_DIFFERENTIAL_PREFIX,
   V1J_ADAPTER_DIFFERENTIAL_RUN_FLAG,
 } from "../../../test/helpers/agents/model-choice-adapter-differential.js";
+import {
+  createV1JPreflightStageLedger,
+  V1J_PREFLIGHT_STAGE_NAMES,
+  type V1JPreflightStageName,
+} from "../../../test/helpers/agents/model-choice-preflight-stage-diagnostics.js";
 import { recordV1JPromptAwaitDiagnostic } from "../../../test/helpers/agents/model-choice-prompt-await-diagnostic.js";
 import {
   buildV1JNormalizationCauseAttribution,
@@ -3092,6 +3098,17 @@ async function runV1JProviderCapturePreflight(mode: "body-export" | "materializa
     pid: process.pid,
   });
   let preflightStage = "lmstudio-discovery";
+  const stageLedger = createV1JPreflightStageLedger({
+    record: (event, details) => journal.record(event, details),
+  });
+  const enterStage = (stage: V1JPreflightStageName) => {
+    preflightStage = stage;
+    stageLedger.enter(stage);
+  };
+  const completeStage = (stage: V1JPreflightStageName) => {
+    stageLedger.complete(stage);
+  };
+  enterStage("schema-preflight");
   let providerBoundCaptureCount = 0;
   let requestSummary: ReturnType<typeof summarizeV1JRawRepeatabilityRequest> | undefined;
   let requestIdentities:
@@ -3110,7 +3127,6 @@ async function runV1JProviderCapturePreflight(mode: "body-export" | "materializa
   const providerCaptureStages: string[] = [];
   const callbackStageStartedAt = new Map<string, string>();
   const recordCaptureStage = (event: V1JProviderControlEvent) => {
-    preflightStage = event.event;
     providerCaptureStages.push(event.event);
     const observedAt = new Date().toISOString();
     const stageName = event.event.replace(
@@ -3187,21 +3203,37 @@ async function runV1JProviderCapturePreflight(mode: "body-export" | "materializa
       toolExecutions: 0,
     });
     journal.record("lmstudio-discovery-start");
+    enterStage("schema-discovery");
+    const discoveryAbortController = new AbortController();
     await runV1JPreflightWithHeartbeat({
-      operation: () => assertLiveModelAvailable(),
+      operation: () => assertLiveModelAvailable(discoveryAbortController.signal),
       stage: () => preflightStage,
       record: (event) => journal.record(event.event, event.details),
+      timeoutMsByStage: { "schema-discovery": 30_000 },
+      lastCompletedStage: () =>
+        stageLedger.snapshot().findLast((stage) => stage.completed)?.stage_name ?? null,
+      onStageTimeout: (error) => discoveryAbortController.abort(error),
       heartbeat: ({ stage, elapsedMs }) =>
         process.stdout.write(
           `v1J capture preflight waiting stage=${stage} elapsedMs=${elapsedMs}\n`,
         ),
     });
     journal.record("lmstudio-discovery-complete");
-    preflightStage = "prepared-runtime";
+    completeStage("schema-discovery");
+    enterStage("prepared-runtime");
     journal.record("prepared-runtime-start");
+    const preflightStopController = new AbortController();
     const surface = await runV1JPreflightWithHeartbeat({
       operation: () =>
         captureV1JPreflightSurface(protocol, "A", head, journal, {
+          preflightStopController,
+          onStage: (stage, completed) => {
+            if (completed) {
+              completeStage(stage);
+            } else {
+              enterStage(stage);
+            }
+          },
           benchmarkCase: v1jSmokeBenchmark(cell),
           prepareWorkspace: (workspaceDir) =>
             fs.writeFileSync(path.join(workspaceDir, "smoke-reference.txt"), "smoke-token-47\n", {
@@ -3210,13 +3242,16 @@ async function runV1JProviderCapturePreflight(mode: "body-export" | "materializa
             }),
           onCheckpoint: (checkpoint) => {
             if (checkpoint.stage === "client-preparation-completed") {
-              preflightStage = "provider-bound-capture";
+              completeStage("prepared-runtime");
+              preflightStage = "prompt-preflight";
               journal.record("prepared-runtime-complete", { checkpoint: checkpoint.stage });
-              journal.record("provider-bound-capture-start");
+              journal.record("prompt-preflight-start");
             }
           },
           onProgress: (stage) => {
-            preflightStage = stage;
+            if (stage === "schema-preflight-validation-start") {
+              preflightStage = "schema-preflight-validation";
+            }
             journal.record("preflight-progress", { stage });
           },
           onProviderCaptureStage: recordCaptureStage,
@@ -3428,15 +3463,32 @@ async function runV1JProviderCapturePreflight(mode: "body-export" | "materializa
         }),
       stage: () => preflightStage,
       record: (event) => journal.record(event.event, event.details),
+      timeoutMsByStage: {
+        "authorized-tool-surface": 30_000,
+        "prepared-runtime": 150_000,
+        "schema-preflight-validation": 30_000,
+        "provider-bound-capture-hook": 60_000,
+        "prompt-preflight": 60_000,
+        "prompt-submission": 60_000,
+        "request-observer": 30_000,
+        "provider-bound-callback": 30_000,
+        "provider-schema-materialization": 30_000,
+      },
+      lastCompletedStage: () =>
+        stageLedger.snapshot().findLast((stage) => stage.completed)?.stage_name ?? null,
+      onStageTimeout: (error) => preflightStopController.abort(error),
       heartbeat: ({ stage, elapsedMs }) =>
         process.stdout.write(
           `v1J capture preflight waiting stage=${stage} elapsedMs=${elapsedMs}\n`,
         ),
     });
     const counters = journal.counters();
+    assertV1JPreflightCaptureOnly(counters);
     if (
       !requestSummary ||
       providerBoundCaptureCount !== 1 ||
+      counters.providerBoundCaptureCallbacks !== 1 ||
+      counters.promptSubmissions < 1 ||
       counters.providerDispatchAttempts !== 0 ||
       counters.providerCallbackInvocations !== 0 ||
       counters.modelRequestCounter !== 0 ||
@@ -3487,6 +3539,7 @@ async function runV1JProviderCapturePreflight(mode: "body-export" | "materializa
       toolExecutions: 0,
       formalStateTouched: false,
       normalSmokeStateTouched: false,
+      preflightStages: stageLedger.snapshot(),
     });
     process.stdout.write(
       `${JSON.stringify({
@@ -3516,9 +3569,17 @@ async function runV1JProviderCapturePreflight(mode: "body-export" | "materializa
         formalStateTouched: false,
         normalSmokeStateTouched: false,
         artifactPath: journal.filePath,
+        preflightStages: stageLedger.snapshot(),
       })}\n`,
     );
   } catch (error) {
+    const activeStage = preflightStage;
+    if (V1J_PREFLIGHT_STAGE_NAMES.includes(activeStage as V1JPreflightStageName)) {
+      stageLedger.fail(activeStage as V1JPreflightStageName, error);
+    }
+    if (activeStage !== "schema-preflight") {
+      stageLedger.fail("schema-preflight", error);
+    }
     try {
       recordCaptureStage({
         event: "outer-catch-enter",
@@ -3531,7 +3592,14 @@ async function runV1JProviderCapturePreflight(mode: "body-export" | "materializa
       journal.record("provider-capture-preflight-failed", {
         errorName: error instanceof Error ? error.name : "NonErrorThrown",
         lastCheckpoint: preflightStage,
+        preflightStages: stageLedger.snapshot(),
+        counters: journal.counters(),
       });
+      process.stdout.write(
+        `v1J preflight outcome=failed lastCompletedStage=${
+          stageLedger.snapshot().findLast((stage) => stage.completed)?.stage_name ?? "none"
+        } failureClass=${error instanceof Error ? error.name : typeof error}\n`,
+      );
     } catch {
       // A failed diagnostic sink must not replace the callback's original failure.
     }
@@ -3943,8 +4011,11 @@ async function captureV1JPreflightSurface(
   options?: {
     benchmarkCase?: ToolRankingBenchmarkCase;
     prepareWorkspace?: (workspaceDir: string) => void;
+    preflightStopController?: AbortController;
+    onStage?: (stage: V1JPreflightStageName, completed: boolean) => void;
     onCapturedRequest?: (request: CapturedModelRequest) => void;
     onProviderCaptureStage?: (event: V1JProviderControlEvent) => void;
+    onPreflightStage?: (stage: V1JPreflightStageName, completed?: boolean) => void;
     onProviderBoundRequest?: (input: {
       request: CapturedModelRequest;
       rawBody: string;
@@ -3965,7 +4036,9 @@ async function captureV1JPreflightSurface(
       protocol.design.cells.find((entry) => entry.stratum === "TOOL_REQUIRED")?.caseId ?? "",
     );
   const workspaceDir = fs.mkdtempSync(path.join(os.tmpdir(), `v1j-preflight-${arm}-`));
-  const preflightStopController = new AbortController();
+  const preflightStopController = options?.preflightStopController ?? new AbortController();
+  const stage = (name: V1JPreflightStageName, completed = false) =>
+    options?.onStage?.(name, completed);
   if (preflightDiagnostics) {
     recordV1JPromptAwaitDiagnostic(preflightDiagnostics, "abort-signal-created", {
       sourceStage: "captureV1JPreflightSurface preflightStopController",
@@ -4019,11 +4092,16 @@ async function captureV1JPreflightSurface(
         stopAfterProviderBoundCapture: true,
         ...(preflightDiagnostics ? { preflightDiagnostics } : {}),
         onProviderCaptureStage: options?.onProviderCaptureStage,
+        onPreflightStage: (stageName) => stage(stageName),
         onTimestampProvenance: options?.onTimestampProvenance,
         capturePromptInstruction: v1jInstructionForArm(protocol, arm),
-        onAuthorizedToolsCaptured: (tools) =>
-          authorizedTools.splice(0, authorizedTools.length, ...tools),
+        onAuthorizedToolsCaptured: (tools) => {
+          stage("schema-discovery", true);
+          authorizedTools.splice(0, authorizedTools.length, ...tools);
+          stage("authorized-tool-surface", true);
+        },
         onRequestCaptured: (request) => {
+          stage("provider-schema-materialization", true);
           options?.onProviderCaptureStage?.({
             event: "capture-record-build-start",
             details: {
@@ -4113,12 +4191,16 @@ async function captureV1JPreflightSurface(
       },
       onCheckpoint: (checkpoint) => {
         options?.onCheckpoint?.(checkpoint);
+        if (checkpoint.stage === "attempt-tool-catalog-entered") {
+          stage("schema-discovery");
+        }
         if (
           preflightDiagnostics &&
           !runtimeReadyRecorded &&
           checkpoint.stage === "client-preparation-completed"
         ) {
           runtimeReadyRecorded = true;
+          stage("prepared-runtime", true);
           preflightDiagnostics.record(`arm-${arm.toLowerCase()}-runtime-ready`, {
             sourceCheckpoint: checkpoint.stage,
           });
@@ -4201,6 +4283,7 @@ async function captureV1JPreflightSurface(
         preflightStopSignalRaised: preflightDiagnostics?.counters().preflightStopSignalRaised,
         preflightStopSignalCaught: preflightDiagnostics?.counters().preflightStopSignalCaught,
         preflightCompleted: preflightDiagnostics?.counters().preflightCompleted,
+        preflightCounters: preflightDiagnostics?.counters(),
         observationSummary,
         requestBodyDifferingPaths,
         predicates,
@@ -4244,6 +4327,7 @@ async function captureV1JPreflightSurface(
     surface: actual,
   });
   options?.onProgress?.("schema-preflight-validation-complete");
+  stage("schema-preflight", true);
   preflightDiagnostics?.record(`arm-${arm.toLowerCase()}-schema-validated`, {
     requestObserverCallSite: "runOne.diagnostics.hooks.onProviderRequest",
   });
@@ -5356,7 +5440,12 @@ describe("v1J schema-capture dispatch guard", () => {
         );
       } else {
         expect(preflightError).toBeInstanceOf(Error);
-        expect((preflightError as Error).message).toMatch(/frozen exact set/);
+        expect((preflightError as Error).message).toContain(
+          '"captureOnlyHasNoToolOrModelResults":false',
+        );
+        expect(journal.counters().modelResultsObserved).toBeGreaterThan(0);
+        expect(journal.counters().toolExecutions).toBe(0);
+        expect(journal.counters().toolResultsProduced).toBe(0);
       }
       expect(journal.counters()).toMatchObject({
         requestObserverInvocations: 1,
@@ -5383,7 +5472,9 @@ describe("v1J schema-capture dispatch guard", () => {
       expect(events).toContain("arm-c-request-observer-enter");
       expect(events.includes("arm-c-schema-validated")).toBe(acceptedCanonicalSurface);
       expect(events.includes("arm-c-preflight-complete")).toBe(acceptedCanonicalSurface);
-      expect(events).toContain("arm-c-preflight-observations-equivalent");
+      expect(events.includes("arm-c-preflight-observations-equivalent")).toBe(
+        acceptedCanonicalSurface,
+      );
       expect(events).toContain("preflight-stop-signal-raised");
       expect(events).toContain("arm-c-preflight-stop-signal-caught");
       expect(events).toContain("observer-return-1");
@@ -5423,7 +5514,7 @@ describe("v1J schema-capture dispatch guard", () => {
         protocol.arms.C.experimentalInstruction,
       );
       expect(rows.find((row) => row.event === "preflight-stop-assertion-evaluated")).toMatchObject({
-        passed: true,
+        passed: false,
         requestBodyDifferingPaths: [],
         observationSummary: {
           rawCallbackCount: 1,
@@ -5436,6 +5527,7 @@ describe("v1J schema-capture dispatch guard", () => {
           allCapturedObservationsEquivalent: true,
           uniqueCanonicalObservationIsOne: true,
           providerCallbackCountIsZero: true,
+          captureOnlyHasNoToolOrModelResults: false,
           dispatchAttemptsIsZero: true,
           modelRequestCountIsZero: true,
         },
@@ -5643,13 +5735,14 @@ describe("v1J schema-capture dispatch guard", () => {
         ),
       );
       expect(rows.find((row) => row.event === "preflight-stop-assertion-evaluated")).toMatchObject({
-        passed: true,
+        passed: false,
         predicates: {
           requestHookInvocationsAtLeastOne: true,
           requestObserverInvocationsAtLeastOne: true,
           allCapturedObservationsEquivalent: true,
           uniqueCanonicalObservationIsOne: true,
           providerCallbackCountIsZero: true,
+          captureOnlyHasNoToolOrModelResults: false,
           dispatchAttemptsIsZero: true,
           modelRequestCountIsZero: true,
           stopSignalsMatchCapturedRequests: true,
@@ -8307,6 +8400,7 @@ async function runOne(input: {
       requestIndex: number;
       dispatchOrdinal: number;
     }) => void | Promise<void>;
+    onPreflightStage?: (stage: V1JPreflightStageName, completed?: boolean) => void;
     onTimestampProvenance?: (result: V1JTimestampProvenanceResult) => void;
     onPreflightStopRaised?: () => void;
     onDelegatedRequest?: () => void;
@@ -8395,11 +8489,20 @@ async function runOne(input: {
   ) => {
     if (event === "provider-bound-callback-enter") {
       preDispatchCallbackInvoked = true;
+      input.requestCapture?.preflightDiagnostics?.increment(
+        "providerBoundCaptureCallbacks",
+        "provider-bound-capture-callback-enter",
+      );
+      input.requestCapture?.onPreflightStage?.("provider-bound-callback");
       recordPromptAwait("pre-dispatch-callback-invoked", {
         sourceStage: event,
         preDispatchCallbackExpected,
         preDispatchCallbackRegistered,
       });
+    } else if (event === "provider-bound-request-captured") {
+      input.requestCapture?.onPreflightStage?.("provider-bound-callback", true);
+    } else if (event === "preflight-stop-signal-raised") {
+      input.requestCapture?.onPreflightStage?.("preflight-stop", true);
     }
     input.requestCapture?.onProviderCaptureStage?.({
       event,
@@ -8469,6 +8572,12 @@ async function runOne(input: {
   const originalPromptMessageTrace = diagnostics.hooks.onPromptMessageTrace;
   diagnostics.hooks.onPromptMessageTrace = (event) => {
     originalPromptMessageTrace?.(event);
+    if (event.stage === "provider-message-conversion-input") {
+      input.requestCapture?.onPreflightStage?.("provider-schema-materialization");
+    }
+    if (event.stage === "provider-request-object-constructed") {
+      input.requestCapture?.onPreflightStage?.("provider-schema-materialization", true);
+    }
     if (input.requestCapture?.onTimestampProvenance) {
       if (event.stage === "agent-llm-boundary-input") {
         let messages: readonly unknown[] | undefined;
@@ -8884,6 +8993,15 @@ async function runOne(input: {
   }
   const originalModelLoopSubstage = diagnostics.hooks.onModelLoopSubstage;
   diagnostics.hooks.onModelLoopSubstage = (event) => {
+    if (event.stage === "active-session-prompt-entered") {
+      input.requestCapture?.preflightDiagnostics?.increment(
+        "promptSubmissions",
+        "prompt-submission-enter",
+      );
+      input.requestCapture?.onPreflightStage?.("prompt-submission");
+    } else {
+      input.requestCapture?.onPreflightStage?.("prompt-submission", true);
+    }
     const awaitStage =
       event.stage === "active-session-prompt-entered"
         ? "model-loop-await-start"
@@ -9090,6 +9208,16 @@ async function runOne(input: {
     const callbackIndex = ++requestObserverInvocationIndex;
     const callbackStartedAt = performance.now();
     const callbackJournal = input.requestCapture?.preflightDiagnostics;
+    input.requestCapture?.onPreflightStage?.("request-observer");
+    callbackJournal?.increment(
+      "requestObserverInvocations",
+      `arm-${callbackJournal.arm.toLowerCase()}-request-observer-enter`,
+      {
+        invocationIndex: callbackIndex,
+        providerRequestPhase: "request-observer-enter",
+        callSite: "runOne.diagnostics.hooks.onProviderRequest",
+      },
+    );
     const nestedObserverReentry = activeRequestObserverCount > 0;
     activeRequestObserverCount += 1;
     if (callbackIndex === 2) {
@@ -9217,15 +9345,6 @@ async function runOne(input: {
     if (!stopAtProviderBoundPayload) {
       capture.recordProviderRequest(request);
     }
-    callbackJournal?.increment(
-      "requestObserverInvocations",
-      `arm-${callbackJournal.arm.toLowerCase()}-request-observer-enter`,
-      {
-        invocationIndex: callbackIndex,
-        providerRequestPhase: "request-observer-enter",
-        callSite: "runOne.diagnostics.hooks.onProviderRequest",
-      },
-    );
     if (!stopAtProviderBoundPayload) {
       input.requestCapture?.onRequestCaptured?.(request);
     }
@@ -9351,6 +9470,7 @@ async function runOne(input: {
         sourceStage: "runOne.diagnostics.hooks.onProviderRequest finally",
       });
     }
+    input.requestCapture?.onPreflightStage?.("request-observer", true);
     if (input.requestCapture?.stopAfterCapture) {
       callbackJournal?.increment(
         "preflightStopSignalRaised",
@@ -9380,6 +9500,7 @@ async function runOne(input: {
   };
   const diagnosticsProviderRequestBeforeDispatch =
     diagnostics.hooks.onProviderRequestBeforeDispatch;
+  input.requestCapture?.onPreflightStage?.("provider-bound-capture-hook");
   diagnostics.hooks.onProviderRequestBeforeDispatch = async ({ payload, model }) => {
     await diagnosticsProviderRequestBeforeDispatch?.({ payload, model });
     if (input.requestCapture?.stopAfterProviderBoundCapture !== true) {
@@ -9400,6 +9521,7 @@ async function runOne(input: {
       rawBodySha256,
       providerInvocationCount,
     });
+    input.requestCapture.onPreflightStage?.("preflight-stop");
     const finalRequest: CapturedModelRequest = {
       body: payload as Record<string, unknown>,
       url: "provider-adapter",
@@ -9420,8 +9542,10 @@ async function runOne(input: {
       signalName: V1IProviderRequestCapturedError.name,
       providerInvocationCount,
     });
+    input.requestCapture.onPreflightStage?.("preflight-stop", true);
     throw new V1IProviderRequestCapturedError();
   };
+  input.requestCapture?.onPreflightStage?.("provider-bound-capture-hook", true);
   const diagnosticsProviderResponse = diagnostics.hooks.onProviderResponse;
   let adapterResponseIndex = 0;
   diagnostics.hooks.onProviderResponse = async ({ response, model }) => {
@@ -9430,6 +9554,10 @@ async function runOne(input: {
       input.requestCapture?.stopAfterCapture === true ||
       input.requestCapture?.stopAfterProviderBoundCapture === true;
     if (captureOnly) {
+      input.requestCapture?.preflightDiagnostics?.increment(
+        "modelResultsObserved",
+        "unexpected-provider-result-observed",
+      );
       const classification =
         providerInvocationCount === 0
           ? "UNACCOUNTED_MODEL_RESULT_SOURCE"
@@ -9468,6 +9596,9 @@ async function runOne(input: {
     diagnostics.hooks,
     (message, modelTurnIndex) => {
       const assistantJournal = input.requestCapture?.preflightDiagnostics;
+      assistantJournal?.increment("modelResultsObserved", "assistant-model-result-observed", {
+        modelTurnIndex,
+      });
       const normalizedToolCallCount = message.content.filter(
         (block) => block.type === "toolCall",
       ).length;
@@ -9696,6 +9827,16 @@ async function runOne(input: {
             },
           },
           ...(runAbortSignal ? { abortSignal: runAbortSignal } : {}),
+          onExecutionPhase: (phase) => {
+            if (phase.phase === "tool_execution_started") {
+              input.requestCapture?.preflightDiagnostics?.increment(
+                "toolExecutions",
+                "tool-execution-start-observed",
+                { tool: phase.tool ?? null },
+              );
+            }
+            params.onExecutionPhase?.(phase);
+          },
           onEmbeddedReplayFact: (fact) => {
             if (fact.kind === "ranking") {
               observedRanking = fact;
@@ -9715,6 +9856,11 @@ async function runOne(input: {
             originalFactListener?.(fact);
           },
           onAgentToolResult: (event) => {
+            input.requestCapture?.preflightDiagnostics?.increment(
+              "toolResultsProduced",
+              "tool-result-produced",
+              { isError: event.isError },
+            );
             observedFailure ||= event.isError;
             input.requestCapture?.preflightDiagnostics?.record("tool-result-produced", {
               runOneAttemptId: runId,

@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { V1JPreflightStageTimeoutError } from "./model-choice-preflight-stage-diagnostics.js";
 import {
   runV1JProviderTransportControls,
   V1J_PROVIDER_CONTROL_MODEL_CONFIG_SHA256,
@@ -316,26 +317,64 @@ export async function runV1JPreflightWithHeartbeat<T>(input: {
   heartbeat?: (event: { stage: string; elapsedMs: number }) => void;
   heartbeatMs?: number;
   now?: () => number;
+  timeoutMsByStage?: Readonly<Record<string, number>>;
+  lastCompletedStage?: () => string | null;
+  onStageTimeout?: (error: V1JPreflightStageTimeoutError) => void;
 }): Promise<T> {
   const now = input.now ?? Date.now;
   const startedAt = now();
   let currentStage = input.stage();
   let stageStartedAt = startedAt;
-  const timer = setInterval(() => {
-    const nextStage = input.stage();
-    if (nextStage !== currentStage) {
-      currentStage = nextStage;
-      stageStartedAt = now();
-    }
-    const event = {
-      stage: currentStage,
-      elapsedMs: Math.max(0, now() - stageStartedAt),
-    };
-    input.record({ event: "preflight-heartbeat", details: event });
-    input.heartbeat?.(event);
-  }, input.heartbeatMs ?? 25_000);
+  let lastHeartbeatAt = startedAt;
+  let lastCompletedStage: string | null = null;
+  let timeoutError: V1JPreflightStageTimeoutError | undefined;
+  let rejectTimeout!: (error: Error) => void;
+  const timeoutPromise = new Promise<never>((_resolve, reject) => {
+    rejectTimeout = reject;
+  });
+  const timer = setInterval(
+    () => {
+      const nextStage = input.stage();
+      if (nextStage !== currentStage) {
+        lastCompletedStage = currentStage;
+        currentStage = nextStage;
+        stageStartedAt = now();
+      }
+      const elapsedMs = Math.max(0, now() - stageStartedAt);
+      const heartbeatMs = input.heartbeatMs ?? 25_000;
+      if (now() - lastHeartbeatAt >= heartbeatMs) {
+        const event = { stage: currentStage, elapsedMs };
+        lastHeartbeatAt = now();
+        input.record({ event: "preflight-heartbeat", details: event });
+        input.heartbeat?.(event);
+      }
+      const timeoutMs = input.timeoutMsByStage?.[currentStage];
+      if (timeoutMs !== undefined && elapsedMs >= timeoutMs && !timeoutError) {
+        timeoutError = new V1JPreflightStageTimeoutError(
+          currentStage,
+          timeoutMs,
+          input.lastCompletedStage?.() ?? lastCompletedStage,
+        );
+        input.record({
+          event: "preflight-stage-timeout",
+          details: {
+            stage_name: currentStage,
+            entered: true,
+            completed: false,
+            elapsed_ms: elapsedMs,
+            failure_class: timeoutError.name,
+            timeout_ms: timeoutMs,
+            last_completed_stage: timeoutError.lastCompletedStage,
+          },
+        });
+        input.onStageTimeout?.(timeoutError);
+        rejectTimeout(timeoutError);
+      }
+    },
+    Math.min(input.heartbeatMs ?? 25_000, 1_000),
+  );
   try {
-    return await input.operation();
+    return await Promise.race([input.operation(), timeoutPromise]);
   } finally {
     clearInterval(timer);
   }

@@ -53,7 +53,12 @@ export type V1JPreflightCounterName =
   | "schemaCaptureCompletes"
   | "preflightStopSignalRaised"
   | "preflightStopSignalCaught"
-  | "preflightCompleted";
+  | "preflightCompleted"
+  | "toolExecutions"
+  | "toolResultsProduced"
+  | "modelResultsObserved"
+  | "promptSubmissions"
+  | "providerBoundCaptureCallbacks";
 
 export type V1JPreflightCounters = Record<V1JPreflightCounterName, number>;
 
@@ -143,11 +148,28 @@ export function evaluateV1JPreflightStop(input: {
       input.counters.preflightStopSignalRaised === input.capturedRequestCount &&
       input.capturedRequestCount > 0,
     stopSignalCaught: input.counters.preflightStopSignalCaught === 1,
+    captureOnlyHasNoToolOrModelResults:
+      input.counters.toolExecutions === 0 &&
+      input.counters.toolResultsProduced === 0 &&
+      input.counters.modelResultsObserved === 0,
     schemaCaptureNotEntered:
       input.counters.schemaCaptureStarts === 0 && input.counters.schemaCaptureCompletes === 0,
     delegatedRequestCountIsZero: input.delegatedRequestCount === 0,
   };
   return { observationSummary, predicates };
+}
+
+export function assertV1JPreflightCaptureOnly(counters: V1JPreflightCounters): void {
+  const unexpected = {
+    toolExecutions: counters.toolExecutions,
+    toolResultsProduced: counters.toolResultsProduced,
+    modelResultsObserved: counters.modelResultsObserved,
+  };
+  if (Object.values(unexpected).some((count) => count !== 0)) {
+    throw new Error(
+      `v1J capture-only preflight observed execution/result activity: ${JSON.stringify(unexpected)}`,
+    );
+  }
 }
 
 export type V1JPreflightDiagnosticJournal = {
@@ -332,6 +354,11 @@ function createV1JPreflightDiagnosticJournalAtPath(
     preflightStopSignalRaised: 0,
     preflightStopSignalCaught: 0,
     preflightCompleted: 0,
+    toolExecutions: 0,
+    toolResultsProduced: 0,
+    modelResultsObserved: 0,
+    promptSubmissions: 0,
+    providerBoundCaptureCallbacks: 0,
   };
   let eventIndex = 0;
   let closed = false;

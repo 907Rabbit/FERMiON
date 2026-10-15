@@ -57,10 +57,50 @@ export type V1JPreflightCounterName =
   | "toolExecutions"
   | "toolResultsProduced"
   | "modelResultsObserved"
+  | "resultEventsObserved"
+  | "syntheticAbortResultsObserved"
   | "promptSubmissions"
   | "providerBoundCaptureCallbacks";
 
 export type V1JPreflightCounters = Record<V1JPreflightCounterName, number>;
+
+export type V1JModelResultKind =
+  | "provider-result"
+  | "synthetic-abort-result"
+  | "sentinel-result"
+  | "cached/local-result"
+  | "replayed-result"
+  | "other";
+
+export function classifyV1JModelResultSource(input: {
+  stopReason: string;
+  hasToolCall: boolean;
+  captureStopSignalRaised: boolean;
+  captureStopSignalName: string | null;
+  captureStopErrorMessageMatches: boolean;
+  providerRequestIdPresent: boolean;
+  providerCallbackSeen: boolean;
+  providerDispatchSeen: boolean;
+  // Set only by a source boundary that can authoritatively identify local/cache/replay production.
+  explicitSourceKind?: Exclude<
+    V1JModelResultKind,
+    "provider-result" | "synthetic-abort-result" | "other"
+  >;
+}): V1JModelResultKind {
+  if (
+    input.captureStopSignalRaised &&
+    input.captureStopSignalName === "V1IProviderRequestCapturedError" &&
+    input.captureStopErrorMessageMatches &&
+    !input.hasToolCall &&
+    (input.stopReason === "error" || input.stopReason === "aborted")
+  ) {
+    return "synthetic-abort-result";
+  }
+  if (input.providerRequestIdPresent && input.providerCallbackSeen && input.providerDispatchSeen) {
+    return "provider-result";
+  }
+  return input.explicitSourceKind ?? "other";
+}
 
 export type V1JPreflightRequestObservation = {
   arm: "A" | "C";
@@ -192,6 +232,27 @@ export type V1JPreflightDiagnosticJournal = {
   }) => Record<string, boolean>;
   close: () => void;
 };
+
+export function recordV1JModelResultProvenance(input: {
+  journal: Pick<V1JPreflightDiagnosticJournal, "increment">;
+  resultKind: V1JModelResultKind;
+  details: Record<string, unknown>;
+}): void {
+  input.journal.increment("resultEventsObserved", "model-result-provenance-classified", {
+    ...input.details,
+    resultKind: input.resultKind,
+  });
+  if (input.resultKind === "synthetic-abort-result") {
+    input.journal.increment("syntheticAbortResultsObserved", "synthetic-abort-result-observed", {
+      resultEventId: input.details.resultEventId,
+    });
+    return;
+  }
+  input.journal.increment("modelResultsObserved", "model-result-source-observed", {
+    resultEventId: input.details.resultEventId,
+    resultKind: input.resultKind,
+  });
+}
 
 /** Writes count-only smoke-preflight diagnostics outside both smoke and formal evidence. */
 export function createV1JPreflightDiagnosticJournal(input: {
@@ -357,6 +418,8 @@ function createV1JPreflightDiagnosticJournalAtPath(
     toolExecutions: 0,
     toolResultsProduced: 0,
     modelResultsObserved: 0,
+    resultEventsObserved: 0,
+    syntheticAbortResultsObserved: 0,
     promptSubmissions: 0,
     providerBoundCaptureCallbacks: 0,
   };

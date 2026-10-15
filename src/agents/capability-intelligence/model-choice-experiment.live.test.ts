@@ -14,10 +14,12 @@ import {
   assertV1JPreflightCaptureOnly,
   assertV1JSmokeProvenance,
   buildV1JSmokeSchedule,
+  classifyV1JModelResultSource,
   createV1JArmCOnlyPreflightDiagnosticJournal,
   createV1JPreflightDiagnosticJournal,
   createV1JSmokeArtifactState,
   finalizeV1JSmokeArtifacts,
+  recordV1JModelResultProvenance,
   resolveV1JSmokeRoot,
   runV1JArmCPreflightOnly,
   runV1JSmokeSchedule,
@@ -5408,7 +5410,7 @@ describe("v1J schema-capture dispatch guard", () => {
     }
   });
 
-  it("keeps Arm C preflight closed when its offline runtime fixture drifts", async () => {
+  it("keeps Arm C preflight closed when the offline runtime surface drifts", async () => {
     const protocol = readV1JPreregistration();
     const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), "v1j-preflight-path-test-"));
     const cwd = vi.spyOn(process, "cwd").mockReturnValue(repoRoot);
@@ -5441,11 +5443,8 @@ describe("v1J schema-capture dispatch guard", () => {
       } else {
         expect(preflightError).toBeInstanceOf(Error);
         expect((preflightError as Error).message).toContain(
-          '"captureOnlyHasNoToolOrModelResults":false',
+          "v1J preflight runtime tool names differ from the frozen exact set",
         );
-        expect(journal.counters().modelResultsObserved).toBeGreaterThan(0);
-        expect(journal.counters().toolExecutions).toBe(0);
-        expect(journal.counters().toolResultsProduced).toBe(0);
       }
       expect(journal.counters()).toMatchObject({
         requestObserverInvocations: 1,
@@ -5454,6 +5453,9 @@ describe("v1J schema-capture dispatch guard", () => {
         providerCallbackInvocations: 0,
         providerDispatchAttempts: 0,
         modelRequestCounter: 0,
+        modelResultsObserved: 0,
+        resultEventsObserved: 1,
+        syntheticAbortResultsObserved: 1,
         preflightStopSignalRaised: 1,
         preflightStopSignalCaught: 1,
         preflightCompleted: acceptedCanonicalSurface ? 1 : 0,
@@ -5467,14 +5469,28 @@ describe("v1J schema-capture dispatch guard", () => {
         .split("\n")
         .map((line) => JSON.parse(line) as Record<string, unknown>);
       const events = rows.map((row) => row.event);
+      expect(rows.find((row) => row.event === "model-result-provenance-classified")).toMatchObject({
+        resultKind: "synthetic-abort-result",
+        eventSourceFunction: "createFailureMessage",
+        eventSourceComponent: "packages/agent-core/src/turn-interruption.ts",
+        runId: expect.any(String),
+        promptSubmissionIndex: expect.any(Number),
+        modelLoopIteration: expect.any(Number),
+        stopReason: expect.stringMatching(/^(error|aborted)$/),
+        hasAssistantMessage: true,
+        hasToolCall: false,
+        providerRequestIdPresent: false,
+        providerCallbackSeen: false,
+        providerDispatchSeen: false,
+        modelRequestCounterAtEvent: 0,
+        resultCreatedRelativeToCaptureHook: "after-capture-hook",
+      });
       expect(events).toContain("arm-c-preflight-start");
       expect(events).toContain("arm-c-runtime-ready");
       expect(events).toContain("arm-c-request-observer-enter");
       expect(events.includes("arm-c-schema-validated")).toBe(acceptedCanonicalSurface);
       expect(events.includes("arm-c-preflight-complete")).toBe(acceptedCanonicalSurface);
-      expect(events.includes("arm-c-preflight-observations-equivalent")).toBe(
-        acceptedCanonicalSurface,
-      );
+      expect(events).toContain("arm-c-preflight-observations-equivalent");
       expect(events).toContain("preflight-stop-signal-raised");
       expect(events).toContain("arm-c-preflight-stop-signal-caught");
       expect(events).toContain("observer-return-1");
@@ -5514,7 +5530,7 @@ describe("v1J schema-capture dispatch guard", () => {
         protocol.arms.C.experimentalInstruction,
       );
       expect(rows.find((row) => row.event === "preflight-stop-assertion-evaluated")).toMatchObject({
-        passed: false,
+        passed: true,
         requestBodyDifferingPaths: [],
         observationSummary: {
           rawCallbackCount: 1,
@@ -5527,7 +5543,7 @@ describe("v1J schema-capture dispatch guard", () => {
           allCapturedObservationsEquivalent: true,
           uniqueCanonicalObservationIsOne: true,
           providerCallbackCountIsZero: true,
-          captureOnlyHasNoToolOrModelResults: false,
+          captureOnlyHasNoToolOrModelResults: true,
           dispatchAttemptsIsZero: true,
           modelRequestCountIsZero: true,
         },
@@ -5735,14 +5751,14 @@ describe("v1J schema-capture dispatch guard", () => {
         ),
       );
       expect(rows.find((row) => row.event === "preflight-stop-assertion-evaluated")).toMatchObject({
-        passed: false,
+        passed: true,
         predicates: {
           requestHookInvocationsAtLeastOne: true,
           requestObserverInvocationsAtLeastOne: true,
           allCapturedObservationsEquivalent: true,
           uniqueCanonicalObservationIsOne: true,
           providerCallbackCountIsZero: true,
-          captureOnlyHasNoToolOrModelResults: false,
+          captureOnlyHasNoToolOrModelResults: true,
           dispatchAttemptsIsZero: true,
           modelRequestCountIsZero: true,
           stopSignalsMatchCapturedRequests: true,
@@ -6194,6 +6210,8 @@ describe("v1J schema-capture dispatch guard", () => {
         modelTurnIndex: 0,
         providerInvocationCount: 0,
         stopSignalRaised: false,
+        captureStopSignalName: null,
+        captureStopErrorMessageMatches: false,
         journal,
         captureOnly: true,
       }),
@@ -6225,10 +6243,16 @@ describe("v1J schema-capture dispatch guard", () => {
   it("recognizes only the local capture-stop error without treating it as a model result", () => {
     const record = vi.fn();
     const result = guardV1JPreflightAssistantResult({
-      message: { ...makeAssistantMessage([]), stopReason: "error" },
+      message: {
+        ...makeAssistantMessage([]),
+        stopReason: "error",
+        errorMessage: new V1IProviderRequestCapturedError().message,
+      },
       modelTurnIndex: 0,
       providerInvocationCount: 0,
       stopSignalRaised: true,
+      captureStopSignalName: V1IProviderRequestCapturedError.name,
+      captureStopErrorMessageMatches: true,
       journal: { record } as unknown as V1JPreflightDiagnosticJournal,
       captureOnly: true,
     });
@@ -6236,7 +6260,136 @@ describe("v1J schema-capture dispatch guard", () => {
     expect(result).toBe(true);
     expect(record).toHaveBeenCalledWith(
       "preflight-stop-assistant-error-observed",
-      expect.objectContaining({ providerInvocationCount: 0, stopReason: "error" }),
+      expect.objectContaining({
+        providerInvocationCount: 0,
+        stopReason: "error",
+        resultKind: "synthetic-abort-result",
+        producerFunction: "createFailureMessage",
+      }),
+    );
+  });
+
+  it("accounts synthetic, provider, cached, replayed, and unknown result sources distinctly", () => {
+    const base = {
+      stopReason: "error",
+      hasToolCall: false,
+      captureStopSignalRaised: false,
+      captureStopSignalName: null,
+      captureStopErrorMessageMatches: false,
+      providerRequestIdPresent: false,
+      providerCallbackSeen: false,
+      providerDispatchSeen: false,
+    } as const;
+    const syntheticKind = classifyV1JModelResultSource({
+      ...base,
+      captureStopSignalRaised: true,
+      captureStopSignalName: V1IProviderRequestCapturedError.name,
+      captureStopErrorMessageMatches: true,
+    });
+    const providerKind = classifyV1JModelResultSource({
+      ...base,
+      stopReason: "stop",
+      providerRequestIdPresent: true,
+      providerCallbackSeen: true,
+      providerDispatchSeen: true,
+    });
+    expect(syntheticKind).toBe("synthetic-abort-result");
+    expect(providerKind).toBe("provider-result");
+    expect(
+      classifyV1JModelResultSource({ ...base, explicitSourceKind: "cached/local-result" }),
+    ).toBe("cached/local-result");
+    expect(classifyV1JModelResultSource({ ...base, explicitSourceKind: "replayed-result" })).toBe(
+      "replayed-result",
+    );
+    expect(classifyV1JModelResultSource(base)).toBe("other");
+
+    const counters = {
+      resultEventsObserved: 0,
+      syntheticAbortResultsObserved: 0,
+      modelResultsObserved: 0,
+    };
+    const rows: Array<{ event: string; details?: Record<string, unknown> }> = [];
+    const journal = {
+      increment: (
+        counter: keyof typeof counters,
+        event: string,
+        details?: Record<string, unknown>,
+      ) => {
+        counters[counter] += 1;
+        rows.push({ event, details });
+      },
+    };
+    recordV1JModelResultProvenance({
+      journal,
+      resultKind: syntheticKind,
+      details: {
+        resultEventId: "offline-run:0",
+        eventSourceFunction: "createFailureMessage",
+        eventSourceComponent: "packages/agent-core/src/turn-interruption.ts",
+        runId: "offline-run",
+        promptSubmissionIndex: 1,
+        modelLoopIteration: 0,
+        stopReason: "aborted",
+        hasAssistantMessage: true,
+        hasToolCall: false,
+        providerRequestIdPresent: false,
+        providerCallbackSeen: false,
+        providerDispatchSeen: false,
+        modelRequestCounterAtEvent: 0,
+        resultCreatedRelativeToCaptureHook: "after-capture-hook",
+      },
+    });
+    expect(counters).toEqual({
+      resultEventsObserved: 1,
+      syntheticAbortResultsObserved: 1,
+      modelResultsObserved: 0,
+    });
+    expect(rows[0]).toMatchObject({
+      event: "model-result-provenance-classified",
+      details: {
+        resultKind: "synthetic-abort-result",
+        eventSourceFunction: "createFailureMessage",
+        stopReason: "aborted",
+      },
+    });
+    expect(JSON.stringify(rows)).not.toMatch(/assistant content|prompt text|response text/i);
+  });
+
+  it("fails closed when an error assistant is not the exact local capture-stop result", () => {
+    expect(() =>
+      guardV1JPreflightAssistantResult({
+        message: { ...makeAssistantMessage([]), stopReason: "error", errorMessage: "timeout" },
+        modelTurnIndex: 0,
+        providerInvocationCount: 0,
+        stopSignalRaised: true,
+        captureStopSignalName: V1IProviderRequestCapturedError.name,
+        captureStopErrorMessageMatches: false,
+        captureOnly: true,
+      }),
+    ).toThrowError(
+      expect.objectContaining({
+        name: "V1JUnexpectedPreflightModelResultError",
+        classification: "UNACCOUNTED_MODEL_RESULT_SOURCE",
+      }),
+    );
+  });
+
+  it("fails closed when an accounted provider result appears during capture-only preflight", () => {
+    expect(() =>
+      guardV1JPreflightAssistantResult({
+        message: { ...makeAssistantMessage([]), stopReason: "stop", responseId: "provider-id" },
+        modelTurnIndex: 0,
+        providerInvocationCount: 1,
+        stopSignalRaised: true,
+        captureStopSignalName: V1IProviderRequestCapturedError.name,
+        captureStopErrorMessageMatches: false,
+        captureOnly: true,
+      }),
+    ).toThrowError(
+      expect.objectContaining({
+        name: "V1JUnexpectedPreflightModelResultError",
+        classification: "MODEL_RESULT_AFTER_PRE_DISPATCH_STOP",
+      }),
     );
   });
 
@@ -8469,6 +8622,7 @@ async function runOne(input: {
   let assistantToolCallCount = 0;
   let providerInvocationCount = 0;
   let providerBoundCaptureInvocationIndex = 0;
+  let modelResultEventIndex = 0;
   let preflightStopSignalRaised = false;
   const preDispatchCallbackExpected = input.requestCapture?.stopAfterProviderBoundCapture === true;
   const preDispatchCallbackRegistered = preDispatchCallbackExpected;
@@ -9554,19 +9708,51 @@ async function runOne(input: {
       input.requestCapture?.stopAfterCapture === true ||
       input.requestCapture?.stopAfterProviderBoundCapture === true;
     if (captureOnly) {
-      input.requestCapture?.preflightDiagnostics?.increment(
-        "modelResultsObserved",
-        "unexpected-provider-result-observed",
-      );
+      const resultEventIndex = ++modelResultEventIndex;
+      const responseRecord = asRecord(response);
+      const providerRequestIdPresent = typeof responseRecord?.id === "string";
+      const resultKind = classifyV1JModelResultSource({
+        stopReason: "provider-response",
+        hasToolCall: false,
+        captureStopSignalRaised: preflightStopSignalRaised,
+        captureStopSignalName: null,
+        captureStopErrorMessageMatches: false,
+        providerRequestIdPresent,
+        providerCallbackSeen: true,
+        providerDispatchSeen: providerInvocationCount > 0,
+      });
       const classification =
         providerInvocationCount === 0
           ? "UNACCOUNTED_MODEL_RESULT_SOURCE"
           : "PROVIDER_RESPONSE_AFTER_CAPTURE_STOP";
-      input.requestCapture?.preflightDiagnostics?.record("unexpected-provider-response", {
-        resultStage: "provider-response-observed",
-        providerInvocationCount,
-        classification,
-      });
+      const resultJournal = input.requestCapture?.preflightDiagnostics;
+      if (resultJournal) {
+        recordV1JModelResultProvenance({
+          journal: resultJournal,
+          resultKind,
+          details: {
+            resultEventId: `${runId}:${resultEventIndex}`,
+            eventSourceFunction: "runOne.diagnostics.hooks.onProviderResponse",
+            eventSourceComponent: "OpenClaw embedded provider response hook",
+            runId,
+            promptSubmissionIndex: promptSubmissionTraceIndex,
+            modelLoopIteration: currentProviderPayloadTraceIndex,
+            resultKind,
+            stopReason: "provider-response",
+            hasAssistantMessage: false,
+            hasToolCall: false,
+            providerRequestIdPresent,
+            providerCallbackSeen: true,
+            providerDispatchSeen: providerInvocationCount > 0,
+            modelRequestCounterAtEvent:
+              input.requestCapture?.preflightDiagnostics?.counters().modelRequestCounter ?? 0,
+            resultCreatedRelativeToCaptureHook: "after-capture-hook",
+            resultStage: "provider-response-observed",
+            providerInvocationCount,
+            classification,
+          },
+        });
+      }
       throw new V1JUnexpectedPreflightModelResultError(classification);
     }
     input.requestCapture?.lifecycleJournal?.record("adapter-parse-start", {
@@ -9596,12 +9782,59 @@ async function runOne(input: {
     diagnostics.hooks,
     (message, modelTurnIndex) => {
       const assistantJournal = input.requestCapture?.preflightDiagnostics;
-      assistantJournal?.increment("modelResultsObserved", "assistant-model-result-observed", {
-        modelTurnIndex,
-      });
       const normalizedToolCallCount = message.content.filter(
         (block) => block.type === "toolCall",
       ).length;
+      const stopSignalReason = input.abortSignal?.reason;
+      const captureStopSignalName =
+        stopSignalReason instanceof Error ? stopSignalReason.name : null;
+      const captureStopErrorMessageMatches =
+        stopSignalReason instanceof V1IProviderRequestCapturedError &&
+        message.errorMessage === stopSignalReason.message;
+      const resultKind = classifyV1JModelResultSource({
+        stopReason: message.stopReason,
+        hasToolCall: normalizedToolCallCount > 0,
+        captureStopSignalRaised: preflightStopSignalRaised,
+        captureStopSignalName,
+        captureStopErrorMessageMatches,
+        providerRequestIdPresent:
+          typeof message.responseId === "string" && Boolean(message.responseId),
+        providerCallbackSeen: adapterResponseIndex > 0,
+        providerDispatchSeen: providerInvocationCount > 0,
+      });
+      const resultEventIndex = ++modelResultEventIndex;
+      if (assistantJournal) {
+        recordV1JModelResultProvenance({
+          journal: assistantJournal,
+          resultKind,
+          details: {
+            resultEventId: `${runId}:${resultEventIndex}`,
+            eventSourceFunction:
+              resultKind === "synthetic-abort-result"
+                ? "createFailureMessage"
+                : "installAssistantMessageObserver",
+            eventSourceComponent:
+              resultKind === "synthetic-abort-result"
+                ? "packages/agent-core/src/turn-interruption.ts"
+                : "producer-unresolved; observed by embedded assistant-message hook",
+            runId,
+            promptSubmissionIndex: promptSubmissionTraceIndex,
+            modelLoopIteration: currentProviderPayloadTraceIndex,
+            resultKind,
+            stopReason: message.stopReason,
+            hasAssistantMessage: true,
+            hasToolCall: normalizedToolCallCount > 0,
+            providerRequestIdPresent:
+              typeof message.responseId === "string" && Boolean(message.responseId),
+            providerCallbackSeen: adapterResponseIndex > 0,
+            providerDispatchSeen: providerInvocationCount > 0,
+            modelRequestCounterAtEvent: assistantJournal.counters().modelRequestCounter,
+            resultCreatedRelativeToCaptureHook: preflightStopSignalRaised
+              ? "after-capture-hook"
+              : "before-or-unrelated-to-capture-hook",
+          },
+        });
+      }
       const assistantSummary = summarizeV1JTraceContent(message.content);
       assistantFinalReason = message.stopReason;
       assistantContentSha256 = assistantSummary.contentSha256;
@@ -9694,6 +9927,8 @@ async function runOne(input: {
           modelTurnIndex,
           providerInvocationCount,
           stopSignalRaised: preflightStopSignalRaised,
+          captureStopSignalName,
+          captureStopErrorMessageMatches,
           journal: assistantJournal,
           captureOnly:
             input.requestCapture?.stopAfterCapture === true ||
@@ -12109,6 +12344,8 @@ function guardV1JPreflightAssistantResult(input: {
   modelTurnIndex: number;
   providerInvocationCount: number;
   stopSignalRaised: boolean;
+  captureStopSignalName: string | null;
+  captureStopErrorMessageMatches: boolean;
   journal?: V1JPreflightDiagnosticJournal;
   captureOnly: boolean;
 }): boolean {
@@ -12118,6 +12355,9 @@ function guardV1JPreflightAssistantResult(input: {
   const toolCalls = input.message.content.filter((block) => block.type === "toolCall");
   const expectedStopError =
     input.stopSignalRaised &&
+    input.providerInvocationCount === 0 &&
+    input.captureStopSignalName === V1IProviderRequestCapturedError.name &&
+    input.captureStopErrorMessageMatches &&
     toolCalls.length === 0 &&
     (input.message.stopReason === "error" || input.message.stopReason === "aborted");
   if (expectedStopError) {
@@ -12125,6 +12365,9 @@ function guardV1JPreflightAssistantResult(input: {
       modelTurnIndex: input.modelTurnIndex,
       providerInvocationCount: input.providerInvocationCount,
       stopReason: input.message.stopReason,
+      producerFunction: "createFailureMessage",
+      producerComponent: "packages/agent-core/src/turn-interruption.ts",
+      resultKind: "synthetic-abort-result",
     });
     return true;
   }

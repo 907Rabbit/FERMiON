@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  createV1JPreflightCounters,
   evaluateV1JPreflightStop,
   summarizeV1JPreflightObservations,
   type V1JPreflightCounters,
@@ -24,17 +25,14 @@ const observation: V1JPreflightRequestObservation = {
 
 function preflightCounters(count: number): V1JPreflightCounters {
   return {
+    ...createV1JPreflightCounters(),
     requestObserverInvocations: count,
     providerRequestHookInvocations: count,
     fetchWrapperInvocations: 0,
     providerCallbackInvocations: 0,
     providerDispatchAttempts: 0,
-    modelRequestCounter: 0,
-    schemaCaptureStarts: 0,
-    schemaCaptureCompletes: 0,
     preflightStopSignalRaised: count,
     preflightStopSignalCaught: 1,
-    preflightCompleted: 0,
   };
 }
 

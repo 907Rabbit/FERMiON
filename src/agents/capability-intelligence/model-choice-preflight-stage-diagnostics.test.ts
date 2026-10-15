@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   assertV1JPreflightCaptureOnly,
+  createV1JPreflightCounters,
   type V1JPreflightCounters,
 } from "../../../test/helpers/agents/model-choice-action-initiation-smoke.js";
 import {
@@ -212,24 +213,7 @@ describe("v1J preflight stage diagnostics", () => {
   });
 
   it("fails capture-only accounting on tool execution, tool result, or model result", () => {
-    const base: V1JPreflightCounters = {
-      requestObserverInvocations: 0,
-      providerRequestHookInvocations: 0,
-      fetchWrapperInvocations: 0,
-      providerCallbackInvocations: 0,
-      providerDispatchAttempts: 0,
-      modelRequestCounter: 0,
-      schemaCaptureStarts: 0,
-      schemaCaptureCompletes: 0,
-      preflightStopSignalRaised: 0,
-      preflightStopSignalCaught: 0,
-      preflightCompleted: 0,
-      toolExecutions: 0,
-      toolResultsProduced: 0,
-      modelResultsObserved: 0,
-      promptSubmissions: 0,
-      providerBoundCaptureCallbacks: 0,
-    };
+    const base: V1JPreflightCounters = createV1JPreflightCounters();
     expect(() => assertV1JPreflightCaptureOnly(base)).not.toThrow();
     for (const counter of [
       "toolExecutions",

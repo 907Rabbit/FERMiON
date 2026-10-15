@@ -59,10 +59,206 @@ export type V1JPreflightCounterName =
   | "modelResultsObserved"
   | "resultEventsObserved"
   | "syntheticAbortResultsObserved"
+  | "unaccountedModelResults"
   | "promptSubmissions"
-  | "providerBoundCaptureCallbacks";
+  | "providerBoundCaptureCallbacks"
+  | "rawRequestsSent"
+  | "bodyPublicationCalls";
 
 export type V1JPreflightCounters = Record<V1JPreflightCounterName, number>;
+
+export type V1JPreflightPredicateEvaluation = {
+  predicateName: string;
+  expected: string | number | boolean;
+  observed: string | number | boolean;
+  pass: boolean;
+  evaluationOrder: number;
+};
+
+export function createV1JPreflightCounters(): V1JPreflightCounters {
+  return {
+    requestObserverInvocations: 0,
+    providerRequestHookInvocations: 0,
+    fetchWrapperInvocations: 0,
+    providerCallbackInvocations: 0,
+    providerDispatchAttempts: 0,
+    modelRequestCounter: 0,
+    schemaCaptureStarts: 0,
+    schemaCaptureCompletes: 0,
+    preflightStopSignalRaised: 0,
+    preflightStopSignalCaught: 0,
+    preflightCompleted: 0,
+    toolExecutions: 0,
+    toolResultsProduced: 0,
+    modelResultsObserved: 0,
+    resultEventsObserved: 0,
+    syntheticAbortResultsObserved: 0,
+    unaccountedModelResults: 0,
+    promptSubmissions: 0,
+    providerBoundCaptureCallbacks: 0,
+    rawRequestsSent: 0,
+    bodyPublicationCalls: 0,
+  };
+}
+
+export function evaluateV1JPreflightTerminalPredicates(input: {
+  counters: V1JPreflightCounters;
+  requestSummaryPresent: boolean;
+  providerBoundCaptureCount: number;
+  expectedBodyPublicationCalls: number;
+  activeFilteringEnabled: boolean;
+}): V1JPreflightPredicateEvaluation[] {
+  const { counters } = input;
+  const predicates: V1JPreflightPredicateEvaluation[] = [];
+  const add = (
+    predicateName: string,
+    expected: string | number | boolean,
+    observed: string | number | boolean,
+    pass: boolean,
+  ) =>
+    predicates.push({
+      predicateName,
+      expected,
+      observed,
+      pass,
+      evaluationOrder: predicates.length + 1,
+    });
+  add("toolExecutionsIsZero", 0, counters.toolExecutions, counters.toolExecutions === 0);
+  add(
+    "toolResultsProducedIsZero",
+    0,
+    counters.toolResultsProduced,
+    counters.toolResultsProduced === 0,
+  );
+  add(
+    "modelResultsObservedIsZero",
+    0,
+    counters.modelResultsObserved,
+    counters.modelResultsObserved === 0,
+  );
+  add(
+    "unaccountedModelResultsIsZero",
+    0,
+    counters.unaccountedModelResults,
+    counters.unaccountedModelResults === 0,
+  );
+  add("requestSummaryPresent", true, input.requestSummaryPresent, input.requestSummaryPresent);
+  add(
+    "providerBoundCaptureCountIsOne",
+    1,
+    input.providerBoundCaptureCount,
+    input.providerBoundCaptureCount === 1,
+  );
+  add(
+    "providerBoundCaptureCallbacksIsOne",
+    1,
+    counters.providerBoundCaptureCallbacks,
+    counters.providerBoundCaptureCallbacks === 1,
+  );
+  add(
+    "promptSubmissionsAtLeastOne",
+    ">= 1",
+    counters.promptSubmissions,
+    counters.promptSubmissions >= 1,
+  );
+  add(
+    "providerDispatchAttemptsIsZero",
+    0,
+    counters.providerDispatchAttempts,
+    counters.providerDispatchAttempts === 0,
+  );
+  add(
+    "providerCallbackInvocationsIsZero",
+    0,
+    counters.providerCallbackInvocations,
+    counters.providerCallbackInvocations === 0,
+  );
+  add(
+    "modelRequestCounterIsZero",
+    0,
+    counters.modelRequestCounter,
+    counters.modelRequestCounter === 0,
+  );
+  add(
+    "preflightStopSignalRaisedIsOne",
+    1,
+    counters.preflightStopSignalRaised,
+    counters.preflightStopSignalRaised === 1,
+  );
+  add(
+    "preflightStopSignalCaughtIsOne",
+    1,
+    counters.preflightStopSignalCaught,
+    counters.preflightStopSignalCaught === 1,
+  );
+  add("preflightCompletedIsOne", 1, counters.preflightCompleted, counters.preflightCompleted === 1);
+  add("rawRequestsSentIsZero", 0, counters.rawRequestsSent, counters.rawRequestsSent === 0);
+  add(
+    "bodyPublicationCallsMatchMode",
+    input.expectedBodyPublicationCalls,
+    counters.bodyPublicationCalls,
+    counters.bodyPublicationCalls === input.expectedBodyPublicationCalls,
+  );
+  add(
+    "activeFilteringIsDisabled",
+    false,
+    input.activeFilteringEnabled,
+    input.activeFilteringEnabled === false,
+  );
+  return predicates;
+}
+
+export function buildV1JPreflightTerminalReport(input: {
+  counters: V1JPreflightCounters;
+  lastCompletedStage: string | null;
+  blockingStage: string | null;
+  captureHookLiveness: string;
+  failureClass: string | null;
+  predicateEvaluations: readonly V1JPreflightPredicateEvaluation[] | null;
+}): Record<string, unknown> {
+  const { counters, predicateEvaluations } = input;
+  return {
+    LAST_COMPLETED_STAGE: input.lastCompletedStage ?? "none",
+    BLOCKING_STAGE: input.blockingStage ?? "none",
+    CAPTURE_HOOK_LIVENESS: input.captureHookLiveness,
+    FAILURE_CLASS: input.failureClass ?? "none",
+    PROMPT_SUBMISSIONS: counters.promptSubmissions,
+    REQUEST_OBSERVER_INVOCATIONS: counters.requestObserverInvocations,
+    PROVIDER_BOUND_CAPTURE_CALLBACKS: counters.providerBoundCaptureCallbacks,
+    PROVIDER_CALLBACK_INVOCATIONS: counters.providerCallbackInvocations,
+    PROVIDER_DISPATCH_ATTEMPTS: counters.providerDispatchAttempts,
+    MODEL_RESULTS_OBSERVED_TOTAL: counters.resultEventsObserved,
+    SYNTHETIC_RESULTS_OBSERVED: counters.syntheticAbortResultsObserved,
+    UNACCOUNTED_MODEL_RESULTS: counters.unaccountedModelResults,
+    TOOL_EXECUTIONS: counters.toolExecutions,
+    TOOL_RESULTS_PRODUCED: counters.toolResultsProduced,
+    RAW_REQUESTS_SENT: counters.rawRequestsSent,
+    BODY_PUBLICATION_CALLS: counters.bodyPublicationCalls,
+    PREFLIGHT_PREDICATES_EVALUATED: predicateEvaluations !== null,
+    PREFLIGHT_PREDICATE_EVALUATIONS: predicateEvaluations ?? [],
+    PREFLIGHT_PREDICATE_FAILURES:
+      predicateEvaluations?.filter((predicate) => !predicate.pass) ?? [],
+    FIRST_FAILED_PREDICATE:
+      predicateEvaluations?.find((predicate) => !predicate.pass)?.predicateName ??
+      (predicateEvaluations ? "none" : "NOT_EVALUATED"),
+  };
+}
+
+export async function runV1JPreflightWithTerminalReport<T>(input: {
+  operation: () => Promise<T>;
+  report: () => Record<string, unknown>;
+  emit: (report: Record<string, unknown>) => void;
+}): Promise<T> {
+  try {
+    return await input.operation();
+  } finally {
+    try {
+      input.emit(input.report());
+    } catch {
+      // A terminal-report sink must not replace the preflight's original outcome.
+    }
+  }
+}
 
 export type V1JModelResultKind =
   | "provider-result"
@@ -248,6 +444,11 @@ export function recordV1JModelResultProvenance(input: {
     });
     return;
   }
+  if (input.resultKind === "other") {
+    input.journal.increment("unaccountedModelResults", "unaccounted-model-result-observed", {
+      resultEventId: input.details.resultEventId,
+    });
+  }
   input.journal.increment("modelResultsObserved", "model-result-source-observed", {
     resultEventId: input.details.resultEventId,
     resultKind: input.resultKind,
@@ -403,26 +604,7 @@ function createV1JPreflightDiagnosticJournalAtPath(
   }
   const fd = fs.openSync(filePath, "wx");
   const startedAtMs = input.startedAtMs ?? Date.now();
-  const counters: V1JPreflightCounters = {
-    requestObserverInvocations: 0,
-    providerRequestHookInvocations: 0,
-    fetchWrapperInvocations: 0,
-    providerCallbackInvocations: 0,
-    providerDispatchAttempts: 0,
-    modelRequestCounter: 0,
-    schemaCaptureStarts: 0,
-    schemaCaptureCompletes: 0,
-    preflightStopSignalRaised: 0,
-    preflightStopSignalCaught: 0,
-    preflightCompleted: 0,
-    toolExecutions: 0,
-    toolResultsProduced: 0,
-    modelResultsObserved: 0,
-    resultEventsObserved: 0,
-    syntheticAbortResultsObserved: 0,
-    promptSubmissions: 0,
-    providerBoundCaptureCallbacks: 0,
-  };
+  const counters = createV1JPreflightCounters();
   let eventIndex = 0;
   let closed = false;
   const record = (event: string, details: Record<string, unknown> = {}) => {

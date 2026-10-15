@@ -11,22 +11,26 @@ import { describe, expect, it, vi } from "vitest";
 import {
   assertV1JFormalStateEmpty,
   assertV1JPreflightPairComplete,
-  assertV1JPreflightCaptureOnly,
   assertV1JSmokeProvenance,
+  buildV1JPreflightTerminalReport,
   buildV1JSmokeSchedule,
   classifyV1JModelResultSource,
+  createV1JPreflightCounters,
   createV1JArmCOnlyPreflightDiagnosticJournal,
   createV1JPreflightDiagnosticJournal,
   createV1JSmokeArtifactState,
+  evaluateV1JPreflightTerminalPredicates,
   finalizeV1JSmokeArtifacts,
   recordV1JModelResultProvenance,
   resolveV1JSmokeRoot,
   runV1JArmCPreflightOnly,
+  runV1JPreflightWithTerminalReport,
   runV1JSmokeSchedule,
   summarizeV1JPreflightObservations,
   V1J_FORMAL_ARTIFACT_RELATIVE_PATH,
   V1J_SMOKE_PROVENANCE_PATH,
   type V1JPreflightDiagnosticJournal,
+  type V1JPreflightPredicateEvaluation,
   type V1JPreflightRequestObservation,
   type V1JSmokeCell,
 } from "../../../test/helpers/agents/model-choice-action-initiation-smoke.js";
@@ -3006,7 +3010,53 @@ describeV1JProviderMaterializationTracePreflight(
   },
 );
 
+type V1JProviderPreflightTerminalState = {
+  counters: ReturnType<typeof createV1JPreflightCounters>;
+  journal?: V1JPreflightDiagnosticJournal;
+  lastCompletedStage: string | null;
+  blockingStage: string | null;
+  captureHookLiveness: string;
+  failureClass: string | null;
+  predicateEvaluations: V1JPreflightPredicateEvaluation[] | null;
+};
+
 async function runV1JProviderCapturePreflight(mode: "body-export" | "materialization-trace") {
+  const terminalState: V1JProviderPreflightTerminalState = {
+    counters: createV1JPreflightCounters(),
+    lastCompletedStage: null,
+    blockingStage: "preflight-entry",
+    captureHookLiveness: "NOT_REACHED",
+    failureClass: null,
+    predicateEvaluations: null,
+  };
+  await runV1JPreflightWithTerminalReport({
+    operation: async () => {
+      try {
+        await runV1JProviderCapturePreflightInternal(mode, terminalState);
+        terminalState.blockingStage = null;
+      } catch (error) {
+        terminalState.failureClass = error instanceof Error ? error.name : typeof error;
+        throw error;
+      }
+    },
+    report: () =>
+      buildV1JPreflightTerminalReport({
+        counters: terminalState.journal?.counters() ?? terminalState.counters,
+        lastCompletedStage: terminalState.lastCompletedStage,
+        blockingStage: terminalState.blockingStage,
+        captureHookLiveness: terminalState.captureHookLiveness,
+        failureClass: terminalState.failureClass,
+        predicateEvaluations: terminalState.predicateEvaluations,
+      }),
+    emit: (report) =>
+      process.stdout.write(`V1J_PREFLIGHT_TERMINAL_REPORT ${JSON.stringify(report)}\n`),
+  });
+}
+
+async function runV1JProviderCapturePreflightInternal(
+  mode: "body-export" | "materialization-trace",
+  terminalState: V1JProviderPreflightTerminalState,
+) {
   const materializationTraceOnly = mode === "materialization-trace";
   const runFlag = materializationTraceOnly
     ? V1J_MATERIALIZATION_TRACE_PREFLIGHT
@@ -3102,6 +3152,7 @@ async function runV1JProviderCapturePreflight(mode: "body-export" | "materializa
     preflightId: `provider-bound-capture-${head.slice(0, 8)}-${process.pid}`,
     pid: process.pid,
   });
+  terminalState.journal = journal;
   let preflightStage = "lmstudio-discovery";
   const stageLedger = createV1JPreflightStageLedger({
     record: (event, details) => journal.record(event, details),
@@ -3114,6 +3165,7 @@ async function runV1JProviderCapturePreflight(mode: "body-export" | "materializa
   const completeStage = (stage: V1JPreflightStageName) => {
     stageLedger.complete(stage, V1J_PREFLIGHT_STAGE_METADATA[stage]);
     lastCompletedStage = stage;
+    terminalState.lastCompletedStage = stage;
   };
   enterStage("schema-preflight");
   let providerBoundCaptureCount = 0;
@@ -3433,6 +3485,7 @@ async function runV1JProviderCapturePreflight(mode: "body-export" | "materializa
                   V1J_PROVIDER_BOUND_REQUEST_CANONICAL_SHA256,
               });
             } else {
+              journal.increment("bodyPublicationCalls", "provider-body-publication-call-started");
               bodyArtifact = publishAndVerifyV1JProviderBoundBodyArtifact({
                 repoRoot,
                 captureCommit: head,
@@ -3507,20 +3560,20 @@ async function runV1JProviderCapturePreflight(mode: "body-export" | "materializa
         ),
     });
     const counters = journal.counters();
-    assertV1JPreflightCaptureOnly(counters);
-    if (
-      !requestSummary ||
-      providerBoundCaptureCount !== 1 ||
-      counters.providerBoundCaptureCallbacks !== 1 ||
-      counters.promptSubmissions < 1 ||
-      counters.providerDispatchAttempts !== 0 ||
-      counters.providerCallbackInvocations !== 0 ||
-      counters.modelRequestCounter !== 0 ||
-      counters.preflightStopSignalRaised !== 1 ||
-      counters.preflightStopSignalCaught !== 1 ||
-      counters.preflightCompleted !== 1 ||
-      ACTIVE_FILTERING_ENABLED !== false
-    ) {
+    const predicateEvaluations = evaluateV1JPreflightTerminalPredicates({
+      counters,
+      requestSummaryPresent: requestSummary !== undefined,
+      providerBoundCaptureCount,
+      expectedBodyPublicationCalls: materializationTraceOnly ? 0 : 1,
+      activeFilteringEnabled: ACTIVE_FILTERING_ENABLED,
+    });
+    terminalState.predicateEvaluations = predicateEvaluations;
+    for (const predicate of predicateEvaluations) {
+      journal.record("preflight-predicate-evaluated", predicate);
+    }
+    const firstFailedPredicate = predicateEvaluations.find((predicate) => !predicate.pass);
+    if (firstFailedPredicate) {
+      terminalState.blockingStage = "schema-preflight-validation";
       throw new Error("v1J provider preflight did not terminate on its no-dispatch gate");
     }
     if (fs.existsSync(formalRoot) || fs.existsSync(normalSmokeRoot)) {
@@ -3541,6 +3594,10 @@ async function runV1JProviderCapturePreflight(mode: "body-export" | "materializa
         throw new Error("v1J provider-bound body metadata changed after callback verification");
       }
     }
+    const captureHookLivenessClassification = classifyV1JCaptureHookLiveness(
+      stageLedger.snapshot(),
+    );
+    terminalState.captureHookLiveness = captureHookLivenessClassification;
     journal.record("provider-capture-preflight-complete", {
       ...counters,
       authorizedToolCount: surface.authorizedToolCount,
@@ -3563,7 +3620,7 @@ async function runV1JProviderCapturePreflight(mode: "body-export" | "materializa
       toolExecutions: 0,
       formalStateTouched: false,
       normalSmokeStateTouched: false,
-      captureHookLivenessClassification: classifyV1JCaptureHookLiveness(stageLedger.snapshot()),
+      captureHookLivenessClassification,
       preflightStages: stageLedger.snapshot(),
     });
     process.stdout.write(
@@ -3593,7 +3650,7 @@ async function runV1JProviderCapturePreflight(mode: "body-export" | "materializa
         activeFilteringEnabled: false,
         formalStateTouched: false,
         normalSmokeStateTouched: false,
-        captureHookLivenessClassification: classifyV1JCaptureHookLiveness(stageLedger.snapshot()),
+        captureHookLivenessClassification,
         artifactPath: journal.filePath,
         preflightStages: stageLedger.snapshot(),
       })}\n`,
@@ -3601,6 +3658,7 @@ async function runV1JProviderCapturePreflight(mode: "body-export" | "materializa
   } catch (error) {
     const blockingStage =
       error instanceof V1JPreflightStageTimeoutError ? error.stage : preflightStage;
+    terminalState.blockingStage = blockingStage;
     if (V1J_PREFLIGHT_STAGE_NAMES.includes(blockingStage as V1JPreflightStageName)) {
       const stage = blockingStage as V1JPreflightStageName;
       stageLedger.fail(stage, error, V1J_PREFLIGHT_STAGE_METADATA[stage]);
@@ -3611,6 +3669,7 @@ async function runV1JProviderCapturePreflight(mode: "body-export" | "materializa
     try {
       const preflightStages = stageLedger.snapshot();
       const captureHookLivenessClassification = classifyV1JCaptureHookLiveness(preflightStages);
+      terminalState.captureHookLiveness = captureHookLivenessClassification;
       journal.record("capture-hook-liveness-classification", {
         classification: captureHookLivenessClassification,
         lastCompletedStage,

@@ -63,6 +63,8 @@ export type V1JAgentSessionTimestampDecoration = {
   source: "normalizeMessagesForLlmBoundary.stampUserTextWithMessageTimestamp";
   messageIndex: number;
   prefixSha256: string;
+  producerTimestampSha256: string;
+  timezoneSha256: string;
   originalContentSha256: string;
   originalContentBytes: number;
   prefixBytes: number;
@@ -73,6 +75,15 @@ export type V1JProviderRequestIdentity = {
   historicalExactCanonicalSha256: string;
   providerRequestSha256: string;
   stableProviderRequestSha256: string;
+  stableNormalizationApplied: boolean;
+  stableNormalizationReason:
+    | "applied"
+    | "timestamp-provenance-missing"
+    | "invalid-provenance-shape"
+    | "unknown-timestamp-source"
+    | "prefix-length-mismatch"
+    | "prefix-hash-mismatch"
+    | "original-user-content-mismatch";
 };
 
 export type V1JProviderRequestFingerprintComponent = {
@@ -535,6 +546,9 @@ export function identifyV1JProviderRequest(input: {
     throw new Error("v1J stable provider identity requires a provider id");
   }
 
+  let stableNormalizationApplied = false;
+  let stableNormalizationReason: V1JProviderRequestIdentity["stableNormalizationReason"] =
+    "timestamp-provenance-missing";
   // Missing producer provenance leaves the request exact; a generic timestamp-looking prefix
   // is not sufficient evidence to normalize user content.
   if (decoration) {
@@ -543,41 +557,50 @@ export function identifyV1JProviderRequest(input: {
       !Array.isArray(messages) ||
       !Number.isInteger(decoration.messageIndex) ||
       decoration.messageIndex < 0 ||
-      decoration.prefixBytes !== 28 ||
       !/^[a-f0-9]{64}$/.test(decoration.prefixSha256) ||
+      !/^[a-f0-9]{64}$/.test(decoration.producerTimestampSha256) ||
+      !/^[a-f0-9]{64}$/.test(decoration.timezoneSha256) ||
       !Number.isInteger(decoration.originalContentBytes) ||
       decoration.originalContentBytes < 0 ||
       !/^[a-f0-9]{64}$/.test(decoration.originalContentSha256)
     ) {
-      throw new Error("v1J stable provider identity requires valid timestamp provenance");
-    }
-    if (decoration.source !== "normalizeMessagesForLlmBoundary.stampUserTextWithMessageTimestamp") {
-      throw new Error("v1J stable provider identity rejects unknown timestamp provenance");
-    }
-
-    const message = messages[decoration.messageIndex];
-    if (!message || typeof message !== "object" || Array.isArray(message)) {
-      throw new Error("v1J timestamp provenance does not identify a provider user message");
-    }
-    const row = message as Record<string, unknown>;
-    if (row.role !== "user" || typeof row.content !== "string") {
-      throw new Error("v1J timestamp provenance does not identify string user content");
-    }
-    const contentBytes = Buffer.from(row.content, "utf8");
-    const timestampPrefix = contentBytes.subarray(0, decoration.prefixBytes);
-    const originalContent = contentBytes.subarray(decoration.prefixBytes);
-    if (
-      timestampPrefix.byteLength !== decoration.prefixBytes ||
-      sha256(timestampPrefix) !== decoration.prefixSha256 ||
-      originalContent.byteLength !== decoration.originalContentBytes ||
-      sha256(originalContent) !== decoration.originalContentSha256
+      stableNormalizationReason = "invalid-provenance-shape";
+    } else if (decoration.prefixBytes !== 28) {
+      stableNormalizationReason = "prefix-length-mismatch";
+    } else if (
+      decoration.source !== "normalizeMessagesForLlmBoundary.stampUserTextWithMessageTimestamp"
     ) {
-      throw new Error("v1J timestamp provenance does not match the provider user message");
+      stableNormalizationReason = "unknown-timestamp-source";
+    } else {
+      const message = messages[decoration.messageIndex];
+      const row =
+        message && typeof message === "object" && !Array.isArray(message)
+          ? (message as Record<string, unknown>)
+          : undefined;
+      if (row?.role !== "user" || typeof row.content !== "string") {
+        stableNormalizationReason = "original-user-content-mismatch";
+      } else {
+        const contentBytes = Buffer.from(row.content, "utf8");
+        const timestampPrefix = contentBytes.subarray(0, decoration.prefixBytes);
+        const originalContent = contentBytes.subarray(decoration.prefixBytes);
+        if (timestampPrefix.byteLength !== decoration.prefixBytes) {
+          stableNormalizationReason = "prefix-length-mismatch";
+        } else if (sha256(timestampPrefix) !== decoration.prefixSha256) {
+          stableNormalizationReason = "prefix-hash-mismatch";
+        } else if (
+          originalContent.byteLength !== decoration.originalContentBytes ||
+          sha256(originalContent) !== decoration.originalContentSha256
+        ) {
+          stableNormalizationReason = "original-user-content-mismatch";
+        } else {
+          // Only the explicitly traced AgentSession decoration is normalized. All other request
+          // fields remain in the canonical identity so semantic request changes still change its hash.
+          row.content = `<TIMESTAMP> ${new TextDecoder("utf-8", { fatal: true }).decode(originalContent)}`;
+          stableNormalizationApplied = true;
+          stableNormalizationReason = "applied";
+        }
+      }
     }
-
-    // Only the explicitly traced AgentSession decoration is normalized. All other request
-    // fields remain in the canonical identity so semantic request changes still change its hash.
-    row.content = `<TIMESTAMP> ${new TextDecoder("utf-8", { fatal: true }).decode(originalContent)}`;
   }
   return {
     rawBodySha256: sha256(rawBodyBytes),
@@ -585,6 +608,62 @@ export function identifyV1JProviderRequest(input: {
     // Bind the provider separately because provider identity is not part of the serialized body.
     providerRequestSha256: sha256(canonicalJson({ provider: input.provider, request: parsed })),
     stableProviderRequestSha256: sha256(canonicalJson({ provider: input.provider, request: body })),
+    stableNormalizationApplied,
+    stableNormalizationReason,
+  };
+}
+
+/** Builds a test-only timestamp variant from a captured request without retaining its text. */
+export function createV1JTimestampVariantCapture(input: {
+  capture: V1JRawRepeatabilityCapture;
+  provider: string;
+  timestampDecoration: V1JAgentSessionTimestampDecoration;
+  replacementPrefix: string;
+  replacementTimestampSha256: string;
+}): {
+  capture: V1JRawRepeatabilityCapture;
+  timestampDecoration: V1JAgentSessionTimestampDecoration;
+} {
+  const verified = identifyV1JProviderRequest({
+    capture: input.capture,
+    provider: input.provider,
+    timestampDecoration: input.timestampDecoration,
+  });
+  if (!verified.stableNormalizationApplied) {
+    throw new Error("v1J timestamp variant requires verified source provenance");
+  }
+  const replacementPrefixBytes = Buffer.from(input.replacementPrefix, "utf8");
+  if (
+    replacementPrefixBytes.byteLength !== 28 ||
+    !/^[a-f0-9]{64}$/.test(input.replacementTimestampSha256)
+  ) {
+    throw new Error("v1J timestamp variant requires a valid independently generated prefix");
+  }
+  const requestObject = structuredClone(input.capture.requestObject);
+  const messages = requestObject.messages;
+  if (!Array.isArray(messages)) {
+    throw new Error("v1J timestamp variant requires request messages");
+  }
+  const target = messages[input.timestampDecoration.messageIndex];
+  if (!target || typeof target !== "object" || Array.isArray(target)) {
+    throw new Error("v1J timestamp variant target is unavailable");
+  }
+  const row = target as Record<string, unknown>;
+  const content = Buffer.from(String(row.content), "utf8");
+  const originalContent = content.subarray(input.timestampDecoration.prefixBytes);
+  row.content = `${input.replacementPrefix}${new TextDecoder("utf-8", { fatal: true }).decode(originalContent)}`;
+  const capture: V1JRawRepeatabilityCapture = {
+    ...input.capture,
+    requestObject,
+    rawBody: JSON.stringify(requestObject),
+  };
+  return {
+    capture,
+    timestampDecoration: {
+      ...input.timestampDecoration,
+      prefixSha256: sha256(replacementPrefixBytes),
+      producerTimestampSha256: input.replacementTimestampSha256,
+    },
   };
 }
 

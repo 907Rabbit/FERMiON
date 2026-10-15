@@ -291,6 +291,7 @@ describe("v1J raw-only provider repeatability", () => {
           request: { url: capture.endpoint, body: capture.requestObject },
           rawBody: capture.rawBody,
         },
+        provider: "lmstudio",
         expectedCanonicalSha256: V1J_PROVIDER_BOUND_REQUEST_CANONICAL_SHA256,
         record: (event, details) => records.push({ event, details }),
         onStage: (event) => stages.push(event.event),

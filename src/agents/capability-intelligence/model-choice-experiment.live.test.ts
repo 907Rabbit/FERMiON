@@ -83,7 +83,12 @@ import {
   V1J_PROVIDER_CONTROL_MODEL_CONFIG_SHA256,
   V1J_PROVIDER_CONTROL_SCHEMA_BASELINE,
 } from "../../../test/helpers/agents/model-choice-provider-isolation.js";
-import { recordV1JProviderMaterializationTrace } from "../../../test/helpers/agents/model-choice-provider-materialization-trace.js";
+import {
+  captureV1JTimestampProvenance,
+  recordV1JProviderMaterializationTrace,
+  type V1JStableIdentityReference,
+  type V1JTimestampProvenanceResult,
+} from "../../../test/helpers/agents/model-choice-provider-materialization-trace.js";
 import { runV1JPayloadDecompositionDiagnostic } from "../../../test/helpers/agents/model-choice-provider-payload-decomposition-live.js";
 import {
   V1J_PAYLOAD_DECOMPOSITION_AUTHORIZED_FLAG,
@@ -122,6 +127,7 @@ import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { AssistantMessage } from "../../llm/types.js";
 import { applyTestPluginDefaults } from "../../plugins/config-state.js";
 import type { PluginRegistryLoadTraceEvent } from "../../plugins/loader-types.js";
+import { resolveUserTimezone } from "../date-time.js";
 import type {
   EmbeddedCapabilityIntelligenceModelLoopHeartbeat,
   EmbeddedCapabilityIntelligenceModelLoopSubstage,
@@ -3088,6 +3094,18 @@ async function runV1JProviderCapturePreflight(mode: "body-export" | "materializa
   let preflightStage = "lmstudio-discovery";
   let providerBoundCaptureCount = 0;
   let requestSummary: ReturnType<typeof summarizeV1JRawRepeatabilityRequest> | undefined;
+  let requestIdentities:
+    | {
+        rawBodySha256: string;
+        historicalExactCanonicalSha256: string;
+        providerRequestSha256: string;
+        stableProviderRequestSha256: string;
+        stableNormalizationApplied: boolean;
+        stableNormalizationReason: string;
+      }
+    | undefined;
+  let stableIdentityReference: V1JStableIdentityReference | undefined;
+  let timestampProvenance: V1JTimestampProvenanceResult | undefined;
   let bodyArtifact: ReturnType<typeof publishAndVerifyV1JProviderBoundBodyArtifact> | undefined;
   const providerCaptureStages: string[] = [];
   const callbackStageStartedAt = new Map<string, string>();
@@ -3202,6 +3220,25 @@ async function runV1JProviderCapturePreflight(mode: "body-export" | "materializa
             journal.record("preflight-progress", { stage });
           },
           onProviderCaptureStage: recordCaptureStage,
+          ...(materializationTraceOnly
+            ? {
+                onTimestampProvenance: (result: V1JTimestampProvenanceResult) => {
+                  timestampProvenance = result;
+                  journal.record("agent-session-timestamp-provenance", {
+                    source: result.decoration?.source ?? null,
+                    messageIndex: result.decoration?.messageIndex ?? null,
+                    provenanceVerified: result.reason === "verified",
+                    reason: result.reason,
+                    prefixBytes: result.decoration?.prefixBytes ?? null,
+                    prefixSha256: result.decoration?.prefixSha256 ?? null,
+                    producerTimestampSha256: result.decoration?.producerTimestampSha256 ?? null,
+                    timezoneSha256: result.decoration?.timezoneSha256 ?? null,
+                    originalContentSha256: result.decoration?.originalContentSha256 ?? null,
+                    originalContentBytes: result.decoration?.originalContentBytes ?? null,
+                  });
+                },
+              }
+            : {}),
           onProviderBoundRequest: ({ request, rawBody, requestIndex, dispatchOrdinal }) => {
             providerBoundCaptureCount += 1;
             if (providerBoundCaptureCount !== 1 || requestIndex !== 1 || dispatchOrdinal !== 1) {
@@ -3212,12 +3249,29 @@ async function runV1JProviderCapturePreflight(mode: "body-export" | "materializa
               stageName: "capture-record-build",
             });
             if (materializationTraceOnly) {
-              requestSummary = recordV1JProviderMaterializationTrace({
+              const trace = recordV1JProviderMaterializationTrace({
                 capture: { request, rawBody },
+                provider: protocol.model.provider,
                 expectedCanonicalSha256: V1J_PROVIDER_BOUND_REQUEST_CANONICAL_SHA256,
+                ...(timestampProvenance?.decoration
+                  ? { timestampDecoration: timestampProvenance.decoration }
+                  : {}),
+                ...(timestampProvenance?.decoration &&
+                timestampProvenance.producerTimestampMs !== undefined &&
+                timestampProvenance.timezone
+                  ? {
+                      timestampVariant: {
+                        producerTimestampMs: timestampProvenance.producerTimestampMs,
+                        timezone: timestampProvenance.timezone,
+                      },
+                    }
+                  : {}),
                 record: (event, details) => journal.record(event, details),
                 onStage: recordCaptureStage,
               });
+              requestSummary = trace;
+              requestIdentities = trace.identities;
+              stableIdentityReference = trace.stableIdentityReference;
             } else {
               requestSummary = summarizeV1JRawRepeatabilityRequest(
                 { endpoint: request.url, rawBody, requestObject: request.body },
@@ -3420,6 +3474,11 @@ async function runV1JProviderCapturePreflight(mode: "body-export" | "materializa
       requestJsonBytes: requestSummary.requestJsonBytes,
       canonicalRequestSha256: requestSummary.requestCanonicalSha256,
       rawBodySha256: requestSummary.requestSha256,
+      ...(requestIdentities ? { ...requestIdentities } : {}),
+      ...(stableIdentityReference ? { stableIdentityReference } : {}),
+      stableNormalizationApplied: requestIdentities?.stableNormalizationApplied ?? false,
+      stableNormalizationReason:
+        requestIdentities?.stableNormalizationReason ?? "identity-not-computed",
       ...(bodyArtifact ? { bodyArtifactRoot: bodyArtifact.artifactRoot } : {}),
       bodyPublicationCalls: materializationTraceOnly ? 0 : 1,
       bodyArtifactCreated: !materializationTraceOnly,
@@ -3444,6 +3503,9 @@ async function runV1JProviderCapturePreflight(mode: "body-export" | "materializa
         requestJsonBytes: requestSummary.requestJsonBytes,
         canonicalRequestSha256: requestSummary.requestCanonicalSha256,
         rawBodySha256: requestSummary.requestSha256,
+        ...requestIdentities,
+        ...(stableIdentityReference ? { stableIdentityReference } : {}),
+        timestampProvenanceReason: timestampProvenance?.reason ?? "not-observed",
         ...(bodyArtifact ? { bodyArtifactRoot: bodyArtifact.artifactRoot } : {}),
         bodyPublicationCalls: materializationTraceOnly ? 0 : 1,
         bodyArtifactCreated: !materializationTraceOnly,
@@ -3889,6 +3951,7 @@ async function captureV1JPreflightSurface(
       requestIndex: number;
       dispatchOrdinal: number;
     }) => void;
+    onTimestampProvenance?: (result: V1JTimestampProvenanceResult) => void;
     onPreflightStopRaised?: () => void;
     onPreflightStopCaught?: () => void;
     onCheckpoint?: (checkpoint: EmbeddedCapabilityCheckpoint) => void;
@@ -3956,6 +4019,7 @@ async function captureV1JPreflightSurface(
         stopAfterProviderBoundCapture: true,
         ...(preflightDiagnostics ? { preflightDiagnostics } : {}),
         onProviderCaptureStage: options?.onProviderCaptureStage,
+        onTimestampProvenance: options?.onTimestampProvenance,
         capturePromptInstruction: v1jInstructionForArm(protocol, arm),
         onAuthorizedToolsCaptured: (tools) =>
           authorizedTools.splice(0, authorizedTools.length, ...tools),
@@ -4938,6 +5002,7 @@ describe("v1J schema-capture dispatch guard", () => {
         callbackInvocations += 1;
         recordV1JProviderMaterializationTrace({
           capture: { request: captured.request, rawBody: captured.rawBody },
+          provider: "lmstudio",
           expectedCanonicalSha256: V1J_PROVIDER_BOUND_REQUEST_CANONICAL_SHA256,
           record: (event, details) => journalRows.push({ event, details }),
         });
@@ -4966,6 +5031,12 @@ describe("v1J schema-capture dispatch guard", () => {
             bodyArtifactCreated: false,
             messageCount: 2,
             toolCount: 15,
+            rawBodySha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+            historicalExactCanonicalSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+            providerRequestSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+            stableProviderRequestSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+            stableNormalizationApplied: false,
+            stableNormalizationReason: "timestamp-provenance-missing",
           },
         },
       ]);
@@ -8236,6 +8307,7 @@ async function runOne(input: {
       requestIndex: number;
       dispatchOrdinal: number;
     }) => void | Promise<void>;
+    onTimestampProvenance?: (result: V1JTimestampProvenanceResult) => void;
     onPreflightStopRaised?: () => void;
     onDelegatedRequest?: () => void;
     onResponseSummary?: (summary: ProviderResponseSummary) => void;
@@ -8366,6 +8438,13 @@ async function runOne(input: {
       }
     | undefined;
   let materializationRequestIndex = 0;
+  let pendingTimestampProducerInput:
+    | {
+        promptSubmissionIndex: number;
+        modelLoopIterationIndex: number;
+        messages?: readonly unknown[];
+      }
+    | undefined;
   const preCaptureObserverTraces: V1JPreCaptureObserverTrace[] = [];
   const preCaptureTranscriptGrowth: V1JPreCaptureTranscriptGrowth[] = [];
   if (preflightDiagnostics) {
@@ -8390,6 +8469,52 @@ async function runOne(input: {
   const originalPromptMessageTrace = diagnostics.hooks.onPromptMessageTrace;
   diagnostics.hooks.onPromptMessageTrace = (event) => {
     originalPromptMessageTrace?.(event);
+    if (input.requestCapture?.onTimestampProvenance) {
+      if (event.stage === "agent-llm-boundary-input") {
+        let messages: readonly unknown[] | undefined;
+        try {
+          messages = event.messages.map((message) => {
+            const row = asRecord(message);
+            return row
+              ? {
+                  role: row.role,
+                  content: structuredClone(row.content),
+                  timestamp: row.timestamp,
+                }
+              : message;
+          });
+        } catch {
+          messages = undefined;
+        }
+        pendingTimestampProducerInput = {
+          promptSubmissionIndex: promptSubmissionTraceIndex,
+          modelLoopIterationIndex: currentProviderPayloadTraceIndex,
+          messages,
+        };
+      } else if (event.stage === "agent-llm-boundary-normalized") {
+        const producerInput = pendingTimestampProducerInput;
+        pendingTimestampProducerInput = undefined;
+        const sameTraceTurn =
+          producerInput?.promptSubmissionIndex === promptSubmissionTraceIndex &&
+          producerInput.modelLoopIterationIndex === currentProviderPayloadTraceIndex &&
+          event.transition?.sourceStage === "agent-llm-boundary-input";
+        const timezone = resolveUserTimezone(input.config.agents?.defaults?.userTimezone);
+        const provenance = captureV1JTimestampProvenance({
+          ...(sameTraceTurn ? { producerMessages: producerInput?.messages } : {}),
+          transitionInputMessages: event.transition?.inputMessages,
+          normalizedMessages: event.messages,
+          normalizationDiagnostics: event.normalizationDiagnostics,
+          timezone,
+          timestampPolicyActive:
+            event.materializationFactors?.boundaryTimestampEnabled === true &&
+            event.materializationFactors?.boundaryTimezoneConfigured === true &&
+            event.materializationFactors?.timestampPrefixPolicyEnabled === true,
+          timestampOverridePresent:
+            event.materializationFactors?.currentUserTimestampOverridePresent === true,
+        });
+        input.requestCapture.onTimestampProvenance(provenance);
+      }
+    }
     if (event.stage === "provider-onPayload-transform-enter") {
       providerCallPrepareObserved = true;
       recordPromptAwait("provider-call-prepare", {

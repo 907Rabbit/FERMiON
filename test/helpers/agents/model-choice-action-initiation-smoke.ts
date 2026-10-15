@@ -7,6 +7,8 @@ import {
   type V1JObservation,
   type V1JProtocol,
 } from "./model-choice-action-initiation.js";
+import type { V1JProviderCallbackReachabilityEvent } from "./model-choice-provider-callback-reachability.js";
+import type { V1JProviderRequestIdentity } from "./model-choice-provider-repeatability.js";
 
 export const V1J_SMOKE_PROVENANCE_PATH =
   "artifacts/capability-intelligence/v1j-action-initiation/provenance-amendment.json";
@@ -74,6 +76,92 @@ export type V1JPreflightPredicateEvaluation = {
   pass: boolean;
   evaluationOrder: number;
 };
+
+export type V1JProviderBoundCaptureAccountingStatus =
+  | "NOT_REACHED"
+  | "CALLBACK_EVENT_EMITTING"
+  | "CALLBACK_EVENT_EMITTED"
+  | "COUNTER_INCREMENTING"
+  | "ACCOUNTED"
+  | "CALLBACK_EVENT_EMISSION_FAILED"
+  | "COUNTER_INCREMENT_FAILED";
+
+/** Accounts at the reachability-event owner, before a capture sentinel can unwind the caller. */
+export function recordV1JProviderBoundCaptureCallback(input: {
+  journal: Pick<V1JPreflightDiagnosticJournal, "counters" | "record" | "increment">;
+  event: V1JProviderCallbackReachabilityEvent;
+  emitEvent: () => void;
+  setStatus: (status: V1JProviderBoundCaptureAccountingStatus) => void;
+}): void {
+  if (input.event.stage !== "provider-capture-hook-invoked" || !input.event.entered) {
+    throw new Error("v1J capture callback accounting requires an invoked-hook event");
+  }
+  const { event } = input;
+  const metadata = {
+    runId: event.runId,
+    promptSubmissionIndex: event.promptSubmissionIndex,
+    modelLoopIteration: event.modelLoopIteration,
+    providerInstanceFingerprint: event.providerInstanceId,
+    hookRegistrationId: event.hookIdentity,
+    callbackInvocationOrdinal: event.invocationCount,
+  };
+  const counterValue = () => input.journal.counters().providerBoundCaptureCallbacks;
+  let phase: "callback-event-emission" | "aggregate-counter-increment" = "callback-event-emission";
+  try {
+    input.setStatus("CALLBACK_EVENT_EMITTING");
+    input.journal.record("provider-bound-capture-accounting", {
+      phase: "CALLBACK_EVENT_EMIT_ENTER",
+      counterBefore: counterValue(),
+      ...metadata,
+    });
+    input.emitEvent();
+    input.journal.record("provider-bound-capture-accounting", {
+      phase: "CALLBACK_EVENT_EMIT_COMPLETE",
+      counterBefore: counterValue(),
+      ...metadata,
+    });
+    input.setStatus("CALLBACK_EVENT_EMITTED");
+
+    phase = "aggregate-counter-increment";
+    const counterBefore = counterValue();
+    input.setStatus("COUNTER_INCREMENTING");
+    input.journal.record("provider-bound-capture-accounting", {
+      phase: "AGGREGATE_COUNTER_INCREMENT_ENTER",
+      counterBefore,
+      ...metadata,
+    });
+    input.journal.increment(
+      "providerBoundCaptureCallbacks",
+      "provider-bound-capture-callback-accounted",
+      { ...metadata, counterBefore },
+    );
+    const counterAfter = counterValue();
+    input.journal.record("provider-bound-capture-accounting", {
+      phase: "AGGREGATE_COUNTER_INCREMENT_COMPLETE",
+      counterBefore,
+      counterAfter,
+      ...metadata,
+    });
+    input.setStatus("ACCOUNTED");
+  } catch (error) {
+    input.setStatus(
+      phase === "callback-event-emission"
+        ? "CALLBACK_EVENT_EMISSION_FAILED"
+        : "COUNTER_INCREMENT_FAILED",
+    );
+    try {
+      input.journal.record("provider-bound-capture-accounting", {
+        phase: `${phase === "callback-event-emission" ? "CALLBACK_EVENT_EMIT" : "AGGREGATE_COUNTER_INCREMENT"}_FAILED`,
+        counterValue: counterValue(),
+        failureClass: error instanceof Error ? error.name : typeof error,
+        ...metadata,
+      });
+    } catch {
+      // Preserve the accounting failure when the diagnostic sink itself has failed.
+    }
+    throw error;
+  }
+}
 
 export function createV1JPreflightCounters(): V1JPreflightCounters {
   return {
@@ -214,6 +302,8 @@ export function buildV1JPreflightTerminalReport(input: {
   blockingStage: string | null;
   captureHookLiveness: string;
   failureClass: string | null;
+  providerBoundCaptureAccountingStatus?: V1JProviderBoundCaptureAccountingStatus;
+  requestIdentities?: V1JProviderRequestIdentity;
   predicateEvaluations: readonly V1JPreflightPredicateEvaluation[] | null;
   providerCallbackReachability?: {
     classification: string;
@@ -221,11 +311,15 @@ export function buildV1JPreflightTerminalReport(input: {
   };
 }): Record<string, unknown> {
   const { counters, predicateEvaluations } = input;
+  const identityUnavailable =
+    counters.providerBoundCaptureCallbacks > 0 ? "UNAVAILABLE" : "NOT_REACHED";
   return {
     LAST_COMPLETED_STAGE: input.lastCompletedStage ?? "none",
     BLOCKING_STAGE: input.blockingStage ?? "none",
     CAPTURE_HOOK_LIVENESS: input.captureHookLiveness,
     FAILURE_CLASS: input.failureClass ?? "none",
+    PROVIDER_BOUND_CAPTURE_ACCOUNTING_STATUS:
+      input.providerBoundCaptureAccountingStatus ?? "NOT_REACHED",
     PROMPT_SUBMISSIONS: counters.promptSubmissions,
     REQUEST_OBSERVER_INVOCATIONS: counters.requestObserverInvocations,
     PROVIDER_BOUND_CAPTURE_CALLBACKS: counters.providerBoundCaptureCallbacks,
@@ -238,6 +332,16 @@ export function buildV1JPreflightTerminalReport(input: {
     TOOL_RESULTS_PRODUCED: counters.toolResultsProduced,
     RAW_REQUESTS_SENT: counters.rawRequestsSent,
     BODY_PUBLICATION_CALLS: counters.bodyPublicationCalls,
+    rawBodySha256: input.requestIdentities?.rawBodySha256 ?? identityUnavailable,
+    historicalExactCanonicalSha256:
+      input.requestIdentities?.historicalExactCanonicalSha256 ?? identityUnavailable,
+    providerRequestSha256: input.requestIdentities?.providerRequestSha256 ?? identityUnavailable,
+    stableProviderRequestSha256:
+      input.requestIdentities?.stableProviderRequestSha256 ?? identityUnavailable,
+    STABLE_NORMALIZATION_APPLIED:
+      input.requestIdentities?.stableNormalizationApplied ?? identityUnavailable,
+    STABLE_NORMALIZATION_REASON:
+      input.requestIdentities?.stableNormalizationReason ?? identityUnavailable,
     PREFLIGHT_PREDICATES_EVALUATED: predicateEvaluations !== null,
     PREFLIGHT_PREDICATE_EVALUATIONS: predicateEvaluations ?? [],
     PREFLIGHT_PREDICATE_FAILURES:

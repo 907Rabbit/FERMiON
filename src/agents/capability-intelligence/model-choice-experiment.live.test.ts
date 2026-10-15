@@ -22,6 +22,7 @@ import {
   evaluateV1JPreflightTerminalPredicates,
   finalizeV1JSmokeArtifacts,
   recordV1JModelResultProvenance,
+  recordV1JProviderBoundCaptureCallback,
   resolveV1JSmokeRoot,
   runV1JArmCPreflightOnly,
   runV1JPreflightWithTerminalReport,
@@ -31,6 +32,7 @@ import {
   V1J_SMOKE_PROVENANCE_PATH,
   type V1JPreflightDiagnosticJournal,
   type V1JPreflightPredicateEvaluation,
+  type V1JProviderBoundCaptureAccountingStatus,
   type V1JPreflightRequestObservation,
   type V1JSmokeCell,
 } from "../../../test/helpers/agents/model-choice-action-initiation-smoke.js";
@@ -134,6 +136,7 @@ import {
   V1J_RAW_REPEATABILITY_RUN_FLAG,
   type V1JProviderControlEvent,
   type V1JProviderRequestFingerprintComponent,
+  type V1JProviderRequestIdentity,
 } from "../../../test/helpers/agents/model-choice-provider-repeatability.js";
 import {
   createV1JProviderResponseDiagnosticJournal,
@@ -3017,6 +3020,8 @@ describeV1JProviderMaterializationTracePreflight(
 
 type V1JProviderPreflightTerminalState = {
   counters: ReturnType<typeof createV1JPreflightCounters>;
+  requestIdentities?: V1JProviderRequestIdentity;
+  providerBoundCaptureAccountingStatus: V1JProviderBoundCaptureAccountingStatus;
   journal?: V1JPreflightDiagnosticJournal;
   lastCompletedStage: string | null;
   blockingStage: string | null;
@@ -3029,6 +3034,7 @@ type V1JProviderPreflightTerminalState = {
 async function runV1JProviderCapturePreflight(mode: "body-export" | "materialization-trace") {
   const terminalState: V1JProviderPreflightTerminalState = {
     counters: createV1JPreflightCounters(),
+    providerBoundCaptureAccountingStatus: "NOT_REACHED",
     lastCompletedStage: null,
     blockingStage: "preflight-entry",
     captureHookLiveness: "NOT_REACHED",
@@ -3053,6 +3059,8 @@ async function runV1JProviderCapturePreflight(mode: "body-export" | "materializa
         blockingStage: terminalState.blockingStage,
         captureHookLiveness: terminalState.captureHookLiveness,
         failureClass: terminalState.failureClass,
+        providerBoundCaptureAccountingStatus: terminalState.providerBoundCaptureAccountingStatus,
+        requestIdentities: terminalState.requestIdentities,
         predicateEvaluations: terminalState.predicateEvaluations,
         providerCallbackReachability: {
           classification: terminalState.providerCallbackReachability.classify(
@@ -3346,8 +3354,22 @@ async function runV1JProviderCapturePreflightInternal(
           },
           onProviderCaptureStage: recordCaptureStage,
           onProviderCallbackReachabilityEvent: (event) => {
-            terminalState.providerCallbackReachability.record(event);
-            journal.record("provider-callback-reachability", event);
+            const emitEvent = () => {
+              terminalState.providerCallbackReachability.record(event);
+              journal.record("provider-callback-reachability", event);
+            };
+            if (event.stage === "provider-capture-hook-invoked" && event.entered) {
+              recordV1JProviderBoundCaptureCallback({
+                journal,
+                event,
+                emitEvent,
+                setStatus: (status) => {
+                  terminalState.providerBoundCaptureAccountingStatus = status;
+                },
+              });
+            } else {
+              emitEvent();
+            }
           },
           ...(materializationTraceOnly
             ? {
@@ -3400,6 +3422,7 @@ async function runV1JProviderCapturePreflightInternal(
               });
               requestSummary = trace;
               requestIdentities = trace.identities;
+              terminalState.requestIdentities = trace.identities;
               stableIdentityReference = trace.stableIdentityReference;
             } else {
               requestSummary = summarizeV1JRawRepeatabilityRequest(
@@ -8758,10 +8781,6 @@ async function runOne(input: {
   ) => {
     if (event === "provider-bound-callback-enter") {
       preDispatchCallbackInvoked = true;
-      input.requestCapture?.preflightDiagnostics?.increment(
-        "providerBoundCaptureCallbacks",
-        "provider-bound-capture-callback-enter",
-      );
       input.requestCapture?.onPreflightStage?.("provider-bound-callback");
       recordPromptAwait("pre-dispatch-callback-invoked", {
         sourceStage: event,

@@ -8,6 +8,7 @@ import {
   createV1JPreflightCounters,
   evaluateV1JPreflightTerminalPredicates,
   recordV1JModelResultProvenance,
+  recordV1JProviderBoundCaptureCallback,
   resolveV1JSmokeRoot,
   runV1JPreflightWithTerminalReport,
   runV1JArmCPreflightOnly,
@@ -35,6 +36,38 @@ function evaluateTerminal(counters: V1JPreflightCounters) {
     expectedBodyPublicationCalls: 0,
     activeFilteringEnabled: false,
   });
+}
+
+function callbackEvent(invocationCount = 1) {
+  return {
+    stage: "provider-capture-hook-invoked" as const,
+    entered: true,
+    completed: false,
+    invocationCount,
+    runId: "offline-run",
+    promptSubmissionIndex: 1,
+    modelLoopIteration: 1,
+    providerInstanceId: "provider-fingerprint",
+    hookIdentity: "hook-registration",
+    failureClass: null,
+  };
+}
+
+function createCallbackAccountingHarness() {
+  const counters = createV1JPreflightCounters();
+  const records: Array<{ event: string; details: Record<string, unknown> }> = [];
+  const journal = {
+    counters: () => ({ ...counters }),
+    record: (event: string, details: Record<string, unknown> = {}) => {
+      records.push({ event, details });
+    },
+    increment: (counter: keyof V1JPreflightCounters, event: string, details = {}) => {
+      const before = counters[counter];
+      counters[counter] += 1;
+      records.push({ event, details: { ...details, before, after: counters[counter] } });
+    },
+  };
+  return { counters, journal, records };
 }
 
 describe("v1J preflight terminal diagnostics", () => {
@@ -121,6 +154,187 @@ describe("v1J preflight terminal diagnostics", () => {
     expect(report.PROVIDER_CALLBACK_REACHABILITY).toEqual({
       classification: "OBSERVER_WITHOUT_PROVIDER_TRANSFORM",
       events: [event],
+    });
+  });
+
+  it("increments callback accounting once after the reachability event is emitted", () => {
+    const { counters, journal, records } = createCallbackAccountingHarness();
+    const phases: string[] = [];
+    let status = "NOT_REACHED";
+    recordV1JProviderBoundCaptureCallback({
+      journal,
+      event: callbackEvent(),
+      emitEvent: () => phases.push("event-emitted"),
+      setStatus: (value) => {
+        status = value;
+      },
+    });
+
+    expect(phases).toEqual(["event-emitted"]);
+    expect(counters.providerBoundCaptureCallbacks).toBe(1);
+    expect(status).toBe("ACCOUNTED");
+    expect(records.map(({ details }) => details.phase).filter(Boolean)).toEqual([
+      "CALLBACK_EVENT_EMIT_ENTER",
+      "CALLBACK_EVENT_EMIT_COMPLETE",
+      "AGGREGATE_COUNTER_INCREMENT_ENTER",
+      "AGGREGATE_COUNTER_INCREMENT_COMPLETE",
+    ]);
+    expect(records.at(-1)?.details).toMatchObject({
+      counterBefore: 0,
+      counterAfter: 1,
+      runId: "offline-run",
+      promptSubmissionIndex: 1,
+      modelLoopIteration: 1,
+      providerInstanceFingerprint: "provider-fingerprint",
+      hookRegistrationId: "hook-registration",
+      callbackInvocationOrdinal: 1,
+    });
+  });
+
+  it("keeps callback accounting when the local sentinel throws immediately afterward", () => {
+    const { counters, journal } = createCallbackAccountingHarness();
+    let status = "NOT_REACHED";
+    expect(() => {
+      recordV1JProviderBoundCaptureCallback({
+        journal,
+        event: callbackEvent(),
+        emitEvent: () => undefined,
+        setStatus: (value) => {
+          status = value;
+        },
+      });
+      throw new Error("local capture stop sentinel");
+    }).toThrow("local capture stop sentinel");
+    expect(counters.providerBoundCaptureCallbacks).toBe(1);
+    expect(status).toBe("ACCOUNTED");
+    expect(counters.providerDispatchAttempts).toBe(0);
+    expect(counters.rawRequestsSent).toBe(0);
+    expect(counters.toolExecutions).toBe(0);
+    expect(counters.bodyPublicationCalls).toBe(0);
+  });
+
+  it("reports event-emission failure without claiming callback accounting", () => {
+    const { counters, journal } = createCallbackAccountingHarness();
+    let status = "NOT_REACHED";
+    expect(() =>
+      recordV1JProviderBoundCaptureCallback({
+        journal,
+        event: callbackEvent(),
+        emitEvent: () => {
+          throw new Error("event sink failed");
+        },
+        setStatus: (value) => {
+          status = value;
+        },
+      }),
+    ).toThrow("event sink failed");
+    expect(counters.providerBoundCaptureCallbacks).toBe(0);
+    expect(status).toBe("CALLBACK_EVENT_EMISSION_FAILED");
+  });
+
+  it("reports aggregate-counter failure without claiming callback accounting", () => {
+    const { counters, journal } = createCallbackAccountingHarness();
+    let status = "NOT_REACHED";
+    const failingJournal = {
+      ...journal,
+      increment: () => {
+        throw new Error("counter increment failed");
+      },
+    };
+    expect(() =>
+      recordV1JProviderBoundCaptureCallback({
+        journal: failingJournal,
+        event: callbackEvent(),
+        emitEvent: () => undefined,
+        setStatus: (value) => {
+          status = value;
+        },
+      }),
+    ).toThrow("counter increment failed");
+    expect(counters.providerBoundCaptureCallbacks).toBe(0);
+    expect(status).toBe("COUNTER_INCREMENT_FAILED");
+  });
+
+  it("matches the aggregate to multiple emitted callback events", () => {
+    const { counters, journal } = createCallbackAccountingHarness();
+    let emitted = 0;
+    let status = "NOT_REACHED";
+    for (const ordinal of [1, 2]) {
+      recordV1JProviderBoundCaptureCallback({
+        journal,
+        event: callbackEvent(ordinal),
+        emitEvent: () => {
+          emitted += 1;
+        },
+        setStatus: (value) => {
+          status = value;
+        },
+      });
+    }
+    expect(emitted).toBe(2);
+    expect(counters.providerBoundCaptureCallbacks).toBe(emitted);
+    expect(status).toBe("ACCOUNTED");
+  });
+
+  it("surfaces identities computed before a thrown sentinel in the terminal report", async () => {
+    const counters = passingPreflightCounters();
+    const identities = {
+      rawBodySha256: "a".repeat(64),
+      historicalExactCanonicalSha256: "b".repeat(64),
+      providerRequestSha256: "c".repeat(64),
+      stableProviderRequestSha256: "d".repeat(64),
+      stableNormalizationApplied: true,
+      stableNormalizationReason: "applied" as const,
+    };
+    const reports: Record<string, unknown>[] = [];
+    await expect(
+      runV1JPreflightWithTerminalReport({
+        operation: async () => {
+          throw new Error("local capture stop sentinel");
+        },
+        report: () =>
+          buildV1JPreflightTerminalReport({
+            counters,
+            lastCompletedStage: "provider-bound-capture",
+            blockingStage: "preflight-stop",
+            captureHookLiveness: "EXPECTED_CAPTURE_SEQUENCE",
+            failureClass: "V1IProviderRequestCapturedError",
+            providerBoundCaptureAccountingStatus: "ACCOUNTED",
+            requestIdentities: identities,
+            predicateEvaluations: null,
+          }),
+        emit: (report) => reports.push(report),
+      }),
+    ).rejects.toThrow("local capture stop sentinel");
+    expect(reports[0]).toMatchObject({
+      rawBodySha256: identities.rawBodySha256,
+      historicalExactCanonicalSha256: identities.historicalExactCanonicalSha256,
+      providerRequestSha256: identities.providerRequestSha256,
+      stableProviderRequestSha256: identities.stableProviderRequestSha256,
+      STABLE_NORMALIZATION_APPLIED: true,
+      STABLE_NORMALIZATION_REASON: "applied",
+      PROVIDER_BOUND_CAPTURE_ACCOUNTING_STATUS: "ACCOUNTED",
+    });
+  });
+
+  it("reports identities unavailable when capture ran but did not produce identity values", () => {
+    const counters = createV1JPreflightCounters();
+    counters.providerBoundCaptureCallbacks = 1;
+    const report = buildV1JPreflightTerminalReport({
+      counters,
+      lastCompletedStage: "provider-bound-capture",
+      blockingStage: "capture-stop",
+      captureHookLiveness: "EXPECTED_CAPTURE_SEQUENCE",
+      failureClass: "capture-terminal-report-incomplete",
+      predicateEvaluations: null,
+    });
+    expect(report).toMatchObject({
+      rawBodySha256: "UNAVAILABLE",
+      historicalExactCanonicalSha256: "UNAVAILABLE",
+      providerRequestSha256: "UNAVAILABLE",
+      stableProviderRequestSha256: "UNAVAILABLE",
+      STABLE_NORMALIZATION_APPLIED: "UNAVAILABLE",
+      STABLE_NORMALIZATION_REASON: "UNAVAILABLE",
     });
   });
 
